@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Slide Write",
+  "version": "0.1.0",
+  "description": "Portable AI design assistant — click an element or type a request and an agent edits the running app's source live.",
+  "permissions": ["storage", "activeTab"],
+  "host_permissions": ["http://localhost/*", "http://127.0.0.1/*", "https://localhost/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Slide Write — toggle panel" },
+  "options_page": "options.html",
+  "content_scripts": [{
+    "matches": ["http://localhost/*", "http://127.0.0.1/*", "https://localhost/*"],
+    "js": ["content/inject.js"],
+    "run_at": "document_idle"
+  }],
+  "web_accessible_resources": [{
+    "resources": ["content/sse.js", "content/panel.js", "content/picker.js", "styles.css"],
+    "matches": ["http://localhost/*", "http://127.0.0.1/*", "https://localhost/*"]
+  }],
+  "commands": {
+    "toggle-panel": {
+      "suggested_key": { "default": "Ctrl+Shift+E", "mac": "Command+Shift+E" },
+      "description": "Toggle the Slide Write panel"
+    }
+  }
+}

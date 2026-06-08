@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# logs
+*.log
+
+# secrets / local env — never commit a token
+.env
+.env.*
+*.pem
+*.key
+
+# local Claude / editor / OS cruft
+.claude/settings.local.json
+.vscode/
+.idea/
+.DS_Store
