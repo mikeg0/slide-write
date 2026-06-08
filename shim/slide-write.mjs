@@ -14,6 +14,18 @@ const TOKEN   = arg("token",  process.env.SLIDEWRITE_TOKEN ?? "");
 const ORIGIN  = arg("origin", process.env.SLIDEWRITE_ALLOWED_ORIGIN ?? "*"); // app origin, e.g. http://localhost:5173
 const VERSION = "0.1.0";
 
+// Models the UI may pick from. Advertised via /meta so the client dropdown stays server-driven; a
+// `/design` request's `model` is validated against this allowlist before reaching the SDK (an
+// unknown id falls back to DEFAULT_MODEL, or the SDK's own default when that's unset). Keep ids in
+// sync with the installed `claude` CLI / Agent SDK.
+const MODELS = [
+  { id: "claude-opus-4-8",           label: "Claude Opus 4.8" },
+  { id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6" },
+  { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
+];
+const DEFAULT_MODEL = arg("model", process.env.SLIDEWRITE_MODEL ?? ""); // "" = let the SDK decide
+const modelAllowed  = (m) => MODELS.some((x) => x.id === m);
+
 const PREAMBLE =
   "You are editing a web app live from within its running dev environment. Your edits land on the " +
   "repo at the working directory and the app's own dev server hot-reloads, so changes appear in the " +
@@ -76,10 +88,15 @@ function resultText(content) {
 export async function runDesign(body, emit, aborted = () => false) {
   const tool = {}; let streamedText = false, hadError = false;
   const dirty0 = new Set(await porcelainPaths());
+  // Resolve the requested model against the allowlist; fall back to DEFAULT_MODEL (or, if that's
+  // unset, omit `model` entirely so the SDK uses its own default). The actual model the SDK runs is
+  // echoed back to the client in the `start` event from system/init.
+  const model = modelAllowed(body.model) ? body.model : (DEFAULT_MODEL || undefined);
   for await (const m of query({ prompt: buildPrompt(body), options: {
     cwd: REPO, permissionMode: "bypassPermissions",  // runs as you (non-root) → allowed, no callback
     allowDangerouslySkipPermissions: true,           // required by the SDK alongside bypassPermissions
     includePartialMessages: true, settingSources: ["project"], systemPrompt: PREAMBLE, maxTurns: 40,
+    ...(model ? { model } : {}),
   } })) {
     if (aborted()) return;
     if (process.env.SW_DEBUG) console.error("SDK", m.type, m.subtype ?? "");
@@ -148,6 +165,7 @@ function serve() {
         project: basename(REPO), repoDir: REPO, version: VERSION,
         branch: await git("rev-parse", "--abbrev-ref", "HEAD"),
         dirty: !!(await git("status", "--porcelain")),
+        models: MODELS, defaultModel: DEFAULT_MODEL || MODELS[0].id,
       });
     if (path === "/design" && req.method === "POST") return design(req, res);
     json(res, 404, { error: "not found" });

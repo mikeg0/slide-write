@@ -357,6 +357,12 @@ Every frame is **one JSON object on a `data:` line**; the client reads only `dat
 
 Adding a new `type` is backward-compatible: clients ignore unknown types.
 
+**Model selection (additive).** `/design` accepts an optional top-level `model` (a model id). The
+shim validates it against an allowlist advertised by `/meta` (`{ models: [{id,label}], defaultModel }`);
+an unknown/absent id falls back to the shim's `--model`/`SLIDEWRITE_MODEL` default, or the SDK's own
+default when that's unset. The model the SDK actually runs is echoed back in the `start` event. The
+extension renders the `/meta` list in a composer dropdown and persists the choice per-origin.
+
 ---
 
 ## 7. The element-capture contract
@@ -460,7 +466,8 @@ export async function streamDesign(shimUrl, token, payload, onEvent, signal) {
 - **`content/panel.js`** — transcript + composer. Renders each [§6](#6-the-sse-event-contract) event
   as a row; **coalesce consecutive same-role streaming deltas** into one bubble; tool/result rows
   break the chain. Footer textarea (⌘/Ctrl+Enter), disabled while a run is in flight;
-  `AbortController` cancels on close.
+  `AbortController` cancels on close. The composer's toolbar row holds a model selector (populated
+  from `/meta`, persisted per-origin) and the send button, modeled on the Claude AI chat composer.
 - **`content/inject.js`** — create a host node + `attachShadow({mode:'open'})`, inject `styles.css`
   into the shadow root, mount the panel + a toolbar affordance, wire the shortcut. Look up config for
   `location.origin`; call `GET <shimUrl>/meta`; show "wired to `<project>` @ `<branch>`" in the header.

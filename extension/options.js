@@ -73,4 +73,10 @@ $("add").addEventListener("click", async () => {
   render();
 });
 
+// When opened from the toolbar icon on an un-wired origin, pre-fill the add form with it.
+try {
+  const pending = new URL(location.href).searchParams.get("origin");
+  if (pending && !$("a-origin").value) { $("a-origin").value = pending; $("a-enabled").checked = true; }
+} catch { /* no/invalid query param */ }
+
 render();

@@ -43,20 +43,34 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true; // keep the channel open for the async response
 });
 
-// Toolbar icon click → toggle the slide-out panel in the active tab's content script.
-// (No default_popup, so action.onClicked fires.) Inert if the origin isn't enabled — the content
-// script only registers the listener once configured; open the options page to enable a new origin.
-chrome.action.onClicked.addListener((tab) => {
-  if (tab && tab.id != null) {
-    chrome.tabs.sendMessage(tab.id, { type: "toggle-panel" }).catch(() => {});
+// Toggle the panel in a tab's content script. If the content script isn't mounted (origin not
+// enabled, or the page was opened before it was enabled), the message has no receiver and rejects —
+// guide the user to setup instead of failing silently (the symptom: "the icon does nothing").
+async function togglePanel(tab) {
+  if (!tab || tab.id == null) return;
+  try {
+    await chrome.tabs.sendMessage(tab.id, { type: "toggle-panel" });
+  } catch {
+    openSetup(tab); // no receiving end → not wired up on this origin yet
   }
-});
+}
 
-// Keyboard shortcut → tell the active tab's content script to toggle the panel.
+// Open the options page with this tab's origin pre-filled in the "add origin" form, so the user
+// lands ready to enable it. (openOptionsPage can't carry a query param, so create the tab directly.)
+function openSetup(tab) {
+  let origin = "";
+  try { origin = tab && tab.url ? new URL(tab.url).origin : ""; } catch { /* chrome://, etc. */ }
+  const url = chrome.runtime.getURL("options.html") + (origin ? `?origin=${encodeURIComponent(origin)}` : "");
+  chrome.tabs.create({ url });
+}
+
+// Toolbar icon click → toggle (or, if not yet wired up, open setup). (No default_popup, so
+// action.onClicked fires.)
+chrome.action.onClicked.addListener((tab) => { togglePanel(tab); });
+
+// Keyboard shortcut → same path against the active tab.
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== "toggle-panel") return;
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tab && tab.id != null) {
-    chrome.tabs.sendMessage(tab.id, { type: "toggle-panel" }).catch(() => {});
-  }
+  togglePanel(tab);
 });
