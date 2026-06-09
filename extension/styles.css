@@ -25,8 +25,13 @@
   display: flex; align-items: center; gap: 8px;
   padding: 10px 12px; border-bottom: 1px solid #2c2c3a; background: #1b1b25;
 }
-.dmsg-title { font-weight: 600; }
-.dmsg-status { flex: 1; color: #9a9ab0; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dmsg-title { font-weight: 600; flex: 1; }
+/* Muted status line directly under the header: connection/run state, or a hovered button's help. */
+.dmsg-statusbar {
+  padding: 5px 12px; border-bottom: 1px solid #2c2c3a; background: #181820;
+  min-height: 23px;
+}
+.dmsg-status { color: #9a9ab0; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
 .dmsg-iconbtn {
   border: none; background: transparent; color: #c8c8da; cursor: pointer;
   font-size: 14px; padding: 2px 6px; border-radius: 6px;
@@ -54,6 +59,28 @@
   font-size: 14px; font-weight: 600;
 }
 .dmsg-setup-btn:hover { background: #5a5ac0; }
+
+/* Disconnected diagnostics banner — configured, but the shim isn't answering as expected. */
+.dmsg-diag {
+  margin: 8px 12px; padding: 10px 12px; border-radius: 8px;
+  background: #2a1c1c; border: 1px solid #5a2e2e;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.dmsg-diag-title { font-size: 13px; font-weight: 600; color: #ffb4a8; }
+.dmsg-diag-text { margin: 0; font-size: 11px; line-height: 1.5; color: #c9b3b3; }
+.dmsg-diag-code {
+  font-size: 10px; line-height: 1.4; color: #d7d7e6; background: #15151c;
+  border: 1px solid #2c2c3a; border-radius: 6px; padding: 6px 8px;
+  white-space: pre-wrap; word-break: break-all; user-select: all;
+}
+.dmsg-diag-actions { display: flex; gap: 8px; margin-top: 2px; }
+.dmsg-diag-btn {
+  border: none; cursor: pointer; background: #4646a0; color: #fff;
+  padding: 5px 12px; border-radius: 6px; font-size: 12px; font-weight: 600;
+}
+.dmsg-diag-btn:hover { background: #5a5ac0; }
+.dmsg-diag-btn-ghost { background: #2c2c3a; }
+.dmsg-diag-btn-ghost:hover { background: #3a3a4a; }
 
 /* Transcript */
 .dmsg-transcript { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
@@ -122,9 +149,37 @@
 .dmsg-input:disabled { opacity: .6; }
 
 .dmsg-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 4px; }
+.dmsg-toolbar-left { display: flex; align-items: center; gap: 4px; min-width: 0; }
+
+/* "+" composer menu — round icon button whose menu opens upward, holding per-message toggles
+   (Image Generation). Goes amber-tinted while a toggle is active so the mode is visible at a glance. */
+.dmsg-pluswrap { position: relative; flex-shrink: 0; }
+.dmsg-plus {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; border: 1px solid #2c2c3a; background: transparent;
+  color: #c8c8da; cursor: pointer; border-radius: 8px; font-size: 16px; line-height: 1; font-family: inherit;
+}
+.dmsg-plus:hover, .dmsg-plus.dmsg-plus-open { background: #23232f; }
+.dmsg-plus:disabled { opacity: .5; cursor: default; }
+.dmsg-plus.dmsg-plus-active, .dmsg-plus.dmsg-plus-active:hover {
+  background: #3a2a22; border-color: #cc7a5b; color: #e8a585;
+}
+.dmsg-plusmenu {
+  position: absolute; bottom: calc(100% + 6px); left: 0; min-width: 200px; z-index: 5;
+  background: #1f1f2b; border: 1px solid #34344a; border-radius: 10px; padding: 4px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .5);
+}
+.dmsg-menuitem {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%;
+  border: none; background: transparent; color: #d6d6e6; cursor: pointer; text-align: left;
+  font-size: 12px; font-family: inherit; padding: 7px 9px; border-radius: 7px;
+}
+.dmsg-menuitem:hover { background: #2c2c3a; }
+.dmsg-menuitem-active { color: #fff; }
+.dmsg-menuitem-check { color: #cc7a5b; }
 
 /* Model selector — a text button + chevron whose menu opens upward (composer sits at the bottom). */
-.dmsg-modelwrap { position: relative; }
+.dmsg-modelwrap { position: relative; min-width: 0; }
 .dmsg-model {
   display: inline-flex; align-items: center; gap: 5px;
   border: none; background: transparent; color: #c8c8da; cursor: pointer;

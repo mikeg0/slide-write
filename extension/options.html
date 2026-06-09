@@ -42,12 +42,22 @@
     <button id="gemini-save" class="primary" type="button">Save</button>
   </div>
 
+  <h2>Connection</h2>
+  <p class="hint">How often the panel re-checks the shim (<code>/health</code> + <code>/meta</code>) while it's open,
+    so the status flips as the shim goes up/down. Only polls while the panel is visible. Default 5 seconds; minimum 1.</p>
+  <div class="global">
+    <label for="poll-interval">Poll every</label>
+    <span style="display:flex;gap:6px;align-items:center"><input id="poll-interval" type="number" min="1" step="1" placeholder="5" style="width:80px" /> seconds</span>
+    <button id="poll-save" class="primary" type="button">Save</button>
+  </div>
+
   <h2>Configured origins</h2>
   <div id="list"></div>
 
   <h2>Add an origin</h2>
   <div class="add">
     <div class="fields">
+      <label for="a-name">Name</label><input id="a-name" type="text" placeholder="My project (optional)" />
       <label for="a-origin">Origin</label><input id="a-origin" type="text" placeholder="http://localhost:5173" />
       <label for="a-token">Token</label>
       <span style="display:flex;gap:6px"><input id="a-token" type="password" placeholder="SLIDEWRITE_TOKEN" /><button id="a-gen" type="button">Generate</button></span>

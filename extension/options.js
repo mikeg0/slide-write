@@ -7,6 +7,10 @@ function normOrigin(s) {
   try { return new URL(s.trim()).origin; } catch { return s.trim().replace(/\/+$/, ""); }
 }
 
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
 async function render() {
   const cfg = await send({ type: "getAll" });
   const list = $("list");
@@ -21,7 +25,7 @@ async function render() {
     const row = document.createElement("div");
     row.className = "row";
     row.innerHTML = `
-      <div class="origin">${origin}</div>
+      <div class="origin">${c.name ? `${esc(c.name)} <span class="hint" style="font-weight:400">${origin}</span>` : origin}</div>
       <div class="controls">
         <label><input type="checkbox" class="en" ${c.enabled ? "checked" : ""}/> enabled</label>
         <label><input type="checkbox" class="ar" ${c.autoReload ? "checked" : ""}/> auto-reload</label>
@@ -29,12 +33,14 @@ async function render() {
         <button class="del danger">Delete</button>
       </div>
       <div class="fields">
-        <label>Token</label><input type="password" class="tok" value="${c.token || ""}"/>
-        <label>Shim URL</label><input type="text" class="url" value="${c.shimUrl || ""}" placeholder="http://localhost:4040"/>
-        <label>Image steps (override)</label><textarea class="imgsteps" placeholder="Optional override — prefer the repo's CLAUDE.md / a skill. Layered on top (path, naming, DB write, resize…)">${c.imageInstructions || ""}</textarea>
+        <label>Name</label><input type="text" class="name" value="${esc(c.name || "")}" placeholder="optional label"/>
+        <label>Token</label><input type="password" class="tok" value="${esc(c.token || "")}"/>
+        <label>Shim URL</label><input type="text" class="url" value="${esc(c.shimUrl || "")}" placeholder="http://localhost:4040"/>
+        <label>Image steps (override)</label><textarea class="imgsteps" placeholder="Optional override — prefer the repo's CLAUDE.md / a skill. Layered on top (path, naming, DB write, resize…)">${esc(c.imageInstructions || "")}</textarea>
       </div>`;
     row.querySelector(".save").addEventListener("click", async () => {
       await send({ type: "setOrigin", origin, value: {
+        name: row.querySelector(".name").value.trim(),
         enabled: row.querySelector(".en").checked,
         autoReload: row.querySelector(".ar").checked,
         token: row.querySelector(".tok").value.trim(),
@@ -69,17 +75,27 @@ $("gemini-save").addEventListener("click", async () => {
   flash($("gemini-save"), "Saved");
 });
 
+// Global liveness-poll cadence (seconds). Blank field shows the 5s default but stores 0 → client default.
+async function loadPoll() { const v = (await send({ type: "getAll" })).pollInterval; $("poll-interval").value = v ? String(v) : ""; }
+$("poll-save").addEventListener("click", async () => {
+  const n = Math.max(1, Math.round(Number($("poll-interval").value) || 5));
+  $("poll-interval").value = String(n);
+  await send({ type: "setPollInterval", value: n });
+  flash($("poll-save"), "Saved");
+});
+
 $("add").addEventListener("click", async () => {
   const origin = normOrigin($("a-origin").value);
   if (!origin) return;
   await send({ type: "setOrigin", origin, value: {
+    name: $("a-name").value.trim(),
     enabled: $("a-enabled").checked,
     autoReload: $("a-autoreload").checked,
     token: $("a-token").value.trim(),
     shimUrl: $("a-url").value.trim() || undefined,
     imageInstructions: $("a-imgsteps").value.trim(),
   }});
-  $("a-origin").value = $("a-token").value = $("a-url").value = $("a-imgsteps").value = "";
+  $("a-name").value = $("a-origin").value = $("a-token").value = $("a-url").value = $("a-imgsteps").value = "";
   render();
 });
 
@@ -91,3 +107,4 @@ try {
 
 render();
 loadGemini();
+loadPoll();

@@ -357,15 +357,19 @@ current route/view):
   "text": "New",                    // textContent, trimmed, ≤120 chars
   "domPath": "div.topbar > button.btn.btn-primary",  // nth-of-type chain, ≤5 ancestors, stops at first id
   "rect": { "x": 1180, "y": 16, "w": 64, "h": 32 },
-  "imageDataUrl": "data:image/png;base64,…"   // optional; only in image mode (🖼️), only for an <img>
+  "imageDataUrl": "data:image/png;base64,…"   // optional; present only when the target is an <img>
 }
 ```
 Centralized, semantic class names usually pinpoint the source; for CSS-in-JS / hashed classes, lean
 on `text` + `domPath` + `screen`, or add framework-fiber data ([§8.4](#84-the-widget--remaining-files)).
 
-`imageDataUrl` is added only when picking in image mode and the target is an `<img>` whose pixels the
-picker could read (same-origin / CORS-enabled canvas; tainted images are silently skipped). It drives
-image-to-image in `/generate-image`; everything else is unchanged.
+`imageDataUrl` is captured on every pick where the target is an `<img>` whose pixels the picker could
+read (same-origin / CORS-enabled canvas; tainted images are silently skipped). The composer keeps it
+only when **Image Generation** is toggled on (the "+" menu in the send area) — then it drives
+image-to-image in `/generate-image`; for plain `/design` sends the composer strips it back out, so it
+never bloats a non-image request. Image Generation is a per-send toggle, not a separate picker: pick
+any element with 🎯, flip the toggle, and the shim places the generated image as the `<img>`'s `src`
+or the element's CSS `background-image` depending on the element type.
 
 ---
 

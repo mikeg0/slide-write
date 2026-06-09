@@ -24,16 +24,26 @@
       autoReload: !!(c && c.autoReload),
       model: (c && c.model) || "",   // persisted model selection (empty = use shim default)
       geminiKey: (c && c.geminiKey) || "",            // global Gemini key (getOrigin merges it in)
+      pollInterval: (c && c.pollInterval) || 0,       // global liveness-poll seconds (getOrigin merges it in; 0 = default)
       imageInstructions: (c && c.imageInstructions) || "",  // per-origin image-integration steps
     };
   }
-  async function fetchMeta(shimUrl, token) {
-    if (!token) return null;
+  // Probe the shim so the panel can show *targeted* help instead of a flat "not connected".
+  // /health needs no auth (pure reachability); /meta is the Bearer-gated truth (auth + repo info).
+  // Returns one of: { state:"live", meta } · { state:"unauthorized" } (token rejected) ·
+  // { state:"unreachable", detail? } (shim down / not forwarded) · { state:null } (no token yet).
+  async function probe(shimUrl, token) {
+    if (!token) return { state: null };
     try {
-      const r = await fetch(`${shimUrl}/meta`, { headers: { Authorization: `Bearer ${token}` } });
-      if (r.ok) return await r.json();
-    } catch { /* offline / agent down */ }
-    return null;
+      const h = await fetch(`${shimUrl}/health`, { cache: "no-store" });
+      if (!h.ok) return { state: "unreachable", detail: `health ${h.status}` };
+    } catch { return { state: "unreachable" }; }
+    try {
+      const r = await fetch(`${shimUrl}/meta`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+      if (r.status === 401) return { state: "unauthorized" };
+      if (r.ok) return { state: "live", meta: await r.json() };
+      return { state: "unreachable", detail: `meta ${r.status}` };
+    } catch { return { state: "unreachable" }; }
   }
 
   const init = resolve(cfg);
@@ -52,21 +62,24 @@
   shadow.append(rootEl);
   (document.body || document.documentElement).append(host);
 
-  // 3. If already wired up, confirm which repo this tab is connected to (§11): GET <shimUrl>/meta.
-  const meta = init.configured ? await fetchMeta(shimUrl, token) : null;
+  // 3. If already wired up, probe the shim (§11): /health for reachability, /meta for repo + auth.
+  const conn = init.configured ? await probe(shimUrl, token) : { state: null };
+  const meta = conn.meta || null;
 
   // 4. Mount the panel (always — disabled "set up" state when not yet configured).
   const { createPanel } = await import(chrome.runtime.getURL("content/panel.js"));
   let pickerActive = false;
   const panel = createPanel({
     root: rootEl, shimUrl, token, meta,
+    conn: { state: conn.state, detail: conn.detail },
+    onProbe: probe,                  // panel re-checks on open / poll / after a failed send
     configured: init.configured,
     autoReload: init.autoReload,
     model: init.model,
     geminiKey: init.geminiKey,
+    pollInterval: init.pollInterval,
     imageInstructions: init.imageInstructions,
     onMarkup: () => startMarkup(),
-    onAddImage: () => startImagePicker(),
     onOpenOptions: () => chrome.runtime.sendMessage({ type: "openOptions" }).catch(() => {}),
     // Persist the model choice per-origin so it survives reloads (background store, §11).
     onSelectModel: (id) => chrome.runtime.sendMessage({ type: "setOrigin", origin: ORIGIN, value: { model: id } }).catch(() => {}),
@@ -78,28 +91,26 @@
   // 6. Markup mode — lazily import the picker (Phase 5). Picks an element, fills the §7 context,
   //    then opens the composer anchored to it. The panel stays open during picking (the picker
   //    skips its own data-slidewrite-ui nodes), so the chat doesn't slide shut on every pick.
-  //    The image variant (🖼️) reuses the same picker but asks it to also capture the element's
-  //    current pixels (for image-to-image), and routes the result into image mode.
-  async function startPick({ image }) {
+  //    We always capture the element's current pixels (cheap, img-only) so that if the user then
+  //    toggles Image Generation in the composer's "+" menu the shim can do image-to-image; the
+  //    composer strips that field back out for plain /design sends.
+  async function startMarkup() {
     if (pickerActive) return;
     pickerActive = true;
-    const setActive = (on) => image ? panel.setImageActive(on) : panel.setMarkupActive(on);
-    setActive(true);
+    panel.setMarkupActive(true);
     try {
       const { startPicker } = await import(chrome.runtime.getURL("content/picker.js"));
       startPicker((ctx) => {
         pickerActive = false;
-        setActive(false);
-        if (ctx) { (image ? panel.setImageContext : panel.setElementContext)(ctx); panel.open(); }
-      }, { captureImage: image });
+        panel.setMarkupActive(false);
+        if (ctx) { panel.setElementContext(ctx); panel.open(); }
+      }, { captureImage: true });
     } catch (e) {
       pickerActive = false;
-      setActive(false);
+      panel.setMarkupActive(false);
       console.warn("[slide-write] picker unavailable:", e);
     }
   }
-  const startMarkup = () => startPick({ image: false });
-  const startImagePicker = () => startPick({ image: true });
 
   // 7. Keyboard shortcut relayed from the background command.
   chrome.runtime.onMessage.addListener((msg) => {
@@ -109,18 +120,20 @@
   // 8. Live config: when this origin's settings change in Options, re-resolve and push to the panel
   //    so a freshly-enabled origin goes live in place — no page reload. (background.js stores the
   //    whole config under the "slidewrite" key in chrome.storage.local.)
-  let liveCfg = init, lastMeta = meta;
+  let liveCfg = init, lastMeta = meta, lastConn = conn;
   chrome.storage.onChanged.addListener(async (changes, area) => {
     if (area !== "local" || !changes.slidewrite) return;
     const nv = changes.slidewrite.newValue || {};
-    // The global Gemini key lives at the config root; merge it in like background.js's getOrigin does.
-    const next = resolve({ ...((nv.origins || {})[ORIGIN] || null), geminiKey: nv.geminiKey || "" });
-    // Only re-fetch /meta when the connection actually changed — a model-only edit (which we write
-    // here ourselves on selection) reuses the cached meta, so the dropdown doesn't churn.
+    // The global settings live at the config root; merge them in like background.js's getOrigin does.
+    const next = resolve({ ...((nv.origins || {})[ORIGIN] || null), geminiKey: nv.geminiKey || "", pollInterval: nv.pollInterval || 0 });
+    // Only re-probe when the connection actually changed — a model-only edit (which we write here
+    // ourselves on selection) reuses the cached state, so the dropdown/status don't churn.
     const connChanged = next.shimUrl !== liveCfg.shimUrl || next.token !== liveCfg.token || next.configured !== liveCfg.configured;
-    const m = connChanged ? (next.configured ? await fetchMeta(next.shimUrl, next.token) : null) : lastMeta;
-    liveCfg = next; lastMeta = m;
-    panel.setConfig({ shimUrl: next.shimUrl, token: next.token, meta: m, autoReload: next.autoReload,
-      configured: next.configured, model: next.model, geminiKey: next.geminiKey, imageInstructions: next.imageInstructions });
+    const c = connChanged ? (next.configured ? await probe(next.shimUrl, next.token) : { state: null }) : lastConn;
+    const m = c.meta || (connChanged ? null : lastMeta);
+    liveCfg = next; lastMeta = m; lastConn = c;
+    panel.setConfig({ shimUrl: next.shimUrl, token: next.token, meta: m, conn: { state: c.state, detail: c.detail },
+      autoReload: next.autoReload, configured: next.configured, model: next.model, geminiKey: next.geminiKey,
+      pollInterval: next.pollInterval, imageInstructions: next.imageInstructions });
   });
 })();
