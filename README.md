@@ -14,6 +14,16 @@ is on the laptop or on a remote server, on **Windows / macOS / Linux**.
 > 1. **`shim/`** — a cross-platform Node CLI: runs `claude` in a repo and streams the run as SSE on `127.0.0.1:<port>`.
 > 2. **`extension/`** — a Manifest V3 browser extension: the universal, framework-agnostic UI.
 
+## Demo
+
+https://github.com/user-attachments/assets/3aec869a-b4e2-40f2-b51b-7c99191d2ff7
+
+## Why I built this
+
+I loved the DOM element picker paired with a Claude Code chat in claude.ai/design, but I needed a
+tool that worked against a local development environment. Along the way I realized the same tool
+could also generate and embed image assets.
+
 This README is self-contained and buildable: it inlines every contract, the shim's core code, and
 the extension spec. It's written to be implemented by **Claude Code** — see [§12](#12-build-order-for-claude).
 
@@ -212,6 +222,12 @@ parts.push("\n[The user clicked this on-screen element and is referring to it]\n
   "\nUse the class names / text / DOM path to locate the source and matching styles, then edit there.");
 ```
 
+When the request carries an element screenshot ([§7](#7-the-element-capture-contract)
+`screenshotDataUrl`), `runDesign` writes it to a temp PNG **outside the repo** (`saveScreenshot()`,
+the same temp-file pattern `runImage` uses) and `buildPrompt` appends a line telling `claude` to
+`Read` that path — its Read tool renders the image, so the agent sees how the element looks before
+editing. No Agent-SDK image-input plumbing is needed.
+
 Everything else is mechanical and may be implemented freely as long as it honors these contracts:
 
 - **The SDK run loop.** `query({ prompt, options })` is driven with `cwd: REPO`,
@@ -357,11 +373,23 @@ current route/view):
   "text": "New",                    // textContent, trimmed, ≤120 chars
   "domPath": "div.topbar > button.btn.btn-primary",  // nth-of-type chain, ≤5 ancestors, stops at first id
   "rect": { "x": 1180, "y": 16, "w": 64, "h": 32 },
-  "imageDataUrl": "data:image/png;base64,…"   // optional; present only when the target is an <img>
+  "imageDataUrl": "data:image/png;base64,…",      // optional; present only when the target is an <img>
+  "screenshotDataUrl": "data:image/png;base64,…", // optional; a screenshot of the picked element
+  "screenshotW": 64, "screenshotH": 32            // UI-only (chip label); not forwarded to the shim
 }
 ```
 Centralized, semantic class names usually pinpoint the source; for CSS-in-JS / hashed classes, lean
 on `text` + `domPath` + `screen`, or add framework-fiber data ([§8.4](#84-the-widget--remaining-files)).
+
+`screenshotDataUrl` is captured on **every** pick: Chrome has no "screenshot this element" API, so the
+background worker grabs the visible tab (`chrome.tabs.captureVisibleTab`) and the content script crops
+it to `rect` (scaling by `devicePixelRatio`, clamping to the viewport, downscaling to a modest max
+edge). Capture is best-effort — restricted pages, a zero-size rect, or a load failure just yield no
+screenshot and the flow degrades to text-only. The composer shows it as a **removable attachment
+chip** (thumbnail + dimensions + ✕); removing it drops the pixels so they're never sent. On `/design`
+the screenshot IS sent (with the UI-only `screenshotW/H` stripped) — the shim writes it to a temp file
+and asks `claude` to `Read` it ([§5](#5-the-shim-shim)). On `/generate-image` it's stripped (that route
+uses `imageDataUrl` instead).
 
 `imageDataUrl` is captured on every pick where the target is an `<img>` whose pixels the picker could
 read (same-origin / CORS-enabled canvas; tainted images are silently skipped). The composer keeps it

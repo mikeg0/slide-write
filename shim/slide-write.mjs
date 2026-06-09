@@ -81,7 +81,7 @@ function elementContext(element) {
   return Object.keys(ctx).length ? ctx : null;
 }
 
-function buildPrompt({ prompt = "", screen, element }) {
+function buildPrompt({ prompt = "", screen, element }, screenshotPath) {
   const parts = [String(prompt).trim()];
   if (screen) parts.push(`\n[Current screen: ${screen}]`);
   const ctx = elementContext(element);
@@ -89,6 +89,8 @@ function buildPrompt({ prompt = "", screen, element }) {
     parts.push("\n[The user clicked this on-screen element and is referring to it]\n" +
       JSON.stringify(ctx, null, 2) +
       "\nUse the class names / text / DOM path to locate the source and matching styles, then edit there.");
+  if (screenshotPath)
+    parts.push(`\n[A screenshot of the selected element was saved at:\n  ${screenshotPath}\n(this file is OUTSIDE the repo). Read it to see how the element currently looks before editing.]`);
   return parts.join("\n");
 }
 
@@ -107,7 +109,10 @@ function buildImagePrompt({ imagePrompt = "", screen, element, imageInstructions
     "the project's conventional static-assets location (the framework-appropriate public/static dir, or " +
     "an imported asset) with a descriptive filename.\n" +
     "2. Wire it into the on-screen element the user selected: set the <img>'s src, or the element's CSS " +
-    "background-image, matching the existing patterns in the source.\n\n" +
+    "background-image, matching the existing patterns in the source.\n" +
+    "3. Add a cache-busting query string to the referenced URL (e.g. `?v=<timestamp-or-hash>`) so an " +
+    "UPDATED image with the same filename actually refreshes in the browser instead of serving the stale " +
+    "cached copy. If the URL already carries such a param, bump it to a new value.\n\n" +
     `Original image request: ${String(imagePrompt).trim()}`,
   ];
   if (screen) parts.push(`\n[Current screen: ${screen}]`);
@@ -333,11 +338,24 @@ async function commitChanged(dirty0, subj, emit) {
   emit("commit", { sha: await git("rev-parse", "--short", "HEAD"), count: changed.length });
 }
 
+// Persist a picked-element screenshot (data:<mime>;base64,<data>) to a temp file OUTSIDE the repo so
+// `claude` can Read it as an image — same approach runImage uses for generated assets. Returns the
+// path, or null when there's no (well-formed) screenshot.
+async function saveScreenshot(element) {
+  const m = /^data:([^;,]+);base64,(.+)$/s.exec(element?.screenshotDataUrl || "");
+  if (!m) return null;
+  const ext = m[1].includes("jpeg") ? "jpg" : m[1].includes("webp") ? "webp" : "png";
+  const tmpPath = join(os.tmpdir(), `slidewrite-shot-${Date.now()}.${ext}`);
+  await writeFile(tmpPath, Buffer.from(m[2], "base64"));
+  return tmpPath;
+}
+
 // Core: drive one design run. `emit(type, data)` sends an SSE event; `aborted()` lets the caller
 // cancel (client disconnect). Exported so the HTTP handler and tests share one implementation.
 export async function runDesign(body, emit, aborted = () => false) {
   const dirty0 = new Set(await porcelainPaths());
-  const hadError = await streamQuery(buildPrompt(body), body, emit, aborted);
+  const shotPath = await saveScreenshot(body.element);
+  const hadError = await streamQuery(buildPrompt(body, shotPath), body, emit, aborted);
   if (aborted()) return;
   if (!hadError) await commitChanged(dirty0, (body.prompt || "design change").split("\n")[0].slice(0, 72), emit);
   emit("done");

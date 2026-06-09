@@ -18,6 +18,17 @@ async function save(cfg) {
 // everything else is per-origin.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
+    // Visible-tab capture is the one privileged step the content script can't do itself (chrome.tabs
+    // lives here). It is NOT network (§10.4) — just the current viewport as a PNG, which the picker
+    // then crops to the selected element. activeTab + the localhost host_permissions cover it; it
+    // fails gracefully (returns ok:false) on restricted pages.
+    if (msg && msg.type === "captureTab") {
+      try {
+        const windowId = _sender && _sender.tab ? _sender.tab.windowId : undefined;
+        const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+        return sendResponse({ ok: true, dataUrl });
+      } catch (e) { return sendResponse({ ok: false, error: String((e && e.message) || e) }); }
+    }
     const cfg = await load();
     switch (msg && msg.type) {
       case "getAll":

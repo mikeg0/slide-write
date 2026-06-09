@@ -100,16 +100,65 @@
     panel.setMarkupActive(true);
     try {
       const { startPicker } = await import(chrome.runtime.getURL("content/picker.js"));
-      startPicker((ctx) => {
+      startPicker(async (ctx) => {
         pickerActive = false;
         panel.setMarkupActive(false);
-        if (ctx) { panel.setElementContext(ctx); panel.open(); }
+        if (!ctx) return;
+        // Best-effort screenshot of the picked element's rendered pixels (Chrome has no
+        // "screenshot this element" API — we grab the viewport and crop). Degrades silently to
+        // text-only context on any failure (restricted page, tainted canvas, off-screen rect).
+        const shot = await captureElementShot(ctx.rect);
+        if (shot) { ctx.screenshotDataUrl = shot.dataUrl; ctx.screenshotW = shot.w; ctx.screenshotH = shot.h; }
+        panel.setElementContext(ctx);
+        panel.open();
       }, { captureImage: true });
     } catch (e) {
       pickerActive = false;
       panel.setMarkupActive(false);
       console.warn("[slide-write] picker unavailable:", e);
     }
+  }
+
+  // Capture the visible tab (via the background worker — chrome.tabs isn't available here) and crop
+  // it to the element's rect. The picker's own highlight overlay is gone by now (cleanup() runs
+  // before the pick callback), so it never appears in the shot. Known limitation: the open panel
+  // occupies the right edge of the viewport, so an element behind it would be partly covered.
+  async function captureElementShot(rect) {
+    if (!rect || rect.w < 1 || rect.h < 1) return null;
+    let resp;
+    try { resp = await chrome.runtime.sendMessage({ type: "captureTab" }); } catch { return null; }
+    if (!resp || !resp.ok || !resp.dataUrl) return null;
+    return cropDataUrl(resp.dataUrl, rect);
+  }
+
+  // Crop a viewport PNG (device pixels) to a CSS-px rect. captureVisibleTab renders at
+  // devicePixelRatio, while rect is in CSS px, so scale the source coords by dpr. Clamp to the
+  // viewport (a tall element extending below the fold is captured only to the visible edge) and
+  // downscale to a modest max edge so the data URL stays small. Returns null on any failure.
+  function cropDataUrl(dataUrl, rect) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const dpr = window.devicePixelRatio || 1;
+          const vw = window.innerWidth, vh = window.innerHeight;
+          const x = Math.max(0, rect.x), y = Math.max(0, rect.y);
+          const w = Math.min(rect.w - (x - rect.x), vw - x);
+          const h = Math.min(rect.h - (y - rect.y), vh - y);
+          if (w < 1 || h < 1) return resolve(null);
+          const sx = x * dpr, sy = y * dpr, sw = w * dpr, sh = h * dpr;
+          const max = 1400;
+          const scale = Math.min(1, max / Math.max(sw, sh));
+          const cw = Math.max(1, Math.round(sw * scale)), ch = Math.max(1, Math.round(sh * scale));
+          const canvas = document.createElement("canvas");
+          canvas.width = cw; canvas.height = ch;
+          canvas.getContext("2d").drawImage(img, sx, sy, sw, sh, 0, 0, cw, ch);
+          resolve({ dataUrl: canvas.toDataURL("image/png"), w: Math.round(w), h: Math.round(h) });
+        } catch { resolve(null); }
+      };
+      img.onerror = () => resolve(null);
+      img.src = dataUrl;
+    });
   }
 
   // 7. Keyboard shortcut relayed from the background command.
