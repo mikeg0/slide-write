@@ -12,7 +12,9 @@ async function save(cfg) {
   await chrome.storage.local.set({ [KEY]: cfg });
 }
 
-// Message API. Config shape: { origins: { "<origin>": { enabled, token, shimUrl? } } }.
+// Message API. Config shape:
+//   { geminiKey?, origins: { "<origin>": { enabled, token, shimUrl?, autoReload?, model?, imageInstructions? } } }
+// `geminiKey` is global (one Gemini key for all origins); everything else is per-origin.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     const cfg = await load();
@@ -20,7 +22,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       case "getAll":
         return sendResponse(cfg);
       case "getOrigin":
-        return sendResponse(cfg.origins[msg.origin] || null);
+        // Merge the global Gemini key into the per-origin config the content script consumes.
+        return sendResponse(cfg.origins[msg.origin] ? { ...cfg.origins[msg.origin], geminiKey: cfg.geminiKey || "" } : null);
+      case "setGemini":
+        cfg.geminiKey = msg.value || "";
+        await save(cfg);
+        return sendResponse({ ok: true });
       case "setOrigin": {
         cfg.origins[msg.origin] = { ...(cfg.origins[msg.origin] || {}), ...msg.value };
         await save(cfg);

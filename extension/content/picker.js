@@ -37,9 +37,25 @@ function buildDomPath(el) {
   return parts.join(" > ");
 }
 
-function captureContext(el) {
+// Best-effort capture of an <img>'s current pixels as a PNG data-URL, for image-to-image. Returns
+// null for non-images, not-yet-loaded images, or a tainted (cross-origin, no-CORS) canvas — callers
+// then fall back to pure text-to-image. Downscaled to keep the payload modest.
+function captureImageData(el) {
+  try {
+    if (el.tagName.toLowerCase() !== "img" || !el.complete || !el.naturalWidth) return null;
+    const max = 1024;
+    const scale = Math.min(1, max / Math.max(el.naturalWidth, el.naturalHeight));
+    const w = Math.max(1, Math.round(el.naturalWidth * scale)), h = Math.max(1, Math.round(el.naturalHeight * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    canvas.getContext("2d").drawImage(el, 0, 0, w, h);
+    return canvas.toDataURL("image/png");   // throws if the canvas is tainted (cross-origin)
+  } catch { return null; }
+}
+
+function captureContext(el, captureImage) {
   const r = el.getBoundingClientRect();
-  return {
+  const ctx = {
     tag: el.tagName.toLowerCase(),
     id: el.id || null,
     className: typeof el.className === "string" ? el.className : (el.getAttribute("class") || null),
@@ -47,9 +63,14 @@ function captureContext(el) {
     domPath: buildDomPath(el),
     rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) },
   };
+  if (captureImage) {
+    const dataUrl = captureImageData(el);
+    if (dataUrl) ctx.imageDataUrl = dataUrl;   // present → shim does image-to-image; absent → text-to-image
+  }
+  return ctx;
 }
 
-export function startPicker(onPick) {
+export function startPicker(onPick, { captureImage = false } = {}) {
   let current = null;
 
   const box = document.createElement("div");
@@ -96,7 +117,7 @@ export function startPicker(onPick) {
     suppress(e);
     const hit = skipOwnUI(document.elementFromPoint(e.clientX, e.clientY)) || current;
     cleanup();
-    onPick(hit ? captureContext(hit) : null);
+    onPick(hit ? captureContext(hit, captureImage) : null);
   }
 
   function onKey(e) {

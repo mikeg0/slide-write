@@ -12,6 +12,8 @@
     .fields { display: grid; grid-template-columns: 88px 1fr; gap: 6px 10px; align-items: center; grid-column: 1 / -1; }
     label { font-size: 12px; color: #555; }
     input[type=text], input[type=password] { width: 100%; padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; font: inherit; }
+    textarea { width: 100%; padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; font: inherit; resize: vertical; min-height: 52px; }
+    .global { border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin: 10px 0; display: grid; grid-template-columns: 88px 1fr auto; gap: 6px 10px; align-items: center; }
     .controls { display: flex; gap: 8px; align-items: center; }
     button { padding: 6px 12px; border: 1px solid #bbb; border-radius: 6px; background: #f5f5f7; cursor: pointer; font: inherit; }
     button.primary { background: #4646a0; color: #fff; border-color: #4646a0; }
@@ -27,6 +29,19 @@
     the reverse-proxy fallback, where it derives <code>&lt;origin&gt;/_slidewrite</code>. The token is the
     primary security boundary — use a long random secret.</p>
 
+  <h2>Image generation (Gemini “nano banana”)</h2>
+  <p class="hint">One Gemini API key, shared across all origins, used to generate images for the
+    🖼️ image button. Get a key from Google AI Studio. Stored locally; never committed.</p>
+  <p class="hint">A project's image-save conventions (path, naming, resize, DB/CDN steps) belong
+    <strong>in the target repo</strong> — its <code>CLAUDE.md</code>, or a <code>.claude/skills/</code>
+    image-asset skill (run the shim with <code>--use-skills</code> to load skills). The per-origin
+    “Image steps (override)” field below only layers extra instructions on top, per developer.</p>
+  <div class="global">
+    <label for="gemini-key">Gemini key</label>
+    <input id="gemini-key" type="password" placeholder="GEMINI_API_KEY" />
+    <button id="gemini-save" class="primary" type="button">Save</button>
+  </div>
+
   <h2>Configured origins</h2>
   <div id="list"></div>
 
@@ -37,6 +52,7 @@
       <label for="a-token">Token</label>
       <span style="display:flex;gap:6px"><input id="a-token" type="password" placeholder="SLIDEWRITE_TOKEN" /><button id="a-gen" type="button">Generate</button></span>
       <label for="a-url">Shim URL</label><input id="a-url" type="text" placeholder="http://localhost:4040" />
+      <label for="a-imgsteps">Image steps (override)</label><textarea id="a-imgsteps" placeholder="Optional override — prefer putting image conventions in the repo's CLAUDE.md / a skill. Layered on top, e.g. save to src/assets/generated/, kebab-case, max width 800px, insert a media row…"></textarea>
     </div>
     <p class="controls">
       <label><input id="a-enabled" type="checkbox" checked /> enabled</label>

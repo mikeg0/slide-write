@@ -1,11 +1,11 @@
-export async function streamDesign(shimUrl, token, payload, onEvent, signal) {
-  const res = await fetch(`${shimUrl}/design`, {
+export async function streamDesign(shimUrl, token, payload, onEvent, signal, path = "/design") {
+  const res = await fetch(`${shimUrl}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "Accept": "text/event-stream",
                "Authorization": `Bearer ${token}` },
     body: JSON.stringify(payload), signal,
   });
-  if (!res.ok || !res.body) throw new Error(`design failed: ${res.status}`);
+  if (!res.ok || !res.body) throw new Error(`request failed: ${res.status}`);
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";

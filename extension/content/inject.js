@@ -23,6 +23,8 @@
       token: (c && c.token) || "",
       autoReload: !!(c && c.autoReload),
       model: (c && c.model) || "",   // persisted model selection (empty = use shim default)
+      geminiKey: (c && c.geminiKey) || "",            // global Gemini key (getOrigin merges it in)
+      imageInstructions: (c && c.imageInstructions) || "",  // per-origin image-integration steps
     };
   }
   async function fetchMeta(shimUrl, token) {
@@ -61,7 +63,10 @@
     configured: init.configured,
     autoReload: init.autoReload,
     model: init.model,
+    geminiKey: init.geminiKey,
+    imageInstructions: init.imageInstructions,
     onMarkup: () => startMarkup(),
+    onAddImage: () => startImagePicker(),
     onOpenOptions: () => chrome.runtime.sendMessage({ type: "openOptions" }).catch(() => {}),
     // Persist the model choice per-origin so it survives reloads (background store, §11).
     onSelectModel: (id) => chrome.runtime.sendMessage({ type: "setOrigin", origin: ORIGIN, value: { model: id } }).catch(() => {}),
@@ -73,23 +78,28 @@
   // 6. Markup mode — lazily import the picker (Phase 5). Picks an element, fills the §7 context,
   //    then opens the composer anchored to it. The panel stays open during picking (the picker
   //    skips its own data-slidewrite-ui nodes), so the chat doesn't slide shut on every pick.
-  async function startMarkup() {
+  //    The image variant (🖼️) reuses the same picker but asks it to also capture the element's
+  //    current pixels (for image-to-image), and routes the result into image mode.
+  async function startPick({ image }) {
     if (pickerActive) return;
     pickerActive = true;
-    panel.setMarkupActive(true);
+    const setActive = (on) => image ? panel.setImageActive(on) : panel.setMarkupActive(on);
+    setActive(true);
     try {
       const { startPicker } = await import(chrome.runtime.getURL("content/picker.js"));
       startPicker((ctx) => {
         pickerActive = false;
-        panel.setMarkupActive(false);
-        if (ctx) { panel.setElementContext(ctx); panel.open(); }
-      });
+        setActive(false);
+        if (ctx) { (image ? panel.setImageContext : panel.setElementContext)(ctx); panel.open(); }
+      }, { captureImage: image });
     } catch (e) {
       pickerActive = false;
-      panel.setMarkupActive(false);
+      setActive(false);
       console.warn("[slide-write] picker unavailable:", e);
     }
   }
+  const startMarkup = () => startPick({ image: false });
+  const startImagePicker = () => startPick({ image: true });
 
   // 7. Keyboard shortcut relayed from the background command.
   chrome.runtime.onMessage.addListener((msg) => {
@@ -102,12 +112,15 @@
   let liveCfg = init, lastMeta = meta;
   chrome.storage.onChanged.addListener(async (changes, area) => {
     if (area !== "local" || !changes.slidewrite) return;
-    const next = resolve((changes.slidewrite.newValue?.origins || {})[ORIGIN] || null);
+    const nv = changes.slidewrite.newValue || {};
+    // The global Gemini key lives at the config root; merge it in like background.js's getOrigin does.
+    const next = resolve({ ...((nv.origins || {})[ORIGIN] || null), geminiKey: nv.geminiKey || "" });
     // Only re-fetch /meta when the connection actually changed — a model-only edit (which we write
     // here ourselves on selection) reuses the cached meta, so the dropdown doesn't churn.
     const connChanged = next.shimUrl !== liveCfg.shimUrl || next.token !== liveCfg.token || next.configured !== liveCfg.configured;
     const m = connChanged ? (next.configured ? await fetchMeta(next.shimUrl, next.token) : null) : lastMeta;
     liveCfg = next; lastMeta = m;
-    panel.setConfig({ shimUrl: next.shimUrl, token: next.token, meta: m, autoReload: next.autoReload, configured: next.configured, model: next.model });
+    panel.setConfig({ shimUrl: next.shimUrl, token: next.token, meta: m, autoReload: next.autoReload,
+      configured: next.configured, model: next.model, geminiKey: next.geminiKey, imageInstructions: next.imageInstructions });
   });
 })();

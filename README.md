@@ -175,24 +175,20 @@ The SDK reuses `~/.claude` automatically (or `ANTHROPIC_API_KEY` if set). Run wi
 its JSONL as SSE — same event mapping. The SDK is used here for typed messages.)*
 
 ### 5.2 `shim/slide-write.mjs`
+
+A single `.mjs` file. CLI flags / env
+(`--port`/`--repo`/`--token`/`--origin`/`--model`/`--debug`/`--use-skills`, plus the image flags
+`--gemini-key`/`--gemini-model`/`--image-instructions`) configure it; it stands up an
+`http.createServer` on `127.0.0.1`, and the run logic lives in exported `runDesign(body, emit,
+aborted)` / `runImage(body, emit, aborted, signal)` so the HTTP handler and tests share one
+implementation (the server only starts when the file is run directly, behind an `import.meta.url`
+guard).
+
+**The system prompt is the interesting part** — it's what makes a generic shim behave well against
+any repo. It's deliberately project-agnostic (per-project knowledge comes from the target's own
+`CLAUDE.md`, loaded via `settingSources: ["project"]`):
+
 ```js
-#!/usr/bin/env node
-// slide-write — drive `claude` headless in a repo, stream the run as SSE on loopback.
-// Reuses ~/.claude (no API key). Binds 127.0.0.1 only; reach it via VS Code port forwarding.
-import http from "node:http";
-import { execFile } from "node:child_process";
-import { basename, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { query } from "@anthropic-ai/claude-agent-sdk";
-
-const arg = (k, d) => { const i = process.argv.indexOf(`--${k}`); return i > -1 ? process.argv[i + 1] : d; };
-const PORT    = +(arg("port",   process.env.SLIDEWRITE_PORT   ?? 4040));
-const REPO    = resolve(arg("repo", process.cwd()));
-const TOKEN   = arg("token",  process.env.SLIDEWRITE_TOKEN ?? "");
-const ORIGIN  = arg("origin", process.env.SLIDEWRITE_ALLOWED_ORIGIN ?? "*"); // app origin, e.g. http://localhost:5173
-const DEBUG   = process.argv.includes("--debug") || !!process.env.SW_DEBUG;  // log each SDK message to stderr
-const VERSION = "0.1.0";
-
 const PREAMBLE =
   "You are editing a web app live from within its running dev environment. Your edits land on the " +
   "repo at the working directory and the app's own dev server hot-reloads, so changes appear in the " +
@@ -204,144 +200,43 @@ const PREAMBLE =
   "- Do NOT edit Dockerfiles, CI, or anything under .claude / .env / credentials.\n" +
   "- Keep schema/model changes ADDITIVE; never rename/drop/retype an existing column.\n" +
   "- When done, reply with one or two sentences describing exactly what you changed.";
-
-const git = (...a) => new Promise(r => execFile("git", ["-C", REPO, ...a], (_e, out) => r((out || "").trim())));
-// NB: parse porcelain UNtrimmed — `" M file"` starts with a space the status column needs.
-const porcelainPaths = () => new Promise(r => execFile("git", ["-C", REPO, "status", "--porcelain", "-uall"],
-  (_e, out) => r((out || "").split("\n").filter(Boolean).map(l => l.slice(3)))));
-const cors = (res) => {
-  res.setHeader("Access-Control-Allow-Origin", ORIGIN);
-  res.setHeader("Access-Control-Allow-Headers", "authorization, content-type");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Private-Network", "true"); // for https→localhost (PNA); harmless otherwise
-};
-const authed = (req) => !!TOKEN && req.headers.authorization === `Bearer ${TOKEN}`;
-const json = (res, code, obj) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
-const sse  = (res, type, data = {}) => res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
-const readBody = (req) => new Promise((r) => { let b = ""; req.on("data", c => b += c); req.on("end", () => r(b)); });
-
-let busy = false;
-
-function buildPrompt({ prompt = "", screen, element }) {
-  const parts = [String(prompt).trim()];
-  if (screen) parts.push(`\n[Current screen: ${screen}]`);
-  if (element) {
-    const ctx = Object.fromEntries(Object.entries({
-      tag: element.tag, id: element.id, class: element.className,
-      text: element.text, domPath: element.domPath, rect: element.rect,
-    }).filter(([, v]) => v));
-    if (Object.keys(ctx).length)
-      parts.push("\n[The user clicked this on-screen element and is referring to it]\n" +
-        JSON.stringify(ctx, null, 2) +
-        "\nUse the class names / text / DOM path to locate the source and matching styles, then edit there.");
-  }
-  return parts.join("\n");
-}
-
-const detailOf = (name, i = {}) =>
-  name === "Bash" ? (i.command || "") :
-  ["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"].includes(name) ? (i.file_path || i.notebook_path || "") :
-  name === "Grep" || name === "Glob" ? (i.pattern || "") : JSON.stringify(i).slice(0, 600);
-
-function resultText(content) {
-  let t = typeof content === "string" ? content
-    : Array.isArray(content) ? content.map(b => b?.type === "text" ? b.text : JSON.stringify(b)).join("\n")
-    : String(content ?? "");
-  const trunc = t.length > 4000; return { text: t.slice(0, 4000).trim(), trunc };
-}
-
-// Core: drive one design run. `emit(type, data)` sends an SSE event; `aborted()` lets the caller
-// cancel (client disconnect). Exported so the HTTP handler and tests share one implementation.
-export async function runDesign(body, emit, aborted = () => false) {
-  const tool = {}; let streamedText = false, hadError = false;
-  const dirty0 = new Set(await porcelainPaths());
-  for await (const m of query({ prompt: buildPrompt(body), options: {
-    cwd: REPO, permissionMode: "bypassPermissions",  // runs as you (non-root) → allowed, no callback
-    allowDangerouslySkipPermissions: true,           // required by the SDK alongside bypassPermissions
-    includePartialMessages: true, settingSources: ["project"], systemPrompt: PREAMBLE, maxTurns: 40,
-  } })) {
-    if (aborted()) return;
-    if (DEBUG) console.error("SDK", m.type, m.subtype ?? "");
-    if (m.type === "system" && m.subtype === "init") emit("start", { sessionId: m.session_id, model: m.model });
-    else if (m.type === "stream_event" && m.event?.type === "content_block_delta") {
-      const d = m.event.delta;
-      if (d.type === "text_delta" && d.text) { streamedText = true; emit("delta", { text: d.text }); }
-      else if (d.type === "thinking_delta" && d.thinking) emit("thinking_delta", { text: d.thinking });
-    }
-    else if (m.type === "assistant") for (const b of m.message.content ?? []) {
-      if (b.type !== "tool_use") continue;
-      tool[b.id] = b.name;
-      if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(b.name))
-        emit("file_edit", { tool: b.name, path: (b.input?.file_path || "").replace(REPO + "/", ""), id: b.id });
-      else emit("tool", { tool: b.name, detail: detailOf(b.name, b.input), id: b.id });
-    }
-    else if (m.type === "user") for (const b of (Array.isArray(m.message.content) ? m.message.content : [])) {
-      if (b.type !== "tool_result") continue;
-      const { text, trunc } = resultText(b.content);
-      emit("tool_result", { tool: tool[b.tool_use_id], id: b.tool_use_id, text, isError: !!b.is_error, truncated: trunc });
-    }
-    else if (m.type === "result") {
-      hadError = !!m.is_error;
-      emit("result", { isError: hadError, numTurns: m.num_turns, durationMs: m.duration_ms,
-        totalCostUsd: m.total_cost_usd, usage: m.usage, result: streamedText ? null : m.result });
-    }
-  }
-  if (!hadError) {                                                   // commit only what THIS run changed; no push
-    const changed = (await porcelainPaths()).filter(p => !dirty0.has(p));
-    if (changed.length) {
-      const subj = (body.prompt || "design change").split("\n")[0].slice(0, 72);
-      await git("add", "--", ...changed);
-      await git("-c", "user.name=Slide Write", "-c", "user.email=slide-write@local", "commit", "-m", `slide-write: ${subj}`);
-      emit("commit", { sha: await git("rev-parse", "--short", "HEAD"), count: changed.length });
-    }
-  }
-  emit("done");
-}
-
-async function design(req, res) {
-  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "connection": "keep-alive" });
-  if (busy) { sse(res, "error", { message: "a run is already in progress" }); sse(res, "done"); return res.end(); }
-  busy = true;
-  try {
-    const body = JSON.parse((await readBody(req)) || "{}");
-    await runDesign(body, (t, d) => sse(res, t, d), () => req.destroyed);
-  } catch (e) { sse(res, "error", { message: String(e?.message || e) }); sse(res, "done"); }
-  finally { busy = false; res.end(); }
-}
-
-function serve() {
-  http.createServer(async (req, res) => {
-    cors(res);
-    if (req.method === "OPTIONS") return res.writeHead(204).end();
-    const path = new URL(req.url, "http://x").pathname;
-    if (path === "/health") return json(res, 200, { ok: true });
-    if (!authed(req)) return json(res, 401, { error: "unauthorized" });
-    if (path === "/meta")
-      return json(res, 200, {
-        project: basename(REPO), repoDir: REPO, version: VERSION,
-        branch: await git("rev-parse", "--abbrev-ref", "HEAD"),
-        dirty: !!(await git("status", "--porcelain")),
-      });
-    if (path === "/history" && req.method === "GET")        // list this repo's past `claude` sessions
-      return json(res, 200, { sessions: await listHistory() });
-    if (path.startsWith("/history/") && req.method === "GET") {  // one session, normalized to §6 events
-      const id = decodeURIComponent(path.slice("/history/".length));
-      const data = await readHistory(id);                   // null for a bad/missing id → 404
-      return data ? json(res, 200, data) : json(res, 404, { error: "not found" });
-    }
-    if (path === "/design" && req.method === "POST") return design(req, res);
-    json(res, 404, { error: "not found" });
-  }).listen(PORT, "127.0.0.1", () =>
-    console.error(`slide-write → http://127.0.0.1:${PORT}  repo=${REPO}  origin=${ORIGIN}`));
-}
-
-// Start the server only when run directly (so tests can import runDesign without listening).
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) serve();
 ```
 
-**Validated against `@anthropic-ai/claude-agent-sdk` 0.3.168** (the run logic lives in the exported `runDesign()`; the HTTP server only starts when the file is run directly, so tests can import `runDesign`). **SDK version caveat:** message/block shapes (`stream_event` deltas, `tool_use`/`tool_result`
-blocks) can drift across SDK versions. The loop dispatches on `m.type` defensively; verify against
-the installed `@anthropic-ai/claude-agent-sdk` during the phase-1 smoke test ([§12](#12-build-order-for-claude)).
+The other load-bearing bit is **how a clicked element becomes prompt context.** `buildPrompt()`
+joins the typed request with the current `screen` and a compact JSON of the element's
+tag/class/text/`domPath`, then instructs `claude` to use those to locate the source:
+
+```js
+parts.push("\n[The user clicked this on-screen element and is referring to it]\n" +
+  JSON.stringify(ctx, null, 2) +
+  "\nUse the class names / text / DOM path to locate the source and matching styles, then edit there.");
+```
+
+Everything else is mechanical and may be implemented freely as long as it honors these contracts:
+
+- **The SDK run loop.** `query({ prompt, options })` is driven with `cwd: REPO`,
+  `permissionMode: "bypassPermissions"` **plus** `allowDangerouslySkipPermissions: true` (the SDK
+  requires both; the shim runs as you/non-root, so no permission callback is needed),
+  `includePartialMessages: true`, `settingSources: ["project"]`, `systemPrompt: PREAMBLE`,
+  `maxTurns: 40`. The loop dispatches on `m.type` and maps each SDK message to a §6 SSE event —
+  `system/init`→`start`, `content_block_delta`→`delta`/`thinking_delta`, `tool_use`→`file_edit`
+  (for Edit/Write/MultiEdit/NotebookEdit) or `tool`, `tool_result`→`tool_result`, `result`→`result`.
+  `--debug`/`SW_DEBUG` logs each `m.type`/`m.subtype` to stderr. Bail immediately when `aborted()`
+  (client disconnect) returns true. `--use-skills`/`SLIDEWRITE_USE_SKILLS` adds `skills: "all"` so the
+  target repo's `.claude/skills/` are loaded (off by default — `settingSources:["project"]` alone does
+  not enable skills).
+- **Auto-commit only what this run changed.** Snapshot `git status --porcelain -uall` before the
+  run, diff after, `git add` + commit just the new paths under a `Slide Write` identity (no push),
+  emit `commit`. **Parse porcelain untrimmed** (`line.slice(3)`) — the leading status-column space
+  is significant, so a path's first character would be eaten by a trimming helper.
+- **HTTP server.** CORS (allow only `ORIGIN`; include `Access-Control-Allow-Private-Network`),
+  a `Bearer <token>` gate on every route except `/health` (401 first), the `busy` single-run lock,
+  and routes `/health`, `/meta`, `/history`, `/history/<id>`, `POST /design`, `POST /generate-image`.
+
+**Validated against `@anthropic-ai/claude-agent-sdk` 0.3.168.** Message/block shapes (`stream_event`
+deltas, `tool_use`/`tool_result` blocks) can drift across SDK versions; the loop dispatches on
+`m.type` defensively — verify against the installed SDK during the phase-1 smoke test
+([§12](#12-build-order-for-claude)).
 
 ---
 
@@ -360,6 +255,8 @@ Every frame is **one JSON object on a `data:` line**; the client reads only `dat
 | `tool_result` | `{tool, id, text, isError, truncated}` | collapsible output (auto-open on error) |
 | `result` | `{isError, numTurns, durationMs, totalCostUsd, usage, result}` | stats footer; `result` is the final-text fallback if no deltas streamed |
 | `commit` | `{sha, count}` | green "Committed `<sha>` · N files" |
+| `image_status` | `{state}` | status row (`state:"generating"` → "generating image…"); emitted only by `/generate-image` |
+| `image_generated` | `{tmpPath, mimeType, bytes}` | note row "🖼️ image generated"; metadata only (no image bytes over the wire) |
 | `error` | `{message}` | error row |
 | `done` | `{}` | end of stream; clear the busy indicator |
 
@@ -374,6 +271,56 @@ shim validates it against an allowlist advertised by `/meta` (`{ models: [{id,la
 an unknown/absent id falls back to the shim's `--model`/`SLIDEWRITE_MODEL` default, or the SDK's own
 default when that's unset. The model the SDK actually runs is echoed back in the `start` event. The
 extension renders the `/meta` list in a composer dropdown and persists the choice per-origin.
+
+**Image generation (additive — Gemini "nano banana").** `POST /generate-image` is an SSE route
+(same Bearer+CORS gate, same `busy` lock and per-run auto-commit as `/design`). It takes
+`{ imagePrompt, element, geminiKey, imageInstructions, screen, model }`. The shim calls Google's
+Generative Language API (model id from `--gemini-model`/`SLIDEWRITE_GEMINI_MODEL`, default
+`gemini-2.5-flash-image`) with the key in an `x-goog-api-key` header — never the URL, so it can't
+leak into logs. If `element.imageDataUrl` is present (the user picked an `<img>`; the picker captured
+its pixels via canvas), it's sent as an inline image part for image-to-image; otherwise it's
+text-to-image. The decoded image is written to a temp file **outside the repo**, an `image_generated`
+event fires, and the shim then drives `claude` (via the normal §6 stream) to copy the asset into the
+project and wire it into the picked element. Key resolution: `body.geminiKey` →
+`--gemini-key`/`GEMINI_API_KEY`; missing → an `error` event. `/meta` advertises
+`{ geminiModel, geminiEnv }` (`geminiEnv` = the shim has a server-side key). The extension stores one
+**global** Gemini key (shared across origins).
+
+**Where image-save conventions live (precedence low→high).** Save path, naming, resizing, DB/CDN
+steps differ per project, so they belong **in the target repo**, not the browser:
+
+1. **`CLAUDE.md` `## Image assets` section** — the default; always in context, deterministic, no code
+   change. The shim's image prompt already says "follow the project's image conventions."
+2. **`.claude/skills/image-asset/SKILL.md`** — for *procedural* handling (resize with a bundled
+   script, multi-dir, insert a `media` row, push to a CDN). A Skill can ship scripts and is
+   model-invoked by its `description`. **Requires running the shim with `--use-skills`** (or
+   `SLIDEWRITE_USE_SKILLS=1`) — `settingSources:["project"]` alone does *not* enable skills; that flag
+   passes `skills:"all"` to the SDK query (and applies to `/design` too). Use a Skill when the
+   procedure is large/reusable; use CLAUDE.md when it's just a path/naming rule.
+3. **Per-origin “Image steps (override)”** — the extension field (sent as `imageInstructions`,
+   appended last, wins). A per-developer override / quick experiment, *not* the source of truth.
+   Falls back to `--image-instructions`/`SLIDEWRITE_IMAGE_INSTRUCTIONS`.
+
+Minimal `.claude/skills/image-asset/SKILL.md` in a target repo:
+
+```markdown
+---
+name: image-asset
+description: Save a generated/provided image into this app and reference it. Use whenever an image
+  file needs to be added to the project and wired into a component.
+---
+- Put images in `src/assets/generated/`, kebab-cased from the prompt, `.webp` when possible.
+- Resize to max width 1024 with `node scripts/resize.mjs <file>`.
+- Import the asset in the component (Vite `import url from '…'`); never hardcode `/public` paths.
+- After adding, insert a row into the `media` table via `npm run media:register -- <path>`.
+```
+
+…or, for simple projects, just a CLAUDE.md stub:
+
+```markdown
+## Image assets
+Generated images go in `public/img/`, kebab-cased; reference them with a root-relative `/img/…` URL.
+```
 
 **Chat history (read-only).** `claude` writes one `.jsonl` transcript per session under
 `~/.claude/projects/<encoded-cwd>/` (the cwd with every non-alphanumeric char turned into a single
@@ -409,11 +356,16 @@ current route/view):
   "className": "btn btn-primary",   // full class string
   "text": "New",                    // textContent, trimmed, ≤120 chars
   "domPath": "div.topbar > button.btn.btn-primary",  // nth-of-type chain, ≤5 ancestors, stops at first id
-  "rect": { "x": 1180, "y": 16, "w": 64, "h": 32 }
+  "rect": { "x": 1180, "y": 16, "w": 64, "h": 32 },
+  "imageDataUrl": "data:image/png;base64,…"   // optional; only in image mode (🖼️), only for an <img>
 }
 ```
 Centralized, semantic class names usually pinpoint the source; for CSS-in-JS / hashed classes, lean
 on `text` + `domPath` + `screen`, or add framework-fiber data ([§8.4](#84-the-widget--remaining-files)).
+
+`imageDataUrl` is added only when picking in image mode and the target is an `<img>` whose pixels the
+picker could read (same-origin / CORS-enabled canvas; tainted images are silently skipped). It drives
+image-to-image in `/generate-image`; everything else is unchanged.
 
 ---
 

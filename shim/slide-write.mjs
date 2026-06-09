@@ -4,7 +4,7 @@
 import http from "node:http";
 import os from "node:os";
 import { execFile } from "node:child_process";
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { query } from "@anthropic-ai/claude-agent-sdk";
@@ -15,6 +15,10 @@ const REPO    = resolve(arg("repo", process.cwd()));
 const TOKEN   = arg("token",  process.env.SLIDEWRITE_TOKEN ?? "");
 const ORIGIN  = arg("origin", process.env.SLIDEWRITE_ALLOWED_ORIGIN ?? "*"); // app origin, e.g. http://localhost:5173
 const DEBUG   = process.argv.includes("--debug") || !!process.env.SW_DEBUG;  // log each SDK message to stderr
+// Opt-in: load the target repo's Agent Skills (.claude/skills/*/SKILL.md) so projects can define
+// their own image-asset / design procedures. `settingSources:["project"]` alone does NOT enable
+// skills — the `skills` query option does (and the SDK auto-adds the Skill tool when it's set).
+const USE_SKILLS = process.argv.includes("--use-skills") || !!process.env.SLIDEWRITE_USE_SKILLS;
 const VERSION = "0.1.0";
 
 // Models the UI may pick from. Advertised via /meta so the client dropdown stays server-driven; a
@@ -28,6 +32,14 @@ const MODELS = [
 ];
 const DEFAULT_MODEL = arg("model", process.env.SLIDEWRITE_MODEL ?? ""); // "" = let the SDK decide
 const modelAllowed  = (m) => MODELS.some((x) => x.id === m);
+
+// Gemini "nano banana" image generation. Model id is overridable so a rename doesn't need a code
+// edit. The key is a shim-level fallback used only when a /generate-image request omits one (the
+// extension normally sends it). IMAGE_INSTRUCTIONS is a fallback for the per-project integration
+// steps (asset path, naming, DB write, resize) the request normally carries.
+const GEMINI_MODEL = arg("gemini-model", process.env.SLIDEWRITE_GEMINI_MODEL ?? "gemini-2.5-flash-image");
+const GEMINI_KEY   = arg("gemini-key",   process.env.GEMINI_API_KEY ?? "");
+const IMAGE_INSTRUCTIONS = arg("image-instructions", process.env.SLIDEWRITE_IMAGE_INSTRUCTIONS ?? "");
 
 const PREAMBLE =
   "You are editing a web app live from within its running dev environment. Your edits land on the " +
@@ -58,19 +70,55 @@ const readBody = (req) => new Promise((r) => { let b = ""; req.on("data", c => b
 
 let busy = false;
 
+// The §7 element-capture contract, serialized for the prompt. Single-sourced so buildPrompt and
+// buildImagePrompt stay in sync. Returns null when there's nothing useful to send.
+function elementContext(element) {
+  if (!element) return null;
+  const ctx = Object.fromEntries(Object.entries({
+    tag: element.tag, id: element.id, class: element.className,
+    text: element.text, domPath: element.domPath, rect: element.rect,
+  }).filter(([, v]) => v));
+  return Object.keys(ctx).length ? ctx : null;
+}
+
 function buildPrompt({ prompt = "", screen, element }) {
   const parts = [String(prompt).trim()];
   if (screen) parts.push(`\n[Current screen: ${screen}]`);
-  if (element) {
-    const ctx = Object.fromEntries(Object.entries({
-      tag: element.tag, id: element.id, class: element.className,
-      text: element.text, domPath: element.domPath, rect: element.rect,
-    }).filter(([, v]) => v));
-    if (Object.keys(ctx).length)
-      parts.push("\n[The user clicked this on-screen element and is referring to it]\n" +
-        JSON.stringify(ctx, null, 2) +
-        "\nUse the class names / text / DOM path to locate the source and matching styles, then edit there.");
-  }
+  const ctx = elementContext(element);
+  if (ctx)
+    parts.push("\n[The user clicked this on-screen element and is referring to it]\n" +
+      JSON.stringify(ctx, null, 2) +
+      "\nUse the class names / text / DOM path to locate the source and matching styles, then edit there.");
+  return parts.join("\n");
+}
+
+// Prompt for an image run: the image already exists on disk at `tmpPath` (outside the repo). Tell
+// claude to place it per the project's conventions and wire it into the picked element. Stays
+// generic — framework specifics live in the target repo's CLAUDE.md. The per-project
+// `imageInstructions` (exact path, naming, DB write, resize…) are appended last and take precedence.
+function buildImagePrompt({ imagePrompt = "", screen, element, imageInstructions }, tmpPath, hasSource) {
+  const parts = [
+    (hasSource
+      ? "A newly edited version of the selected image has been generated and saved on disk at:"
+      : "A new image has been generated and saved on disk at:") +
+    `\n  ${tmpPath}\n(this file is OUTSIDE the repo). Then:\n` +
+    "1. If this project defines an image-asset Skill or documents image conventions in its CLAUDE.md / " +
+    "README (save path, naming, resizing, database/CDN steps), FOLLOW THAT. Otherwise copy the file into " +
+    "the project's conventional static-assets location (the framework-appropriate public/static dir, or " +
+    "an imported asset) with a descriptive filename.\n" +
+    "2. Wire it into the on-screen element the user selected: set the <img>'s src, or the element's CSS " +
+    "background-image, matching the existing patterns in the source.\n\n" +
+    `Original image request: ${String(imagePrompt).trim()}`,
+  ];
+  if (screen) parts.push(`\n[Current screen: ${screen}]`);
+  const ctx = elementContext(element);
+  if (ctx)
+    parts.push("\n[The user selected this on-screen element — place the image here]\n" +
+      JSON.stringify(ctx, null, 2) +
+      "\nUse the class names / text / DOM path to locate the source, then edit there.");
+  const extra = (imageInstructions || "").trim();
+  if (extra)
+    parts.push("\n[Project-specific integration steps — follow these exactly; they take precedence over the above]\n" + extra);
   return parts.join("\n");
 }
 
@@ -201,23 +249,53 @@ async function readHistory(id) {
   return { id, events };
 }
 
-// Core: drive one design run. `emit(type, data)` sends an SSE event; `aborted()` lets the caller
-// cancel (client disconnect). Exported so the HTTP handler and tests share one implementation.
-export async function runDesign(body, emit, aborted = () => false) {
+// Generate (or edit) an image with Gemini "nano banana" via the Generative Language REST API.
+// Generic — knows nothing about the target repo. The key goes in a header (never the URL, so it
+// can't leak into request logs); `image` (optional, {mimeType,data}) makes it image-to-image.
+// Returns decoded bytes + mime, or throws a clean, key-free Error.
+async function generateImage({ prompt, key, image, signal }) {
+  const parts = [];
+  if (image) parts.push({ inlineData: { mimeType: image.mimeType, data: image.data } });
+  parts.push({ text: prompt });
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`,
+    { method: "POST", signal,
+      headers: { "content-type": "application/json", "x-goog-api-key": key },
+      body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseModalities: ["TEXT", "IMAGE"] } }) },
+  );
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try { msg = JSON.parse(await res.text())?.error?.message || msg; } catch { /* non-JSON body */ }
+    throw new Error(`Gemini ${res.status}: ${msg}`);
+  }
+  const data = await res.json();
+  if (data.promptFeedback?.blockReason) throw new Error(`Gemini blocked the prompt: ${data.promptFeedback.blockReason}`);
+  const cand = data.candidates?.[0];
+  for (const p of cand?.content?.parts ?? []) {
+    const inl = p.inlineData || p.inline_data;            // v1beta JSON returns camelCase; accept both
+    if (inl?.data) return { bytes: Buffer.from(inl.data, "base64"), mimeType: inl.mimeType || inl.mime_type || "image/png" };
+  }
+  const why = cand?.finishReason && cand.finishReason !== "STOP" ? ` (finishReason: ${cand.finishReason})` : "";
+  throw new Error(`Gemini returned no image${why}`);
+}
+
+// Drive one `claude` query, streaming the §6 SSE events. Returns whether the run errored. Shared by
+// runDesign and runImage so the event contract lives in one place.
+async function streamQuery(prompt, body, emit, aborted) {
   const tool = {}; let streamedText = false, hadError = false;
-  const dirty0 = new Set(await porcelainPaths());
   // Resolve the requested model against the allowlist; fall back to DEFAULT_MODEL (or, if that's
   // unset, omit `model` entirely so the SDK uses its own default). The actual model the SDK runs is
   // echoed back to the client in the `start` event from system/init.
   const model = modelAllowed(body.model) ? body.model : (DEFAULT_MODEL || undefined);
-  for await (const m of query({ prompt: buildPrompt(body), options: {
+  for await (const m of query({ prompt, options: {
     cwd: REPO, permissionMode: "bypassPermissions",  // runs as you (non-root) → allowed, no callback
     allowDangerouslySkipPermissions: true,           // required by the SDK alongside bypassPermissions
     includePartialMessages: true, settingSources: ["project"], systemPrompt: PREAMBLE, maxTurns: 40,
+    ...(USE_SKILLS ? { skills: "all" } : {}),                         // load the target repo's project skills
     ...(model ? { model } : {}),
     ...(validSessionId(body.resume) ? { resume: body.resume } : {}),  // continue a prior session if asked
   } })) {
-    if (aborted()) return;
+    if (aborted()) return hadError;
     if (DEBUG) console.error("SDK", m.type, m.subtype ?? "");
     if (m.type === "system" && m.subtype === "init") emit("start", { sessionId: m.session_id, model: m.model });
     else if (m.type === "stream_event" && m.event?.type === "content_block_delta") {
@@ -243,19 +321,58 @@ export async function runDesign(body, emit, aborted = () => false) {
         totalCostUsd: m.total_cost_usd, usage: m.usage, result: streamedText ? null : m.result });
     }
   }
-  if (!hadError) {                                                   // commit only what THIS run changed; no push
-    const changed = (await porcelainPaths()).filter(p => !dirty0.has(p));
-    if (changed.length) {
-      const subj = (body.prompt || "design change").split("\n")[0].slice(0, 72);
-      await git("add", "--", ...changed);
-      await git("-c", "user.name=Slide Write", "-c", "user.email=slide-write@local", "commit", "-m", `slide-write: ${subj}`);
-      emit("commit", { sha: await git("rev-parse", "--short", "HEAD"), count: changed.length });
-    }
-  }
+  return hadError;
+}
+
+// Commit only what THIS run changed (diff of porcelain before/after); no push.
+async function commitChanged(dirty0, subj, emit) {
+  const changed = (await porcelainPaths()).filter(p => !dirty0.has(p));
+  if (!changed.length) return;
+  await git("add", "--", ...changed);
+  await git("-c", "user.name=Slide Write", "-c", "user.email=slide-write@local", "commit", "-m", `slide-write: ${subj}`);
+  emit("commit", { sha: await git("rev-parse", "--short", "HEAD"), count: changed.length });
+}
+
+// Core: drive one design run. `emit(type, data)` sends an SSE event; `aborted()` lets the caller
+// cancel (client disconnect). Exported so the HTTP handler and tests share one implementation.
+export async function runDesign(body, emit, aborted = () => false) {
+  const dirty0 = new Set(await porcelainPaths());
+  const hadError = await streamQuery(buildPrompt(body), body, emit, aborted);
+  if (aborted()) return;
+  if (!hadError) await commitChanged(dirty0, (body.prompt || "design change").split("\n")[0].slice(0, 72), emit);
   emit("done");
 }
 
-async function design(req, res) {
+// Image run: generate the image with Gemini, save it to a temp file OUTSIDE the repo, then drive
+// `claude` to place it and wire it into the picked element. The fourth arg is an AbortSignal so the
+// (potentially slow) Gemini fetch is cancelled on client disconnect, not just the polled SDK loop.
+export async function runImage(body, emit, aborted = () => false, signal) {
+  const key = body.geminiKey || GEMINI_KEY;
+  if (!key) { emit("error", { message: "no Gemini API key — set one in the extension options" }); return emit("done"); }
+  emit("image_status", { state: "generating" });
+  // Optional source image for image-to-image (the user picked an <img>): data:<mime>;base64,<data>.
+  let image;
+  const m = /^data:([^;,]+);base64,(.+)$/s.exec(body.element?.imageDataUrl || "");
+  if (m) image = { mimeType: m[1], data: m[2] };
+  const { bytes, mimeType } = await generateImage({ prompt: body.imagePrompt || "", key, image, signal });
+  if (aborted()) return;
+  const ext = mimeType.includes("jpeg") ? "jpg" : mimeType.includes("webp") ? "webp" : "png";
+  const tmpPath = join(os.tmpdir(), `slidewrite-${Date.now()}.${ext}`);
+  await writeFile(tmpPath, bytes);
+  emit("image_generated", { tmpPath, mimeType, bytes: bytes.length });  // metadata only — no base64 over the wire
+  if (aborted()) return;
+  const dirty0 = new Set(await porcelainPaths());
+  const prompt = buildImagePrompt({ ...body, imageInstructions: body.imageInstructions || IMAGE_INSTRUCTIONS }, tmpPath, !!image);
+  const hadError = await streamQuery(prompt, body, emit, aborted);
+  if (aborted()) return;
+  if (!hadError) await commitChanged(dirty0, `add image — ${(body.imagePrompt || "add image").split("\n")[0].slice(0, 72)}`, emit);
+  emit("done");
+}
+
+// Generic SSE wrapper: enforce the busy lock, set stream headers, parse the body, run `runner`, and
+// always res.end(). An AbortController is tied to an early client disconnect so an in-flight fetch
+// (Gemini) is cancelled too; the polled `aborted()` continues to guard the SDK loop.
+async function streamRun(req, res, runner) {
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "connection": "keep-alive" });
   if (busy) { sse(res, "error", { message: "a run is already in progress" }); sse(res, "done"); return res.end(); }
   busy = true;
@@ -264,10 +381,11 @@ async function design(req, res) {
   // disconnect — using it aborts every run on the first SDK message. Watch the *response* for an
   // early `close` (before we've called res.end()) instead.
   let clientGone = false;
-  res.on("close", () => { if (!res.writableEnded) clientGone = true; });
+  const ac = new AbortController();
+  res.on("close", () => { if (!res.writableEnded) { clientGone = true; ac.abort(); } });
   try {
     const body = JSON.parse((await readBody(req)) || "{}");
-    await runDesign(body, (t, d) => sse(res, t, d), () => clientGone);
+    await runner(body, (t, d) => sse(res, t, d), () => clientGone, ac.signal);
   } catch (e) { sse(res, "error", { message: String(e?.message || e) }); sse(res, "done"); }
   finally { busy = false; res.end(); }
 }
@@ -285,6 +403,7 @@ function serve() {
         branch: await git("rev-parse", "--abbrev-ref", "HEAD"),
         dirty: !!(await git("status", "--porcelain")),
         models: MODELS, defaultModel: DEFAULT_MODEL || MODELS[0].id,
+        geminiModel: GEMINI_MODEL, geminiEnv: !!GEMINI_KEY,  // geminiEnv: shim has a server-side key fallback
       });
     if (path === "/history" && req.method === "GET")
       return json(res, 200, { sessions: await listHistory() });
@@ -293,7 +412,8 @@ function serve() {
       const data = await readHistory(id);
       return data ? json(res, 200, data) : json(res, 404, { error: "not found" });
     }
-    if (path === "/design" && req.method === "POST") return design(req, res);
+    if (path === "/design" && req.method === "POST") return streamRun(req, res, runDesign);
+    if (path === "/generate-image" && req.method === "POST") return streamRun(req, res, runImage);
     json(res, 404, { error: "not found" });
   }).listen(PORT, "127.0.0.1", () =>
     console.error(`slide-write → http://127.0.0.1:${PORT}  repo=${REPO}  origin=${ORIGIN}`));

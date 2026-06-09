@@ -31,6 +31,7 @@ async function render() {
       <div class="fields">
         <label>Token</label><input type="password" class="tok" value="${c.token || ""}"/>
         <label>Shim URL</label><input type="text" class="url" value="${c.shimUrl || ""}" placeholder="http://localhost:4040"/>
+        <label>Image steps (override)</label><textarea class="imgsteps" placeholder="Optional override — prefer the repo's CLAUDE.md / a skill. Layered on top (path, naming, DB write, resize…)">${c.imageInstructions || ""}</textarea>
       </div>`;
     row.querySelector(".save").addEventListener("click", async () => {
       await send({ type: "setOrigin", origin, value: {
@@ -38,6 +39,7 @@ async function render() {
         autoReload: row.querySelector(".ar").checked,
         token: row.querySelector(".tok").value.trim(),
         shimUrl: row.querySelector(".url").value.trim() || undefined,
+        imageInstructions: row.querySelector(".imgsteps").value.trim(),
       }});
       flash(row.querySelector(".save"), "Saved");
     });
@@ -60,6 +62,13 @@ $("a-gen").addEventListener("click", () => {
   $("a-token").type = "text";
 });
 
+// Global Gemini key — one secret shared across all origins.
+async function loadGemini() { $("gemini-key").value = (await send({ type: "getAll" })).geminiKey || ""; }
+$("gemini-save").addEventListener("click", async () => {
+  await send({ type: "setGemini", value: $("gemini-key").value.trim() });
+  flash($("gemini-save"), "Saved");
+});
+
 $("add").addEventListener("click", async () => {
   const origin = normOrigin($("a-origin").value);
   if (!origin) return;
@@ -68,8 +77,9 @@ $("add").addEventListener("click", async () => {
     autoReload: $("a-autoreload").checked,
     token: $("a-token").value.trim(),
     shimUrl: $("a-url").value.trim() || undefined,
+    imageInstructions: $("a-imgsteps").value.trim(),
   }});
-  $("a-origin").value = $("a-token").value = $("a-url").value = "";
+  $("a-origin").value = $("a-token").value = $("a-url").value = $("a-imgsteps").value = "";
   render();
 });
 
@@ -80,3 +90,4 @@ try {
 } catch { /* no/invalid query param */ }
 
 render();
+loadGemini();

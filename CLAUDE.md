@@ -8,10 +8,13 @@ element-picker + chat overlay into the running app. Click an element or type a r
 edits the real source → the dev server hot-reloads. **README.md is the authoritative spec** — read
 it and implement/extend in the order of its §12 "Build order for Claude".
 
-**Current state: spec-only.** Only README.md exists; `shim/` and `extension/` aren't built yet. The
-README inlines every contract and the load-bearing code verbatim (§5 shim, §8.2 SSE reader) — treat
-those as authoritative; the mechanical parts (UI rendering, helpers) may be implemented freely as
-long as they honor the contracts.
+**Current state: built.** Both `shim/` and `extension/` exist and run; on top of the original
+`/design` flow the shim adds chat history, session resume, model selection, and **Gemini "nano
+banana" image generation** (`POST /generate-image`, the `image_status`/`image_generated` SSE events,
+and the §7 `imageDataUrl` capture field). README.md remains the authoritative spec — it inlines every
+contract and the load-bearing code verbatim (§5 shim, §8.2 SSE reader); treat those as authoritative
+and extend them in lockstep. The mechanical parts (UI rendering, helpers) may be implemented freely
+as long as they honor the contracts.
 
 ## Architecture (two deliverables)
 - `shim/` — a cross-platform **Node CLI** (`slide-write.mjs`) that serves HTTP+SSE on
