@@ -1,7 +1,7 @@
 // Slide Write — chat panel: transcript + composer. Renders the §6 SSE event contract.
 // Free-to-implement UI; the contract it honors is fixed: each event `type` maps to a row, and
 // consecutive same-role streaming deltas coalesce into one bubble (tool/result rows break the chain).
-import { streamDesign } from "./sse.js";
+import { streamDesign, fetchHistory, fetchHistoryDetail } from "./sse.js";
 
 function el(tag, props = {}, children = []) {
   const n = document.createElement(tag);
@@ -23,6 +23,17 @@ function tokens(usage) {
   const i = usage.input_tokens || 0, o = usage.output_tokens || 0;
   const c = (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
   return `${i + c} in / ${o} out`;
+}
+function relTime(iso) {
+  if (!iso) return "";
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "";
+  const s = Math.max(0, (Date.now() - then) / 1000);
+  if (s < 60) return "just now";
+  const m = s / 60; if (m < 60) return `${Math.floor(m)}m ago`;
+  const h = m / 60; if (h < 24) return `${Math.floor(h)}h ago`;
+  const d = h / 24; if (d < 30) return `${Math.floor(d)}d ago`;
+  return new Date(iso).toLocaleDateString();
 }
 
 // Width of the right-hand drawer, kept in sync with `.dmsg-panel` in styles.css. Used to push the
@@ -62,12 +73,18 @@ export function createPanel({ root, shimUrl, token, meta, model, onMarkup, onOpe
   let busy = false;
   let controller = null;
   let elementCtx = null;            // §7 element context (set by the picker in Phase 5)
+  let resumeId = null;              // when set, each send continues this past session
   let stream = { role: null, body: null };  // current coalescing bubble
+  let target;                       // where rows render — the live transcript, or a history pane
 
   const status = el("span", { class: "dmsg-status" });
   const markupBtn = el("button", {
     class: "dmsg-iconbtn", title: "Pick an element", text: "🎯",
     onclick: () => onMarkup && onMarkup(),
+  });
+  const historyBtn = el("button", {
+    class: "dmsg-iconbtn", title: "Chat history", text: "🕘",
+    onclick: () => openHistory(),
   });
   const settingsBtn = el("button", {
     class: "dmsg-iconbtn", title: "Options", text: "⚙️",
@@ -77,10 +94,16 @@ export function createPanel({ root, shimUrl, token, meta, model, onMarkup, onOpe
     el("span", { class: "dmsg-title", text: "Slide Write" }),
     status,
     markupBtn,
+    historyBtn,
     settingsBtn,
     el("button", { class: "dmsg-iconbtn", title: "Close (Esc)", text: "✕", onclick: () => api.close() }),
   ]);
   const transcript = el("div", { class: "dmsg-transcript" });
+  target = transcript;
+  // History pane (list of past sessions, or a read-only replay of one) — shown in place of the
+  // transcript+composer; everything stays inside the shadow root.
+  const historyView = el("div", { class: "dmsg-history", hidden: "" });
+  const resumeChip = el("div", { class: "dmsg-chip dmsg-resumechip", hidden: "" });
   const ctxChip = el("div", { class: "dmsg-chip", hidden: "" });
   const textarea = el("textarea", {
     class: "dmsg-input", rows: "3",
@@ -105,7 +128,7 @@ export function createPanel({ root, shimUrl, token, meta, model, onMarkup, onOpe
     sendBtn,
   ]);
   const inputCard = el("div", { class: "dmsg-inputcard" }, [textarea, toolbar]);
-  const composer = el("div", { class: "dmsg-composer" }, [ctxChip, inputCard]);
+  const composer = el("div", { class: "dmsg-composer" }, [resumeChip, ctxChip, inputCard]);
 
   // Render the model button label + menu items to reflect `models` / `selectedModel`.
   function renderModels() {
@@ -151,21 +174,22 @@ export function createPanel({ root, shimUrl, token, meta, model, onMarkup, onOpe
     el("button", { class: "dmsg-setup-btn", text: "⚙️  Open settings", onclick: () => onOpenOptions && onOpenOptions() }),
   ]);
 
-  const panel = el("div", { class: "dmsg-panel", "data-slidewrite-ui": "" }, [header, setup, transcript, composer]);
+  const panel = el("div", { class: "dmsg-panel", "data-slidewrite-ui": "" }, [header, setup, transcript, historyView, composer]);
   root.append(panel);
 
   applyConfigured();
 
   function setStatus(t) { status.textContent = t; }
-  function scroll() { transcript.scrollTop = transcript.scrollHeight; }
-  function addRow(node) { breakChain(); transcript.append(node); scroll(); return node; }
+  const idleStatus = () => cfg.configured ? (cfg.meta ? `wired to ${cfg.meta.project} @ ${cfg.meta.branch}` : "not connected") : "not configured";
+  function scroll() { target.scrollTop = target.scrollHeight; }
+  function addRow(node) { breakChain(); target.append(node); scroll(); return node; }
   function breakChain() { stream = { role: null, body: null }; }
 
   function appendDelta(role, text) {
     if (stream.role !== role || !stream.body) {
       const body = el("div", { class: "dmsg-bubbletext" });
       const bubble = el("div", { class: `dmsg-bubble dmsg-${role}` }, [body]);
-      transcript.append(bubble);
+      target.append(bubble);
       stream = { role, body };
     }
     stream.body.append(document.createTextNode(text));
@@ -191,7 +215,12 @@ export function createPanel({ root, shimUrl, token, meta, model, onMarkup, onOpe
 
   function onEvent(ev) {
     switch (ev.type) {
-      case "start":   setStatus(`running · ${ev.model || ""}`); break;
+      case "start":
+        setStatus(`running · ${ev.model || ""}`);
+        // If the resumed run was assigned a fresh session id, follow it so chained sends keep threading.
+        if (resumeId && ev.sessionId && ev.sessionId !== resumeId) { resumeId = ev.sessionId; renderResumeChip(resumeId); }
+        break;
+      case "user":    appendDelta("user", ev.text); break;
       case "delta":   appendDelta("assistant", ev.text); break;
       case "thinking_delta": appendDelta("thinking", ev.text); break;
       case "tool":    toolRow(ev.tool, ev.detail); break;
@@ -234,6 +263,7 @@ export function createPanel({ root, shimUrl, token, meta, model, onMarkup, onOpe
     transcript.hidden = !ok;
     composer.hidden = !ok;
     markupBtn.disabled = !ok;
+    historyBtn.disabled = !ok;
     textarea.disabled = busy || !ok;
     sendBtn.disabled = !ok;
     setStatus(ok ? (cfg.meta ? `wired to ${cfg.meta.project} @ ${cfg.meta.branch}` : "not connected") : "not configured");
@@ -246,6 +276,7 @@ export function createPanel({ root, shimUrl, token, meta, model, onMarkup, onOpe
     if (!prompt) return;
     const payload = { prompt, screen: location.pathname + location.search, model: selectedModel };
     if (elementCtx) payload.element = elementCtx;
+    if (resumeId) payload.resume = resumeId;
     addRow(el("div", { class: "dmsg-bubble dmsg-user" }, [el("div", { class: "dmsg-bubbletext", text: prompt })]));
     textarea.value = "";
     clearElementContext();
@@ -273,6 +304,100 @@ export function createPanel({ root, shimUrl, token, meta, model, onMarkup, onOpe
     textarea.focus();
   }
   function clearElementContext() { elementCtx = null; ctxChip.hidden = true; ctxChip.textContent = ""; }
+
+  // --- History & resume ----------------------------------------------------------------------
+  function histBar(label, onBack, extra) {
+    return el("div", { class: "dmsg-histbar" }, [
+      el("button", { class: "dmsg-iconbtn", text: "←", title: "Back", onclick: onBack }),
+      el("span", { class: "dmsg-histtitle", text: label }),
+      extra || null,
+    ]);
+  }
+
+  // List this repo's past sessions in the history pane (hides the live transcript + composer).
+  async function openHistory() {
+    if (!cfg.configured) return;
+    transcript.hidden = true;
+    composer.hidden = true;
+    historyView.hidden = false;
+    historyView.textContent = "";
+    historyView.append(histBar("Chat history", () => showLive()));
+    const note = el("div", { class: "dmsg-row dmsg-note", text: "Loading…" });
+    historyView.append(note);
+    try {
+      const sessions = await fetchHistory(cfg.shimUrl, cfg.token);
+      note.remove();
+      if (!sessions.length) {
+        historyView.append(el("div", { class: "dmsg-row dmsg-note", text: "No history for this repo yet." }));
+        return;
+      }
+      const list = el("div", { class: "dmsg-histlist" });
+      for (const s of sessions) {
+        list.append(el("button", { class: "dmsg-histitem", onclick: () => openTranscript(s) }, [
+          el("div", { class: "dmsg-histitem-top" }, [
+            el("span", { class: "dmsg-histitem-title", text: s.title || "(untitled)" }),
+            el("span", { class: "dmsg-histitem-time", text: relTime(s.endedAt) }),
+          ]),
+          s.firstPrompt ? el("div", { class: "dmsg-histitem-prompt", text: s.firstPrompt }) : null,
+          el("div", { class: "dmsg-histitem-meta", text: [s.branch, `${s.messageCount} msg`].filter(Boolean).join(" · ") }),
+        ]));
+      }
+      historyView.append(list);
+    } catch (e) {
+      note.remove();
+      historyView.append(el("div", { class: "dmsg-row dmsg-error", text: String(e.message || e) }));
+    }
+  }
+
+  // Read-only replay of one session, rendered through the live onEvent renderer into a history pane
+  // (the live transcript is left untouched, so going back restores it).
+  async function openTranscript(s) {
+    transcript.hidden = true;
+    composer.hidden = true;
+    historyView.hidden = false;
+    historyView.textContent = "";
+    const resumeBtn = el("button", { class: "dmsg-resumebtn", text: "↻ Resume", title: "Continue this session", onclick: () => resumeSession(s) });
+    historyView.append(histBar(s.title || "(untitled)", () => openHistory(), resumeBtn));
+    const body = el("div", { class: "dmsg-transcript dmsg-histbody" });
+    historyView.append(body);
+    const note = el("div", { class: "dmsg-row dmsg-note", text: "Loading…" });
+    body.append(note);
+    try {
+      const events = await fetchHistoryDetail(cfg.shimUrl, cfg.token, s.id);
+      note.remove();
+      target = body; breakChain();
+      try { for (const ev of events) onEvent(ev); } finally { breakChain(); target = transcript; }
+      if (!events.length) body.append(el("div", { class: "dmsg-row dmsg-note", text: "(empty transcript)" }));
+    } catch (e) {
+      note.remove();
+      body.append(el("div", { class: "dmsg-row dmsg-error", text: String(e.message || e) }));
+    }
+  }
+
+  // Leave the history pane, back to the live transcript + composer.
+  function showLive() {
+    historyView.hidden = true;
+    historyView.textContent = "";
+    transcript.hidden = !cfg.configured;
+    composer.hidden = !cfg.configured;
+    setStatus(idleStatus());
+  }
+
+  function renderResumeChip(id, title) {
+    resumeChip.textContent = "";
+    resumeChip.append(
+      el("span", { class: "dmsg-chiptext", text: `↻ continuing ${String(id).slice(0, 8)}${title ? ` — ${title.slice(0, 40)}` : ""}` }),
+      el("button", { class: "dmsg-iconbtn", text: "✕", title: "Stop continuing", onclick: () => clearResume() }),
+    );
+    resumeChip.hidden = false;
+  }
+  function resumeSession(s) {
+    resumeId = s.id;
+    showLive();
+    renderResumeChip(s.id, s.title);
+    textarea.focus();
+  }
+  function clearResume() { resumeId = null; resumeChip.hidden = true; resumeChip.textContent = ""; }
 
   ensurePushStyle();
 
@@ -304,6 +429,7 @@ export function createPanel({ root, shimUrl, token, meta, model, onMarkup, onOpe
       if (next.model && models.some((m) => m.id === next.model)) selectedModel = next.model;
       if (!models.some((m) => m.id === selectedModel)) selectedModel = (next.meta && next.meta.defaultModel) || models[0].id;
       renderModels();
+      if (!historyView.hidden) showLive();  // don't strand the user in a stale history pane
       applyConfigured();
     },
   };

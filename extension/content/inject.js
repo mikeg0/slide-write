@@ -91,12 +91,9 @@
     }
   }
 
-  // 7. Keyboard shortcut relayed from the background command, plus Esc to close.
+  // 7. Keyboard shortcut relayed from the background command.
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === "toggle-panel") panel.toggle();
-  });
-  window.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && panel.isOpen()) panel.close();
   });
 
   // 8. Live config: when this origin's settings change in Options, re-resolve and push to the panel

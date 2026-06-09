@@ -22,3 +22,17 @@ export async function streamDesign(shimUrl, token, payload, onEvent, signal) {
     }
   }
 }
+
+// Read-only history fetches (same Bearer gate as /design). `fetchHistory` lists the repo's sessions;
+// `fetchHistoryDetail` returns one session's normalized, render-ready event list (§6 shapes).
+async function getJson(shimUrl, token, path) {
+  const res = await fetch(`${shimUrl}${path}`, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`${path} failed: ${res.status}`);
+  return res.json();
+}
+export async function fetchHistory(shimUrl, token) {
+  return (await getJson(shimUrl, token, "/history")).sessions || [];
+}
+export async function fetchHistoryDetail(shimUrl, token, id) {
+  return (await getJson(shimUrl, token, `/history/${encodeURIComponent(id)}`)).events || [];
+}

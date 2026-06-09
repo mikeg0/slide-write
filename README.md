@@ -321,6 +321,13 @@ function serve() {
         branch: await git("rev-parse", "--abbrev-ref", "HEAD"),
         dirty: !!(await git("status", "--porcelain")),
       });
+    if (path === "/history" && req.method === "GET")        // list this repo's past `claude` sessions
+      return json(res, 200, { sessions: await listHistory() });
+    if (path.startsWith("/history/") && req.method === "GET") {  // one session, normalized to §6 events
+      const id = decodeURIComponent(path.slice("/history/".length));
+      const data = await readHistory(id);                   // null for a bad/missing id → 404
+      return data ? json(res, 200, data) : json(res, 404, { error: "not found" });
+    }
     if (path === "/design" && req.method === "POST") return design(req, res);
     json(res, 404, { error: "not found" });
   }).listen(PORT, "127.0.0.1", () =>
@@ -357,11 +364,35 @@ Every frame is **one JSON object on a `data:` line**; the client reads only `dat
 
 Adding a new `type` is backward-compatible: clients ignore unknown types.
 
+| `user` | `{text}` | user bubble (history replay only; live runs render the user bubble inline in `send()`) |
+
+The `user` event is emitted only by `GET /history/<id>` (below), not by a live `/design` run.
+
 **Model selection (additive).** `/design` accepts an optional top-level `model` (a model id). The
 shim validates it against an allowlist advertised by `/meta` (`{ models: [{id,label}], defaultModel }`);
 an unknown/absent id falls back to the shim's `--model`/`SLIDEWRITE_MODEL` default, or the SDK's own
 default when that's unset. The model the SDK actually runs is echoed back in the `start` event. The
 extension renders the `/meta` list in a composer dropdown and persists the choice per-origin.
+
+**Chat history (read-only).** `claude` writes one `.jsonl` transcript per session under
+`~/.claude/projects/<encoded-cwd>/` (the cwd with every non-alphanumeric char turned into a single
+`-`; matched case-insensitively against the directory listing). Two GET routes, behind the same
+Bearer+CORS gate as `/meta`, expose the **current repo's** sessions:
+
+- `GET /history` → `{ sessions: [{ id, title, firstPrompt, startedAt, endedAt, branch, messageCount }] }`,
+  newest first. `title` is the session's `ai-title` if present, else its first user prompt. Missing
+  project folder → `{ sessions: [] }`.
+- `GET /history/<id>` → `{ id, events: [...] }`, where `events` reuses the §6 shapes above (plus the
+  `user` event) so the panel replays a past session through the same renderer. `id` must be a valid
+  session UUID (regex-validated + path-traversal-guarded); a bad/missing id → 404. Lifecycle events
+  (`start`/`commit`/`done`) are not emitted for a replay.
+
+**Resume (additive).** `/design` accepts an optional top-level `resume` (a session UUID). When
+present and valid, the shim passes `resume` to the SDK `query` so the run continues that
+conversation. The `busy` lock and the per-run auto-commit (diff of `git status` before/after) are
+unaffected — only files changed by *this* run are committed. An absent/invalid value starts fresh.
+The extension's 🕘 history view offers a **↻ Resume** action that threads subsequent sends into the
+chosen session.
 
 ---
 
@@ -468,6 +499,11 @@ export async function streamDesign(shimUrl, token, payload, onEvent, signal) {
   break the chain. Footer textarea (⌘/Ctrl+Enter), disabled while a run is in flight;
   `AbortController` cancels on close. The composer's toolbar row holds a model selector (populated
   from `/meta`, persisted per-origin) and the send button, modeled on the Claude AI chat composer.
+  A 🕘 header button opens a **history view**: `GET /history` lists this repo's past sessions; picking
+  one calls `GET /history/<id>` and **replays it read-only** through the same `onEvent` renderer (the
+  live transcript is left intact). A **↻ Resume** action sets a resume chip and threads subsequent
+  sends into that session via the `/design` `resume` field.
+- **`content/sse.js`** — the SSE reader plus `fetchHistory`/`fetchHistoryDetail` JSON GET helpers.
 - **`content/inject.js`** — create a host node + `attachShadow({mode:'open'})`, inject `styles.css`
   into the shadow root, mount the panel + a toolbar affordance, wire the shortcut. Look up config for
   `location.origin`; call `GET <shimUrl>/meta`; show "wired to `<project>` @ `<branch>`" in the header.
@@ -511,6 +547,9 @@ The shim runs **arbitrary code edits + shell** in a repo as you. Defenses:
   prompt-injection exfiltration.
 - **Prompt injection.** A malicious string in the repo could steer `claude`; the working-directory
   boundary (`cwd: REPO`) is the main mitigation. For higher assurance, run against a throwaway `git worktree`.
+- **History is read-only and repo-scoped.** `/history*` only read `~/.claude/projects/<this repo>/`;
+  the session `id` is UUID-validated and path-traversal-guarded before any file read, so the route
+  can't be coerced into reading other projects or arbitrary files. Same Bearer+CORS gate as `/meta`.
 
 Single-developer, trusted-local only. Not multi-tenant or public.
 
@@ -560,7 +599,17 @@ Each phase is independently testable; build and verify in order.
 3. **Extension — picker.** `content/picker.js` ([§8.3](#83-contentpickerjs--the-element-picker-capture-phase));
    send the [§7](#7-the-element-capture-contract) contract; anchored composer; markup toggle.
 4. **Polish.** Popup enable/disable, auto-reload-on-`commit` option, token UX, the [§10](#10-security-model) checklist.
-5. **(Optional)** fiber-based element resolution ([§8.4](#84-the-widget--remaining-files)).
+5. **History & resume.** Add the `/history` + `/history/<id>` routes and the `resume` field
+   ([§6](#6-the-sse-event-contract)) to the shim, then the 🕘 history view + ↻ Resume in the panel. Verify:
+   ```bash
+   curl -s -H 'Authorization: Bearer test' localhost:4040/history            # {sessions:[…]} newest-first
+   curl -s -H 'Authorization: Bearer test' localhost:4040/history/<uuid>     # {id,events:[…]} (404 on bad id)
+   curl -sN -X POST localhost:4040/design -H 'Authorization: Bearer test' \
+     -H 'Content-Type: application/json' -d '{"prompt":"what did you just change?","resume":"<uuid>"}'
+   ```
+   Expect the resumed run to reference prior context and still commit only its own changes. In the UI:
+   🕘 → pick a session → read-only replay → ↻ Resume → follow-up threads into that session.
+6. **(Optional)** fiber-based element resolution ([§8.4](#84-the-widget--remaining-files)).
 
 ---
 

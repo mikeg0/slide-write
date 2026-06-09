@@ -2,8 +2,10 @@
 // slide-write — drive `claude` headless in a repo, stream the run as SSE on loopback.
 // Reuses ~/.claude (no API key). Binds 127.0.0.1 only; reach it via VS Code port forwarding.
 import http from "node:http";
+import os from "node:os";
 import { execFile } from "node:child_process";
-import { basename, resolve } from "node:path";
+import { readdir, readFile } from "node:fs/promises";
+import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
@@ -82,6 +84,121 @@ function resultText(content) {
     : String(content ?? "");
   const trunc = t.length > 4000; return { text: t.slice(0, 4000).trim(), trunc };
 }
+// Strip the repo prefix for display, tolerating slash-direction and drive-letter-case differences
+// between REPO and the path the SDK/transcript recorded (Windows reports `c:\…`, resolve gives `C:\…`).
+const relPath = (p) => {
+  if (!p) return "";
+  const np = p.replace(/\\/g, "/"), nr = REPO.replace(/\\/g, "/");
+  return np.toLowerCase().startsWith(nr.toLowerCase()) ? np.slice(nr.length).replace(/^\//, "") : p;
+};
+
+// --- Chat history (read-only) ----------------------------------------------------------------
+// `claude` writes one .jsonl transcript per session under ~/.claude/projects/<encoded-cwd>/.
+// The folder name is the cwd with every non-alphanumeric char turned into a single "-". Drive-letter
+// case can differ from REPO on Windows, so match the folder case-insensitively against the listing.
+let _projDir;
+async function claudeProjectDir() {
+  if (_projDir) return _projDir;
+  const encoded = REPO.replace(/[^a-zA-Z0-9]/g, "-");
+  const base = join(os.homedir(), ".claude", "projects");
+  try {
+    const entries = await readdir(base, { withFileTypes: true });
+    const hit = entries.find(e => e.isDirectory() && e.name.toLowerCase() === encoded.toLowerCase());
+    if (hit) return (_projDir = join(base, hit.name));
+  } catch { /* ~/.claude/projects missing */ }
+  return null;
+}
+
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const validSessionId = (id) => typeof id === "string" && UUID_RE.test(id);
+
+// Pull the text out of a user message's content (array of blocks, or a bare string).
+const userText = (content) => {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const t = content.filter(b => b?.type === "text").map(b => b.text).join("\n").trim();
+    return t || (content.some(b => b?.type === "image") ? "[image]" : "");
+  }
+  return "";
+};
+
+// List this repo's sessions, newest first. One pass per .jsonl file extracts a summary.
+async function listHistory() {
+  const dir = await claudeProjectDir();
+  if (!dir) return [];
+  let files;
+  try { files = (await readdir(dir, { withFileTypes: true })).filter(e => e.isFile() && e.name.endsWith(".jsonl")); }
+  catch { return []; }
+  const sessions = [];
+  for (const f of files) {
+    try {
+      const lines = (await readFile(join(dir, f.name), "utf8")).split("\n").filter(Boolean);
+      let title = "", firstPrompt = "", startedAt = "", endedAt = "", branch = "", messageCount = 0;
+      for (const line of lines) {
+        let rec; try { rec = JSON.parse(line); } catch { continue; }
+        if (rec.timestamp) { startedAt ||= rec.timestamp; endedAt = rec.timestamp; }
+        if (rec.gitBranch && !branch) branch = rec.gitBranch;
+        if (rec.type === "ai-title" && rec.aiTitle) title = rec.aiTitle;
+        else if (rec.type === "user" && rec.message) {
+          const t = userText(rec.message.content);
+          if (t && !t.startsWith("[image]")) { firstPrompt ||= t; }
+          messageCount++;
+        } else if (rec.type === "assistant") messageCount++;
+      }
+      if (!title) title = (firstPrompt || "(untitled)").slice(0, 80);
+      sessions.push({
+        id: f.name.slice(0, -".jsonl".length), title,
+        firstPrompt: firstPrompt.slice(0, 140), startedAt, endedAt, branch, messageCount,
+      });
+    } catch { /* skip unreadable transcript */ }
+  }
+  sessions.sort((a, b) => (b.endedAt || "").localeCompare(a.endedAt || ""));
+  return sessions;
+}
+
+// Parse one transcript into render-ready events mirroring the §6 SSE shapes (plus a `user` event), so
+// the panel replays it through the same onEvent renderer. Returns null for a bad/missing id.
+async function readHistory(id) {
+  if (!validSessionId(id)) return null;
+  const dir = await claudeProjectDir();
+  if (!dir) return null;
+  const file = resolve(dir, `${id}.jsonl`);
+  if (!file.startsWith(dir + sep)) return null; // belt-and-suspenders traversal guard (id is already UUID-validated)
+  let lines;
+  try { lines = (await readFile(file, "utf8")).split("\n").filter(Boolean); }
+  catch { return null; }
+  const tool = {}, events = [];
+  for (const line of lines) {
+    let rec; try { rec = JSON.parse(line); } catch { continue; }
+    const content = rec.message?.content;
+    if (rec.type === "assistant" && Array.isArray(content)) {
+      for (const b of content) {
+        if (b.type === "text" && b.text) events.push({ type: "delta", text: b.text });
+        else if (b.type === "thinking" && b.thinking) events.push({ type: "thinking_delta", text: b.thinking });
+        else if (b.type === "tool_use") {
+          tool[b.id] = b.name;
+          if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(b.name))
+            events.push({ type: "file_edit", tool: b.name, path: relPath(b.input?.file_path || ""), id: b.id });
+          else events.push({ type: "tool", tool: b.name, detail: detailOf(b.name, b.input), id: b.id });
+        }
+      }
+    } else if (rec.type === "user") {
+      const blocks = Array.isArray(content) ? content : [{ type: "text", text: userText(content) }];
+      const results = blocks.filter(b => b?.type === "tool_result");
+      if (results.length) for (const b of results) {
+        const { text, trunc } = resultText(b.content);
+        events.push({ type: "tool_result", tool: tool[b.tool_use_id], id: b.tool_use_id, text, isError: !!b.is_error, truncated: trunc });
+      } else {
+        const t = userText(content);
+        if (t) events.push({ type: "user", text: t });
+      }
+    } else if (rec.type === "result") {
+      events.push({ type: "result", isError: !!rec.is_error, numTurns: rec.num_turns,
+        durationMs: rec.duration_ms, totalCostUsd: rec.total_cost_usd, usage: rec.usage, result: null });
+    }
+  }
+  return { id, events };
+}
 
 // Core: drive one design run. `emit(type, data)` sends an SSE event; `aborted()` lets the caller
 // cancel (client disconnect). Exported so the HTTP handler and tests share one implementation.
@@ -97,6 +214,7 @@ export async function runDesign(body, emit, aborted = () => false) {
     allowDangerouslySkipPermissions: true,           // required by the SDK alongside bypassPermissions
     includePartialMessages: true, settingSources: ["project"], systemPrompt: PREAMBLE, maxTurns: 40,
     ...(model ? { model } : {}),
+    ...(validSessionId(body.resume) ? { resume: body.resume } : {}),  // continue a prior session if asked
   } })) {
     if (aborted()) return;
     if (process.env.SW_DEBUG) console.error("SDK", m.type, m.subtype ?? "");
@@ -110,7 +228,7 @@ export async function runDesign(body, emit, aborted = () => false) {
       if (b.type !== "tool_use") continue;
       tool[b.id] = b.name;
       if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(b.name))
-        emit("file_edit", { tool: b.name, path: (b.input?.file_path || "").replace(REPO + "/", ""), id: b.id });
+        emit("file_edit", { tool: b.name, path: relPath(b.input?.file_path || ""), id: b.id });
       else emit("tool", { tool: b.name, detail: detailOf(b.name, b.input), id: b.id });
     }
     else if (m.type === "user") for (const b of (Array.isArray(m.message.content) ? m.message.content : [])) {
@@ -167,6 +285,13 @@ function serve() {
         dirty: !!(await git("status", "--porcelain")),
         models: MODELS, defaultModel: DEFAULT_MODEL || MODELS[0].id,
       });
+    if (path === "/history" && req.method === "GET")
+      return json(res, 200, { sessions: await listHistory() });
+    if (path.startsWith("/history/") && req.method === "GET") {
+      const id = decodeURIComponent(path.slice("/history/".length));
+      const data = await readHistory(id);
+      return data ? json(res, 200, data) : json(res, 404, { error: "not found" });
+    }
     if (path === "/design" && req.method === "POST") return design(req, res);
     json(res, 404, { error: "not found" });
   }).listen(PORT, "127.0.0.1", () =>
