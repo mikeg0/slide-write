@@ -190,6 +190,7 @@ const PORT    = +(arg("port",   process.env.SLIDEWRITE_PORT   ?? 4040));
 const REPO    = resolve(arg("repo", process.cwd()));
 const TOKEN   = arg("token",  process.env.SLIDEWRITE_TOKEN ?? "");
 const ORIGIN  = arg("origin", process.env.SLIDEWRITE_ALLOWED_ORIGIN ?? "*"); // app origin, e.g. http://localhost:5173
+const DEBUG   = process.argv.includes("--debug") || !!process.env.SW_DEBUG;  // log each SDK message to stderr
 const VERSION = "0.1.0";
 
 const PREAMBLE =
@@ -260,7 +261,7 @@ export async function runDesign(body, emit, aborted = () => false) {
     includePartialMessages: true, settingSources: ["project"], systemPrompt: PREAMBLE, maxTurns: 40,
   } })) {
     if (aborted()) return;
-    if (process.env.SW_DEBUG) console.error("SDK", m.type, m.subtype ?? "");
+    if (DEBUG) console.error("SDK", m.type, m.subtype ?? "");
     if (m.type === "system" && m.subtype === "init") emit("start", { sessionId: m.session_id, model: m.model });
     else if (m.type === "stream_event" && m.event?.type === "content_block_delta") {
       const d = m.event.delta;
@@ -569,6 +570,8 @@ cd shim && npm install        # pulls @anthropic-ai/claude-agent-sdk
 node shim/slide-write.mjs --repo /path/to/project --port 4040 \
   --origin http://localhost:5173 --token "$(openssl rand -hex 16)"
 ```
+Add `--debug` (or set `SW_DEBUG=1`) to log every SDK message (`type`/`subtype`) to stderr during a
+run — useful for seeing the raw message sequence before it's translated into SSE events.
 In **remote/WSL/container** dev, run this in a VS Code terminal on the code host — VS Code
 auto-forwards port 4040 (and your dev server's port) to your laptop's `localhost`. Open the app via
 its forwarded `localhost` URL.
