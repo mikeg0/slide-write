@@ -82,6 +82,10 @@ export function createPanel({ root, shimUrl, token, meta, model, onMarkup, onOpe
     class: "dmsg-iconbtn", title: "Pick an element", text: "🎯",
     onclick: () => onMarkup && onMarkup(),
   });
+  const newChatBtn = el("button", {
+    class: "dmsg-iconbtn", title: "New chat", text: "＋",
+    onclick: () => newChat(),
+  });
   const historyBtn = el("button", {
     class: "dmsg-iconbtn", title: "Chat history", text: "🕘",
     onclick: () => openHistory(),
@@ -94,6 +98,7 @@ export function createPanel({ root, shimUrl, token, meta, model, onMarkup, onOpe
     el("span", { class: "dmsg-title", text: "Slide Write" }),
     status,
     markupBtn,
+    newChatBtn,
     historyBtn,
     settingsBtn,
     el("button", { class: "dmsg-iconbtn", title: "Close (Esc)", text: "✕", onclick: () => api.close() }),
@@ -217,8 +222,12 @@ export function createPanel({ root, shimUrl, token, meta, model, onMarkup, onOpe
     switch (ev.type) {
       case "start":
         setStatus(`running · ${ev.model || ""}`);
-        // If the resumed run was assigned a fresh session id, follow it so chained sends keep threading.
-        if (resumeId && ev.sessionId && ev.sessionId !== resumeId) { resumeId = ev.sessionId; renderResumeChip(resumeId); }
+        // Adopt the session id so chained sends keep threading into the same conversation.
+        // Silent for fresh chats; if an explicit-resume chip is showing, keep it in sync across forks.
+        if (ev.sessionId && ev.sessionId !== resumeId) {
+          resumeId = ev.sessionId;
+          if (!resumeChip.hidden) renderResumeChip(resumeId);
+        }
         break;
       case "user":    appendDelta("user", ev.text); break;
       case "delta":   appendDelta("assistant", ev.text); break;
@@ -263,6 +272,7 @@ export function createPanel({ root, shimUrl, token, meta, model, onMarkup, onOpe
     transcript.hidden = !ok;
     composer.hidden = !ok;
     markupBtn.disabled = !ok;
+    newChatBtn.disabled = !ok;
     historyBtn.disabled = !ok;
     textarea.disabled = busy || !ok;
     sendBtn.disabled = !ok;
@@ -398,6 +408,16 @@ export function createPanel({ root, shimUrl, token, meta, model, onMarkup, onOpe
     textarea.focus();
   }
   function clearResume() { resumeId = null; resumeChip.hidden = true; resumeChip.textContent = ""; }
+
+  // Start a fresh conversation: drop the threaded session, clear the live transcript and any
+  // pending element context, and return to the live composer.
+  function newChat() {
+    clearResume();            // resumeId = null → next send starts a fresh session
+    clearElementContext();
+    transcript.textContent = "";
+    breakChain();
+    showLive();
+  }
 
   ensurePushStyle();
 

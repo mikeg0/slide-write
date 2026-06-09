@@ -14,6 +14,7 @@ const PORT    = +(arg("port",   process.env.SLIDEWRITE_PORT   ?? 4040));
 const REPO    = resolve(arg("repo", process.cwd()));
 const TOKEN   = arg("token",  process.env.SLIDEWRITE_TOKEN ?? "");
 const ORIGIN  = arg("origin", process.env.SLIDEWRITE_ALLOWED_ORIGIN ?? "*"); // app origin, e.g. http://localhost:5173
+const DEBUG   = process.argv.includes("--debug") || !!process.env.SW_DEBUG;  // log each SDK message to stderr
 const VERSION = "0.1.0";
 
 // Models the UI may pick from. Advertised via /meta so the client dropdown stays server-driven; a
@@ -217,7 +218,7 @@ export async function runDesign(body, emit, aborted = () => false) {
     ...(validSessionId(body.resume) ? { resume: body.resume } : {}),  // continue a prior session if asked
   } })) {
     if (aborted()) return;
-    if (process.env.SW_DEBUG) console.error("SDK", m.type, m.subtype ?? "");
+    if (DEBUG) console.error("SDK", m.type, m.subtype ?? "");
     if (m.type === "system" && m.subtype === "init") emit("start", { sessionId: m.session_id, model: m.model });
     else if (m.type === "stream_event" && m.event?.type === "content_block_delta") {
       const d = m.event.delta;
