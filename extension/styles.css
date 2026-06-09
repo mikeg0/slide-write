@@ -64,6 +64,26 @@
 .dmsg-assistant { align-self: flex-start; background: #23232f; }
 .dmsg-thinking { align-self: flex-start; background: #1c1c26; color: #8f8fa6; font-style: italic; }
 
+/* Rendered markdown (assistant/thinking bubbles). The bubble keeps pre-wrap as a fallback, but
+   markdown output is real block HTML, so reset white-space and tame default element margins. */
+.dmsg-md { white-space: normal; }
+.dmsg-md > :first-child { margin-top: 0; }
+.dmsg-md > :last-child { margin-bottom: 0; }
+.dmsg-md p { margin: 6px 0; }
+.dmsg-md h1, .dmsg-md h2, .dmsg-md h3, .dmsg-md h4, .dmsg-md h5, .dmsg-md h6 {
+  margin: 10px 0 4px; font-weight: 600; line-height: 1.25; }
+.dmsg-md h1 { font-size: 1.3em; } .dmsg-md h2 { font-size: 1.2em; }
+.dmsg-md h3 { font-size: 1.1em; } .dmsg-md h4, .dmsg-md h5, .dmsg-md h6 { font-size: 1em; }
+.dmsg-md ul, .dmsg-md ol { margin: 6px 0; padding-left: 20px; }
+.dmsg-md li { margin: 2px 0; }
+.dmsg-md a { color: #7fd1ff; text-decoration: underline; }
+.dmsg-md code { background: #0e0e14; padding: 1px 4px; border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+.dmsg-md-pre { margin: 6px 0; background: #0e0e14; padding: 8px; border-radius: 6px; overflow: auto;
+  white-space: pre; }
+.dmsg-md-pre code { background: none; padding: 0; font-size: 11px; }
+.dmsg-md strong { font-weight: 600; } .dmsg-md em { font-style: italic; }
+
 .dmsg-row { font-size: 12px; }
 .dmsg-tool, .dmsg-edit { display: flex; gap: 6px; align-items: baseline; color: #b7b7cc; }
 .dmsg-toolname { color: #7fd1ff; flex-shrink: 0; }
