@@ -3,8 +3,9 @@
   "name": "Slide Write",
   "version": "0.1.0",
   "description": "Portable AI design assistant — click an element or type a request and an agent edits the running app's source live.",
-  "permissions": ["storage", "activeTab"],
+  "permissions": ["storage", "activeTab", "scripting"],
   "host_permissions": ["http://localhost/*", "http://127.0.0.1/*", "https://localhost/*"],
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
   "background": { "service_worker": "background.js" },
   "action": { "default_title": "Slide Write — toggle panel" },
   "options_page": "options.html",
@@ -15,7 +16,7 @@
   }],
   "web_accessible_resources": [{
     "resources": ["content/sse.js", "content/panel.js", "content/picker.js", "styles.css"],
-    "matches": ["http://localhost/*", "http://127.0.0.1/*", "https://localhost/*"]
+    "matches": ["https://*/*", "http://*/*"]
   }],
   "commands": {
     "toggle-panel": {

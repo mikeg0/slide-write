@@ -12,6 +12,55 @@ async function save(cfg) {
   await chrome.storage.local.set({ [KEY]: cfg });
 }
 
+// --- Dynamic per-origin content scripts (§8.1) ---
+// Localhost origins are covered by the static content_scripts entry; every other origin gets a
+// runtime-granted host permission (requested in options/popup, on the user gesture) plus a
+// dynamically registered copy of inject.js. Registration lives here so options, popup, and the
+// startup reconcile share one implementation.
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+function isLocalOrigin(origin) {
+  try { return LOCAL_HOSTS.has(new URL(origin).hostname); } catch { return true; }
+}
+// Match patterns can't carry a port, so a granted origin covers every port on that host — same as
+// the static localhost entry. inject.js stays inert on un-enabled origins, so that's harmless.
+function originPattern(origin) {
+  try { const u = new URL(origin); return `${u.protocol}//${u.hostname}/*`; } catch { return origin + "/*"; }
+}
+const scriptId = (origin) => "sw:" + origin;
+
+async function registerOrigin(origin) {
+  if (isLocalOrigin(origin)) return { ok: true, skipped: "static localhost content script" };
+  if (!(await chrome.permissions.contains({ origins: [originPattern(origin)] })))
+    return { ok: false, error: "host permission not granted" };
+  await chrome.scripting.unregisterContentScripts({ ids: [scriptId(origin)] }).catch(() => {});
+  await chrome.scripting.registerContentScripts([{
+    id: scriptId(origin), matches: [originPattern(origin)], js: ["content/inject.js"], runAt: "document_idle",
+  }]);
+  return { ok: true };
+}
+
+async function unregisterOrigin(origin, { dropPermission = false } = {}) {
+  await chrome.scripting.unregisterContentScripts({ ids: [scriptId(origin)] }).catch(() => {});
+  if (dropPermission && !isLocalOrigin(origin))
+    await chrome.permissions.remove({ origins: [originPattern(origin)] }).catch(() => {});
+  return { ok: true };
+}
+
+// Registrations persist across browser restarts but are cleared on extension update/reload, and the
+// user can revoke a host permission from chrome://extensions at any time — reconcile storage,
+// permissions, and the script registry whenever the worker (re)starts.
+async function reconcile() {
+  const cfg = await load();
+  const want = Object.keys(cfg.origins || {}).filter((o) => cfg.origins[o].enabled && !isLocalOrigin(o));
+  const have = await chrome.scripting.getRegisteredContentScripts().catch(() => []);
+  const wantIds = new Set(want.map(scriptId));
+  const stale = have.map((s) => s.id).filter((id) => id.startsWith("sw:") && !wantIds.has(id));
+  if (stale.length) await chrome.scripting.unregisterContentScripts({ ids: stale }).catch(() => {});
+  for (const origin of want) await registerOrigin(origin).catch(() => {});
+}
+chrome.runtime.onStartup.addListener(reconcile);
+chrome.runtime.onInstalled.addListener(reconcile);
+
 // Message API. Config shape:
 //   { geminiKey?, pollInterval?, origins: { "<origin>": { enabled, token, shimUrl?, autoReload?, model?, imageInstructions? } } }
 // `geminiKey` and `pollInterval` (seconds; liveness-poll cadence while the panel is open) are global;
@@ -50,11 +99,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       case "setOrigin": {
         cfg.origins[msg.origin] = { ...(cfg.origins[msg.origin] || {}), ...msg.value };
         await save(cfg);
-        return sendResponse({ ok: true, value: cfg.origins[msg.origin] });
+        // Keep the dynamic-script registry in step with `enabled` (no-op for localhost). The host
+        // permission itself was requested by options/popup on the user gesture before this message.
+        const registration = cfg.origins[msg.origin].enabled
+          ? await registerOrigin(msg.origin).catch((e) => ({ ok: false, error: String(e?.message || e) }))
+          : await unregisterOrigin(msg.origin);
+        return sendResponse({ ok: true, value: cfg.origins[msg.origin], registration });
       }
       case "deleteOrigin": {
         delete cfg.origins[msg.origin];
         await save(cfg);
+        await unregisterOrigin(msg.origin, { dropPermission: true });
         return sendResponse({ ok: true });
       }
       case "openOptions": {

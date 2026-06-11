@@ -9,9 +9,11 @@ edits the real source → the dev server hot-reloads. **README.md is the authori
 it and implement/extend in the order of its §12 "Build order for Claude".
 
 **Current state: built.** Both `shim/` and `extension/` exist and run; on top of the original
-`/design` flow the shim adds chat history, session resume, model selection, and **Gemini "nano
+`/design` flow the shim adds chat history, session resume, model selection, **Gemini "nano
 banana" image generation** (`POST /generate-image`, the `image_status`/`image_generated` SSE events,
-and the §7 `imageDataUrl` capture field). README.md remains the authoritative spec — it inlines every
+and the §7 `imageDataUrl` capture field), and **multi-host mode** (README §5.2: `--repo-root`/
+`--repos` resolve the target repo per request from the `Host` header behind the §13 reverse proxy;
+single-repo localhost behavior is unchanged when those flags are absent). README.md remains the authoritative spec — it inlines every
 contract and the load-bearing code verbatim (§5 shim, §8.2 SSE reader); treat those as authoritative
 and extend them in lockstep. The mechanical parts (UI rendering, helpers) may be implemented freely
 as long as they honor the contracts.
@@ -31,8 +33,10 @@ on Win/macOS/Linux. The shim and the dev server share the repo via the filesyste
 the dev server hot-reloads.
 
 ## Invariants — do not regress these (each is load-bearing; see README for why)
-- **The shim binds `127.0.0.1` only**, never a public interface. Reached via VS Code's port forward
-  or directly on the same machine.
+- **The shim binds `127.0.0.1` by default**, never a public interface. Reached via VS Code's port
+  forward or directly on the same machine. The opt-in `--bind`/`SLIDEWRITE_BIND` override exists
+  only for the README §13 reverse-proxy fallback (docker bridge gateway); the loopback default must
+  not change.
 - **The shim runs as you (non-root)**, so `permissionMode: "bypassPermissions"` works directly — no
   permission-prompt callback, no streaming-input dance, no root/Docker workarounds. Edits are
   host-owned. (The SDK *requires* `allowDangerouslySkipPermissions: true` set alongside it.)
@@ -61,6 +65,8 @@ the dev server hot-reloads.
   expect SSE `start → file_edit → result → commit → done` and one scoped commit
   (`git reset --hard HEAD~1` to clean up). See README §12.
 - Extension: load `extension/` unpacked; in options add the app origin → `shimUrl` + token; enable.
+  Non-localhost origins prompt for a runtime host permission and get a dynamically registered
+  content script (README §8.1); localhost stays zero-config via the static manifest entries.
 - No test framework or linter yet.
 
 ## Gotchas
@@ -69,7 +75,7 @@ the dev server hot-reloads.
   `session_id` + `model`; assistant/user content are Anthropic blocks (`tool_use`, `tool_result`
   with `tool_use_id`); extra types (`system/status`, `rate_limit_event`, `system/thinking_tokens`)
   are ignored. Shapes can still drift across versions — re-verify on upgrade.
-- The run logic is the exported `runDesign(body, emit, aborted)`; the HTTP server only starts when
+- The run logic is the exported `runDesign(body, emit, aborted, signal, repo)`; the HTTP server only starts when
   the file is run directly (`import.meta.url` guard), so it can be imported by tests.
 - Run the shim as a **normal foreground/terminal process** (e.g. a dedicated VS Code terminal). It
   was validated foreground; that's the intended usage and where you want its logs anyway.
@@ -81,5 +87,6 @@ the dev server hot-reloads.
   that keeps every topology uniform (localhost↔localhost).
 - The reverse-proxy/Traefik path (README §13) is a **fallback** for public-hostname access only;
   don't reach for it by default.
-- One run at a time (the shim's `busy` lock). The UI's `AbortController` cancels on close
+- One run at a time **per repo** (the shim's `busyRepos` lock; different repos may run
+  concurrently in multi-host mode). The UI's `AbortController` cancels on close
   (`req.destroyed` in the shim).

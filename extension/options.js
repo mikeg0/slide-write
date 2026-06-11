@@ -11,6 +11,18 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// Non-localhost origins need a runtime-granted host permission (manifest grants localhost only).
+// Must be the FIRST await in a click handler — chrome.permissions.request needs the user gesture.
+// Match patterns can't carry a port, so the grant covers the whole host (like the localhost entry).
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+async function requestHost(origin) {
+  try {
+    const u = new URL(origin);
+    if (LOCAL_HOSTS.has(u.hostname)) return true;
+    return await chrome.permissions.request({ origins: [`${u.protocol}//${u.hostname}/*`] });
+  } catch { return false; }
+}
+
 async function render() {
   const cfg = await send({ type: "getAll" });
   const list = $("list");
@@ -39,9 +51,12 @@ async function render() {
         <label>Image steps (override)</label><textarea class="imgsteps" placeholder="Optional override — prefer the repo's CLAUDE.md / a skill. Layered on top (path, naming, DB write, resize…)">${esc(c.imageInstructions || "")}</textarea>
       </div>`;
     row.querySelector(".save").addEventListener("click", async () => {
+      const enabled = row.querySelector(".en").checked;
+      if (enabled && !(await requestHost(origin)))
+        return flash(row.querySelector(".save"), "Permission denied");
       await send({ type: "setOrigin", origin, value: {
         name: row.querySelector(".name").value.trim(),
-        enabled: row.querySelector(".en").checked,
+        enabled,
         autoReload: row.querySelector(".ar").checked,
         token: row.querySelector(".tok").value.trim(),
         shimUrl: row.querySelector(".url").value.trim() || undefined,
@@ -87,9 +102,12 @@ $("poll-save").addEventListener("click", async () => {
 $("add").addEventListener("click", async () => {
   const origin = normOrigin($("a-origin").value);
   if (!origin) return;
+  const enabled = $("a-enabled").checked;
+  if (enabled && !(await requestHost(origin)))
+    return flash($("add"), "Permission denied");
   await send({ type: "setOrigin", origin, value: {
     name: $("a-name").value.trim(),
-    enabled: $("a-enabled").checked,
+    enabled,
     autoReload: $("a-autoreload").checked,
     token: $("a-token").value.trim(),
     shimUrl: $("a-url").value.trim() || undefined,

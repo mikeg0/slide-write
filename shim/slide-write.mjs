@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // slide-write — drive `claude` headless in a repo, stream the run as SSE on loopback.
-// Reuses ~/.claude (no API key). Binds 127.0.0.1 only; reach it via VS Code port forwarding.
+// Reuses ~/.claude (no API key). Binds 127.0.0.1 by default; reach it via VS Code port forwarding.
+// `--bind <addr>` overrides for the §13 reverse-proxy fallback (e.g. the docker bridge gateway).
 import http from "node:http";
 import os from "node:os";
 import { execFile } from "node:child_process";
-import { readdir, readFile, writeFile } from "node:fs/promises";
+import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { query } from "@anthropic-ai/claude-agent-sdk";
@@ -14,6 +15,18 @@ const PORT    = +(arg("port",   process.env.SLIDEWRITE_PORT   ?? 4040));
 const REPO    = resolve(arg("repo", process.cwd()));
 const TOKEN   = arg("token",  process.env.SLIDEWRITE_TOKEN ?? "");
 const ORIGIN  = arg("origin", process.env.SLIDEWRITE_ALLOWED_ORIGIN ?? "*"); // app origin, e.g. http://localhost:5173
+const BIND    = arg("bind",   process.env.SLIDEWRITE_BIND ?? "127.0.0.1");   // §13 fallback only — keep loopback otherwise
+// Multi-host mode (§13 generic proxy route): serve MANY repos from one shim, resolving the target
+// repo per request from the Host header. `--repos host=path,…` maps hosts explicitly; `--repo-root`
+// auto-maps a host's first DNS label to a directory under it (life-ops.dev.x.com → <root>/life-ops).
+// When neither is given the shim is single-repo and ignores Host entirely (original behavior).
+const REPO_ROOT = arg("repo-root", process.env.SLIDEWRITE_REPO_ROOT ?? "");
+const REPO_MAP  = new Map((arg("repos", process.env.SLIDEWRITE_REPOS ?? "") || "")
+  .split(",").filter(s => s.includes("=")).map((s) => {
+    const i = s.indexOf("=");
+    return [s.slice(0, i).trim().toLowerCase(), resolve(s.slice(i + 1).trim())];
+  }));
+const MULTI_HOST = !!(REPO_ROOT || REPO_MAP.size);
 const DEBUG   = process.argv.includes("--debug") || !!process.env.SW_DEBUG;  // log each SDK message to stderr
 // Opt-in: load the target repo's Agent Skills (.claude/skills/*/SKILL.md) so projects can define
 // their own image-asset / design procedures. `settingSources:["project"]` alone does NOT enable
@@ -53,10 +66,28 @@ const PREAMBLE =
   "- Keep schema/model changes ADDITIVE; never rename/drop/retype an existing column.\n" +
   "- When done, reply with one or two sentences describing exactly what you changed.";
 
-const git = (...a) => new Promise(r => execFile("git", ["-C", REPO, ...a], (_e, out) => r((out || "").trim())));
+const git = (repo, ...a) => new Promise(r => execFile("git", ["-C", repo, ...a], (_e, out) => r((out || "").trim())));
 // NB: parse porcelain UNtrimmed — `" M file"` starts with a space the status column needs.
-const porcelainPaths = () => new Promise(r => execFile("git", ["-C", REPO, "status", "--porcelain", "-uall"],
+const porcelainPaths = (repo) => new Promise(r => execFile("git", ["-C", repo, "status", "--porcelain", "-uall"],
   (_e, out) => r((out || "").split("\n").filter(Boolean).map(l => l.slice(3)))));
+
+// Resolve the repo a request targets. Single-repo mode always answers REPO. Multi-host mode:
+// explicit --repos entry → localhost fallback to --repo → first-DNS-label lookup under
+// --repo-root (label sanitized: a Host header is attacker-controlled text, never a path).
+// Returns null when nothing maps — the caller 404s.
+const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
+async function repoFor(req) {
+  if (!MULTI_HOST) return REPO;
+  const hostname = String(req.headers.host || "").replace(/:\d+$/, "").toLowerCase();
+  if (REPO_MAP.has(hostname)) return REPO_MAP.get(hostname);
+  if (LOCAL_HOSTNAMES.has(hostname)) return REPO;
+  const label = hostname.split(".")[0];
+  if (REPO_ROOT && /^[a-z0-9-]+$/.test(label)) {
+    const dir = join(resolve(REPO_ROOT), label);
+    try { if ((await stat(dir)).isDirectory()) return dir; } catch { /* no such repo */ }
+  }
+  return null;
+}
 const cors = (res) => {
   res.setHeader("Access-Control-Allow-Origin", ORIGIN);
   res.setHeader("Access-Control-Allow-Headers", "authorization, content-type");
@@ -68,7 +99,7 @@ const json = (res, code, obj) => { res.writeHead(code, { "content-type": "applic
 const sse  = (res, type, data = {}) => res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
 const readBody = (req) => new Promise((r) => { let b = ""; req.on("data", c => b += c); req.on("end", () => r(b)); });
 
-let busy = false;
+const busyRepos = new Set(); // one run at a time PER REPO; different repos may run concurrently
 
 // The §7 element-capture contract, serialized for the prompt. Single-sourced so buildPrompt and
 // buildImagePrompt stay in sync. Returns null when there's nothing useful to send.
@@ -139,26 +170,26 @@ function resultText(content) {
   const trunc = t.length > 4000; return { text: t.slice(0, 4000).trim(), trunc };
 }
 // Strip the repo prefix for display, tolerating slash-direction and drive-letter-case differences
-// between REPO and the path the SDK/transcript recorded (Windows reports `c:\…`, resolve gives `C:\…`).
-const relPath = (p) => {
+// between the repo and the path the SDK/transcript recorded (Windows reports `c:\…`, resolve gives `C:\…`).
+const relPath = (repo, p) => {
   if (!p) return "";
-  const np = p.replace(/\\/g, "/"), nr = REPO.replace(/\\/g, "/");
+  const np = p.replace(/\\/g, "/"), nr = repo.replace(/\\/g, "/");
   return np.toLowerCase().startsWith(nr.toLowerCase()) ? np.slice(nr.length).replace(/^\//, "") : p;
 };
 
 // --- Chat history (read-only) ----------------------------------------------------------------
 // `claude` writes one .jsonl transcript per session under ~/.claude/projects/<encoded-cwd>/.
 // The folder name is the cwd with every non-alphanumeric char turned into a single "-". Drive-letter
-// case can differ from REPO on Windows, so match the folder case-insensitively against the listing.
-let _projDir;
-async function claudeProjectDir() {
-  if (_projDir) return _projDir;
-  const encoded = REPO.replace(/[^a-zA-Z0-9]/g, "-");
+// case can differ from the repo on Windows, so match the folder case-insensitively against the listing.
+const _projDirs = new Map();
+async function claudeProjectDir(repo) {
+  if (_projDirs.has(repo)) return _projDirs.get(repo);
+  const encoded = repo.replace(/[^a-zA-Z0-9]/g, "-");
   const base = join(os.homedir(), ".claude", "projects");
   try {
     const entries = await readdir(base, { withFileTypes: true });
     const hit = entries.find(e => e.isDirectory() && e.name.toLowerCase() === encoded.toLowerCase());
-    if (hit) return (_projDir = join(base, hit.name));
+    if (hit) { const dir = join(base, hit.name); _projDirs.set(repo, dir); return dir; }
   } catch { /* ~/.claude/projects missing */ }
   return null;
 }
@@ -177,8 +208,8 @@ const userText = (content) => {
 };
 
 // List this repo's sessions, newest first. One pass per .jsonl file extracts a summary.
-async function listHistory() {
-  const dir = await claudeProjectDir();
+async function listHistory(repo) {
+  const dir = await claudeProjectDir(repo);
   if (!dir) return [];
   let files;
   try { files = (await readdir(dir, { withFileTypes: true })).filter(e => e.isFile() && e.name.endsWith(".jsonl")); }
@@ -212,9 +243,9 @@ async function listHistory() {
 
 // Parse one transcript into render-ready events mirroring the §6 SSE shapes (plus a `user` event), so
 // the panel replays it through the same onEvent renderer. Returns null for a bad/missing id.
-async function readHistory(id) {
+async function readHistory(repo, id) {
   if (!validSessionId(id)) return null;
-  const dir = await claudeProjectDir();
+  const dir = await claudeProjectDir(repo);
   if (!dir) return null;
   const file = resolve(dir, `${id}.jsonl`);
   if (!file.startsWith(dir + sep)) return null; // belt-and-suspenders traversal guard (id is already UUID-validated)
@@ -232,7 +263,7 @@ async function readHistory(id) {
         else if (b.type === "tool_use") {
           tool[b.id] = b.name;
           if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(b.name))
-            events.push({ type: "file_edit", tool: b.name, path: relPath(b.input?.file_path || ""), id: b.id });
+            events.push({ type: "file_edit", tool: b.name, path: relPath(repo, b.input?.file_path || ""), id: b.id });
           else events.push({ type: "tool", tool: b.name, detail: detailOf(b.name, b.input), id: b.id });
         }
       }
@@ -286,14 +317,14 @@ async function generateImage({ prompt, key, image, signal }) {
 
 // Drive one `claude` query, streaming the §6 SSE events. Returns whether the run errored. Shared by
 // runDesign and runImage so the event contract lives in one place.
-async function streamQuery(prompt, body, emit, aborted) {
+async function streamQuery(repo, prompt, body, emit, aborted) {
   const tool = {}; let streamedText = false, hadError = false;
   // Resolve the requested model against the allowlist; fall back to DEFAULT_MODEL (or, if that's
   // unset, omit `model` entirely so the SDK uses its own default). The actual model the SDK runs is
   // echoed back to the client in the `start` event from system/init.
   const model = modelAllowed(body.model) ? body.model : (DEFAULT_MODEL || undefined);
   for await (const m of query({ prompt, options: {
-    cwd: REPO, permissionMode: "bypassPermissions",  // runs as you (non-root) → allowed, no callback
+    cwd: repo, permissionMode: "bypassPermissions",  // runs as you (non-root) → allowed, no callback
     allowDangerouslySkipPermissions: true,           // required by the SDK alongside bypassPermissions
     includePartialMessages: true, settingSources: ["project"], systemPrompt: PREAMBLE, maxTurns: 40,
     ...(USE_SKILLS ? { skills: "all" } : {}),                         // load the target repo's project skills
@@ -312,7 +343,7 @@ async function streamQuery(prompt, body, emit, aborted) {
       if (b.type !== "tool_use") continue;
       tool[b.id] = b.name;
       if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(b.name))
-        emit("file_edit", { tool: b.name, path: relPath(b.input?.file_path || ""), id: b.id });
+        emit("file_edit", { tool: b.name, path: relPath(repo, b.input?.file_path || ""), id: b.id });
       else emit("tool", { tool: b.name, detail: detailOf(b.name, b.input), id: b.id });
     }
     else if (m.type === "user") for (const b of (Array.isArray(m.message.content) ? m.message.content : [])) {
@@ -330,12 +361,12 @@ async function streamQuery(prompt, body, emit, aborted) {
 }
 
 // Commit only what THIS run changed (diff of porcelain before/after); no push.
-async function commitChanged(dirty0, subj, emit) {
-  const changed = (await porcelainPaths()).filter(p => !dirty0.has(p));
+async function commitChanged(repo, dirty0, subj, emit) {
+  const changed = (await porcelainPaths(repo)).filter(p => !dirty0.has(p));
   if (!changed.length) return;
-  await git("add", "--", ...changed);
-  await git("-c", "user.name=Slide Write", "-c", "user.email=slide-write@local", "commit", "-m", `slide-write: ${subj}`);
-  emit("commit", { sha: await git("rev-parse", "--short", "HEAD"), count: changed.length });
+  await git(repo, "add", "--", ...changed);
+  await git(repo, "-c", "user.name=Slide Write", "-c", "user.email=slide-write@local", "commit", "-m", `slide-write: ${subj}`);
+  emit("commit", { sha: await git(repo, "rev-parse", "--short", "HEAD"), count: changed.length });
 }
 
 // Persist a picked-element screenshot (data:<mime>;base64,<data>) to a temp file OUTSIDE the repo so
@@ -352,19 +383,20 @@ async function saveScreenshot(element) {
 
 // Core: drive one design run. `emit(type, data)` sends an SSE event; `aborted()` lets the caller
 // cancel (client disconnect). Exported so the HTTP handler and tests share one implementation.
-export async function runDesign(body, emit, aborted = () => false) {
-  const dirty0 = new Set(await porcelainPaths());
+// `repo` defaults to the single-repo REPO; the HTTP layer passes the Host-resolved repo.
+export async function runDesign(body, emit, aborted = () => false, _signal, repo = REPO) {
+  const dirty0 = new Set(await porcelainPaths(repo));
   const shotPath = await saveScreenshot(body.element);
-  const hadError = await streamQuery(buildPrompt(body, shotPath), body, emit, aborted);
+  const hadError = await streamQuery(repo, buildPrompt(body, shotPath), body, emit, aborted);
   if (aborted()) return;
-  if (!hadError) await commitChanged(dirty0, (body.prompt || "design change").split("\n")[0].slice(0, 72), emit);
+  if (!hadError) await commitChanged(repo, dirty0, (body.prompt || "design change").split("\n")[0].slice(0, 72), emit);
   emit("done");
 }
 
 // Image run: generate the image with Gemini, save it to a temp file OUTSIDE the repo, then drive
 // `claude` to place it and wire it into the picked element. The fourth arg is an AbortSignal so the
 // (potentially slow) Gemini fetch is cancelled on client disconnect, not just the polled SDK loop.
-export async function runImage(body, emit, aborted = () => false, signal) {
+export async function runImage(body, emit, aborted = () => false, signal, repo = REPO) {
   const key = body.geminiKey || GEMINI_KEY;
   if (!key) { emit("error", { message: "no Gemini API key — set one in the extension options" }); return emit("done"); }
   emit("image_status", { state: "generating" });
@@ -379,21 +411,23 @@ export async function runImage(body, emit, aborted = () => false, signal) {
   await writeFile(tmpPath, bytes);
   emit("image_generated", { tmpPath, mimeType, bytes: bytes.length });  // metadata only — no base64 over the wire
   if (aborted()) return;
-  const dirty0 = new Set(await porcelainPaths());
+  const dirty0 = new Set(await porcelainPaths(repo));
   const prompt = buildImagePrompt({ ...body, imageInstructions: body.imageInstructions || IMAGE_INSTRUCTIONS }, tmpPath, !!image);
-  const hadError = await streamQuery(prompt, body, emit, aborted);
+  const hadError = await streamQuery(repo, prompt, body, emit, aborted);
   if (aborted()) return;
-  if (!hadError) await commitChanged(dirty0, `add image — ${(body.imagePrompt || "add image").split("\n")[0].slice(0, 72)}`, emit);
+  if (!hadError) await commitChanged(repo, dirty0, `add image — ${(body.imagePrompt || "add image").split("\n")[0].slice(0, 72)}`, emit);
   emit("done");
 }
 
-// Generic SSE wrapper: enforce the busy lock, set stream headers, parse the body, run `runner`, and
-// always res.end(). An AbortController is tied to an early client disconnect so an in-flight fetch
-// (Gemini) is cancelled too; the polled `aborted()` continues to guard the SDK loop.
+// Generic SSE wrapper: enforce the per-repo busy lock, set stream headers, parse the body, run
+// `runner`, and always res.end(). An AbortController is tied to an early client disconnect so an
+// in-flight fetch (Gemini) is cancelled too; the polled `aborted()` continues to guard the SDK loop.
 async function streamRun(req, res, runner) {
+  const repo = await repoFor(req);
+  if (!repo) return json(res, 404, { error: "no repo mapped for this host" });
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "connection": "keep-alive" });
-  if (busy) { sse(res, "error", { message: "a run is already in progress" }); sse(res, "done"); return res.end(); }
-  busy = true;
+  if (busyRepos.has(repo)) { sse(res, "error", { message: "a run is already in progress" }); sse(res, "done"); return res.end(); }
+  busyRepos.add(repo);
   // Abort only on a genuine client disconnect. NB: `req.destroyed` is true the moment the POST
   // body is fully read (Node tears down the request's readable side), so it can't signal
   // disconnect — using it aborts every run on the first SDK message. Watch the *response* for an
@@ -403,9 +437,9 @@ async function streamRun(req, res, runner) {
   res.on("close", () => { if (!res.writableEnded) { clientGone = true; ac.abort(); } });
   try {
     const body = JSON.parse((await readBody(req)) || "{}");
-    await runner(body, (t, d) => sse(res, t, d), () => clientGone, ac.signal);
+    await runner(body, (t, d) => sse(res, t, d), () => clientGone, ac.signal, repo);
   } catch (e) { sse(res, "error", { message: String(e?.message || e) }); sse(res, "done"); }
-  finally { busy = false; res.end(); }
+  finally { busyRepos.delete(repo); res.end(); }
 }
 
 function serve() {
@@ -415,26 +449,32 @@ function serve() {
     const path = new URL(req.url, "http://x").pathname;
     if (path === "/health") return json(res, 200, { ok: true });
     if (!authed(req)) return json(res, 401, { error: "unauthorized" });
+    // Routes below operate on a repo — resolved per request from Host in multi-host mode,
+    // always REPO otherwise. streamRun re-resolves itself (it must 404 before the SSE head).
+    const repo = await repoFor(req);
+    if (!repo) return json(res, 404, { error: "no repo mapped for this host" });
     if (path === "/meta")
       return json(res, 200, {
-        project: basename(REPO), repoDir: REPO, version: VERSION,
-        branch: await git("rev-parse", "--abbrev-ref", "HEAD"),
-        dirty: !!(await git("status", "--porcelain")),
+        project: basename(repo), repoDir: repo, version: VERSION,
+        branch: await git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
+        dirty: !!(await git(repo, "status", "--porcelain")),
         models: MODELS, defaultModel: DEFAULT_MODEL || MODELS[0].id,
         geminiModel: GEMINI_MODEL, geminiEnv: !!GEMINI_KEY,  // geminiEnv: shim has a server-side key fallback
       });
     if (path === "/history" && req.method === "GET")
-      return json(res, 200, { sessions: await listHistory() });
+      return json(res, 200, { sessions: await listHistory(repo) });
     if (path.startsWith("/history/") && req.method === "GET") {
       const id = decodeURIComponent(path.slice("/history/".length));
-      const data = await readHistory(id);
+      const data = await readHistory(repo, id);
       return data ? json(res, 200, data) : json(res, 404, { error: "not found" });
     }
     if (path === "/design" && req.method === "POST") return streamRun(req, res, runDesign);
     if (path === "/generate-image" && req.method === "POST") return streamRun(req, res, runImage);
     json(res, 404, { error: "not found" });
-  }).listen(PORT, "127.0.0.1", () =>
-    console.error(`slide-write → http://127.0.0.1:${PORT}  repo=${REPO}  origin=${ORIGIN}`));
+  }).listen(PORT, BIND, () =>
+    console.error(`slide-write → http://${BIND}:${PORT}  ` +
+      (MULTI_HOST ? `multi-host (repo-root=${REPO_ROOT || "-"}, repos=${REPO_MAP.size}, localhost→${REPO})`
+                  : `repo=${REPO}`) + `  origin=${ORIGIN}`));
 }
 
 // Start the server only when run directly (so tests can import runDesign without listening).

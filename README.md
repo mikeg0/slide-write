@@ -187,12 +187,23 @@ its JSONL as SSE — same event mapping. The SDK is used here for typed messages
 ### 5.2 `shim/slide-write.mjs`
 
 A single `.mjs` file. CLI flags / env
-(`--port`/`--repo`/`--token`/`--origin`/`--model`/`--debug`/`--use-skills`, plus the image flags
+(`--port`/`--repo`/`--token`/`--origin`/`--bind`/`--model`/`--debug`/`--use-skills`, the multi-host
+flags `--repo-root`/`--repos`, plus the image flags
 `--gemini-key`/`--gemini-model`/`--image-instructions`) configure it; it stands up an
-`http.createServer` on `127.0.0.1`, and the run logic lives in exported `runDesign(body, emit,
-aborted)` / `runImage(body, emit, aborted, signal)` so the HTTP handler and tests share one
-implementation (the server only starts when the file is run directly, behind an `import.meta.url`
-guard).
+`http.createServer` on `127.0.0.1` (overridable via `--bind` for §13 only), and the run logic lives
+in exported `runDesign(body, emit, aborted, signal, repo)` / `runImage(body, emit, aborted, signal,
+repo)` so the HTTP handler and tests share one implementation (the server only starts when the file
+is run directly, behind an `import.meta.url` guard).
+
+**Multi-host mode (for the §13 proxy fallback):** passing `--repo-root <dir>` and/or `--repos
+host=path,…` makes the shim serve MANY repos, resolving the target per request from the `Host`
+header: explicit `--repos` entry first, then `localhost`/`127.0.0.1` falls back to `--repo`
+(so VS Code-forwarded access keeps working), then the host's first DNS label is looked up under
+`--repo-root` (`life-ops.dev.example.com` → `<root>/life-ops`; the label is sanitized —
+a Host header is attacker-controlled text, never a path). Unmapped hosts get 404 on every route
+but `/health`. The busy lock is per-repo: two projects can run concurrently, a second run on the
+same repo is still rejected. Without these flags the shim is single-repo and ignores `Host`
+entirely — the original behavior.
 
 **The system prompt is the interesting part** — it's what makes a generic shim behave well against
 any repo. It's deliberately project-agnostic (per-project knowledge comes from the target's own
@@ -414,6 +425,7 @@ DOM** so host and panel styles never collide.
   "version": "0.1.0",
   "permissions": ["storage", "scripting", "activeTab"],
   "host_permissions": ["http://localhost/*", "http://127.0.0.1/*", "https://localhost/*"],
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
   "background": { "service_worker": "background.js" },
   "action": { "default_popup": "popup.html" },
   "content_scripts": [{
@@ -425,7 +437,19 @@ DOM** so host and panel styles never collide.
 ```
 `http://localhost/*` matches any port, so it covers every project's dev server and the forwarded
 shim port. `inject.js` mounts the widget only if `chrome.storage` has an **enabled** entry for
-`location.origin` — inert otherwise. (For the reverse-proxy fallback, add your public host here.)
+`location.origin` — inert otherwise.
+
+**Non-localhost origins (the §13 reverse-proxy fallback) are runtime-granted, not baked into the
+manifest.** Install-time host access stays localhost-only; `optional_host_permissions` lets
+options/popup call `chrome.permissions.request({ origins })` on the save click (a user gesture is
+required), and on grant the background registers `content/inject.js` for that origin via
+`chrome.scripting.registerContentScripts` (id `sw:<origin>`). Disabling unregisters; deleting also
+removes the permission; `onStartup`/`onInstalled` reconcile the registry against config + granted
+permissions (registrations survive restarts but are cleared on extension reload/update). Match
+patterns can't carry a port, so a grant covers the whole host — inject.js's per-origin config gate
+keeps other ports inert. `web_accessible_resources.matches` is the one intentionally-broad entry
+(`https://*/*`, `http://*/*`): the panel/picker ES modules must be importable on any granted
+origin, and it exposes only the extension's own JS/CSS, not host access.
 
 ### 8.2 `content/sse.js` — the SSE reader (verbatim; runs in the content script, not the SW)
 ⚠️ The stream lives in the **content script** because MV3 service workers are killed after ~30s
@@ -519,9 +543,11 @@ Per origin, the options page stores `{ enabled, token, shimUrl }` — e.g.
 
 The shim runs **arbitrary code edits + shell** in a repo as you. Defenses:
 
-- **Loopback bind.** The shim listens on `127.0.0.1` only — never a public interface. It's reachable
-  from the browser solely through VS Code's port forward (authenticated by the VS Code remote
-  connection) or directly on the same machine.
+- **Loopback bind.** The shim listens on `127.0.0.1` by default — never a public interface. It's
+  reachable from the browser solely through VS Code's port forward (authenticated by the VS Code
+  remote connection) or directly on the same machine. The opt-in `--bind <addr>` /
+  `SLIDEWRITE_BIND` override exists solely for the §13 reverse-proxy fallback (bind the docker
+  bridge gateway so a containerized proxy can reach the host shim); don't use it otherwise.
 - **Bearer token.** Every route except `/health` requires `Authorization: Bearer <SLIDEWRITE_TOKEN>`;
   reject with 401 first. Use a random secret per project; never commit it.
 - **CORS allowlist = anti-CSRF.** A JSON POST triggers a preflight; the shim only approves your app's
@@ -607,11 +633,18 @@ instead of a VS Code-forwarded `localhost` URL. A public-origin page calling `lo
 cross-origin + Chrome's Private/Local Network Access checks, so instead mount the shim on the app's
 **own hostname** under a path prefix, making the call same-origin.
 
-With Traefik (Docker-label form), route `Host(app) && PathPrefix(/_slidewrite)` → StripPrefix →
-the shim's port, at higher priority than the app's catch-all router. The extension then uses
-`shimUrl = location.origin + "/_slidewrite"`. Bind the shim to the proxy network instead of pure
-loopback, and keep the token + an `ipAllowList` middleware as the boundary. This is strictly more
-setup than the default; prefer VS Code forwarding whenever you can.
+With Traefik (Docker-label or file-provider form), route `PathPrefix(/_slidewrite)` → StripPrefix →
+the shim's port, at higher priority than the apps' catch-all `Host(...)` routers. For a single app,
+scope the rule with `Host(app) && …`; with the shim's **multi-host mode** (§5.2 `--repo-root` /
+`--repos`) one Host-less router covers every app the proxy serves — the shim resolves the repo from
+the forwarded `Host` header and 404s hosts that don't map. The extension then uses
+`shimUrl = location.origin + "/_slidewrite"` (its default). Bind the shim to the proxy network
+instead of pure loopback — run it with `--bind <docker bridge gateway>` (e.g. `--bind 172.18.0.1`)
+and point the Traefik service at `http://<gateway>:<port>`; the default stays `127.0.0.1` so this is
+per-invocation opt-in. Keep the token + an `ipAllowList` middleware as the boundary (caveat: docker
+NAT on the published port can rewrite the source to the gateway IP, so include the bridge subnet
+and treat the bearer token as the real gate). This is strictly more setup than the default; prefer
+VS Code forwarding whenever you can.
 
 ---
 
