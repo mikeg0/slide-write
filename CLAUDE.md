@@ -66,6 +66,8 @@ the dev server hot-reloads.
 - Smoke test: `curl /health`, `curl -H 'Authorization: Bearer <t>' /meta`, then `POST /design`;
   expect SSE `start → file_edit → result → commit → done` and one scoped commit
   (`git reset --hard HEAD~1` to clean up). See README §12.
+- **Version bump:** whenever any code under `extension/` changes, bump the patch level of the
+  SemVer `version` in `extension/manifest.json` (e.g. `0.2.1` → `0.2.2`) in the same change.
 - Extension: load `extension/` unpacked; in options add the app origin → `shimUrl` + token; enable.
   Non-localhost origins prompt for a runtime host permission and get a dynamically registered
   content script (README §8.1); localhost stays zero-config via the static manifest entries.
