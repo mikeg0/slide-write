@@ -364,8 +364,13 @@ async function streamQuery(repo, prompt, body, emit, aborted) {
 async function commitChanged(repo, dirty0, subj, emit) {
   const changed = (await porcelainPaths(repo)).filter(p => !dirty0.has(p));
   if (!changed.length) return;
+  // `git()` swallows errors, so detect a failed commit (hook rejection, index error) by HEAD not
+  // moving — otherwise we'd emit a green `commit` carrying the PREVIOUS head's sha.
+  const head0 = await git(repo, "rev-parse", "HEAD");
   await git(repo, "add", "--", ...changed);
   await git(repo, "-c", "user.name=Slide Write", "-c", "user.email=slide-write@local", "commit", "-m", `slide-write: ${subj}`);
+  if ((await git(repo, "rev-parse", "HEAD")) === head0)
+    return emit("commit_error", { message: "git commit failed (hook rejection or index error) — the run's edits are still in the working tree" });
   emit("commit", { sha: await git(repo, "rev-parse", "--short", "HEAD"), count: changed.length });
 }
 

@@ -283,7 +283,8 @@ Every frame is **one JSON object on a `data:` line**; the client reads only `dat
 | `file_edit` | `{tool, path, id}` | edit row (✏️ `path`) |
 | `tool_result` | `{tool, id, text, isError, truncated}` | collapsible output (auto-open on error) |
 | `result` | `{isError, numTurns, durationMs, totalCostUsd, usage, result}` | stats footer; `result` is the final-text fallback if no deltas streamed |
-| `commit` | `{sha, count}` | green "Committed `<sha>` · N files" |
+| `commit` | `{sha, count}` | green "Committed `<sha>` · N files"; triggers auto-reload when the per-origin option is on |
+| `commit_error` | `{message}` | red error row (commit didn't land — edits remain in the working tree); auto-reload does NOT fire |
 | `image_status` | `{state}` | status row (`state:"generating"` → "generating image…"); emitted only by `/generate-image` |
 | `image_generated` | `{tmpPath, mimeType, bytes}` | note row "🖼️ image generated"; metadata only (no image bytes over the wire) |
 | `error` | `{message}` | error row |
