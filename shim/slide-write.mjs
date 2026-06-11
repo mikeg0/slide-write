@@ -39,6 +39,7 @@ const VERSION = "0.1.0";
 // unknown id falls back to DEFAULT_MODEL, or the SDK's own default when that's unset). Keep ids in
 // sync with the installed `claude` CLI / Agent SDK.
 const MODELS = [
+  { id: "claude-fable-5",            label: "Claude Fable 5" },
   { id: "claude-opus-4-8",           label: "Claude Opus 4.8" },
   { id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6" },
   { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
