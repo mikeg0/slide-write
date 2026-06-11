@@ -41,6 +41,7 @@ async function render() {
       <div class="controls">
         <label><input type="checkbox" class="en" ${c.enabled ? "checked" : ""}/> enabled</label>
         <label><input type="checkbox" class="ar" ${c.autoReload ? "checked" : ""}/> auto-reload</label>
+        <label title="When off, runs leave their edits uncommitted in the repo's working tree"><input type="checkbox" class="ac" ${c.autoCommit !== false ? "checked" : ""}/> auto-commit</label>
         <button class="save primary">Save</button>
         <button class="del danger">Delete</button>
       </div>
@@ -58,6 +59,7 @@ async function render() {
         name: row.querySelector(".name").value.trim(),
         enabled,
         autoReload: row.querySelector(".ar").checked,
+        autoCommit: row.querySelector(".ac").checked,
         token: row.querySelector(".tok").value.trim(),
         shimUrl: row.querySelector(".url").value.trim() || undefined,
         imageInstructions: row.querySelector(".imgsteps").value.trim(),
@@ -109,6 +111,7 @@ $("add").addEventListener("click", async () => {
     name: $("a-name").value.trim(),
     enabled,
     autoReload: $("a-autoreload").checked,
+    autoCommit: $("a-autocommit").checked,
     token: $("a-token").value.trim(),
     shimUrl: $("a-url").value.trim() || undefined,
     imageInstructions: $("a-imgsteps").value.trim(),

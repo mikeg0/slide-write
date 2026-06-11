@@ -62,7 +62,8 @@ chrome.runtime.onStartup.addListener(reconcile);
 chrome.runtime.onInstalled.addListener(reconcile);
 
 // Message API. Config shape:
-//   { geminiKey?, pollInterval?, origins: { "<origin>": { enabled, token, shimUrl?, autoReload?, model?, imageInstructions? } } }
+//   { geminiKey?, pollInterval?, origins: { "<origin>": { enabled, token, shimUrl?, autoReload?, autoCommit?, model?, imageInstructions? } } }
+// `autoCommit` defaults to true when absent (only an explicit false disables the shim's per-run commit).
 // `geminiKey` and `pollInterval` (seconds; liveness-poll cadence while the panel is open) are global;
 // everything else is per-origin.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {

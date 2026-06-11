@@ -255,7 +255,9 @@ Everything else is mechanical and may be implemented freely as long as it honors
 - **Auto-commit only what this run changed.** Snapshot `git status --porcelain -uall` before the
   run, diff after, `git add` + commit just the new paths under a `Slide Write` identity (no push),
   emit `commit`. **Parse porcelain untrimmed** (`line.slice(3)`) — the leading status-column space
-  is significant, so a path's first character would be eaten by a trimming helper.
+  is significant, so a path's first character would be eaten by a trimming helper. A request may
+  opt out with a top-level `autoCommit: false` (§6) — the run then leaves its edits uncommitted in
+  the working tree and no `commit` event fires; absent/anything-else keeps the commit.
 - **HTTP server.** CORS (allow only `ORIGIN`; include `Access-Control-Allow-Private-Network`),
   a `Bearer <token>` gate on every route except `/health` (401 first), the `busy` single-run lock,
   and routes `/health`, `/meta`, `/history`, `/history/<id>`, `POST /design`, `POST /generate-image`.
@@ -301,7 +303,7 @@ extension renders the `/meta` list in a composer dropdown and persists the choic
 
 **Image generation (additive — Gemini "nano banana").** `POST /generate-image` is an SSE route
 (same Bearer+CORS gate, same `busy` lock and per-run auto-commit as `/design`). It takes
-`{ imagePrompt, element, geminiKey, imageInstructions, screen, model }`. The shim calls Google's
+`{ imagePrompt, element, geminiKey, imageInstructions, screen, model, autoCommit }`. The shim calls Google's
 Generative Language API (model id from `--gemini-model`/`SLIDEWRITE_GEMINI_MODEL`, default
 `gemini-2.5-flash-image`) with the key in an `x-goog-api-key` header — never the URL, so it can't
 leak into logs. If `element.imageDataUrl` is present (the user picked an `<img>`; the picker captured
@@ -361,6 +363,13 @@ Bearer+CORS gate as `/meta`, expose the **current repo's** sessions:
   `user` event) so the panel replays a past session through the same renderer. `id` must be a valid
   session UUID (regex-validated + path-traversal-guarded); a bad/missing id → 404. Lifecycle events
   (`start`/`commit`/`done`) are not emitted for a replay.
+
+**Auto-commit opt-out (additive).** `/design` and `/generate-image` accept an optional top-level
+`autoCommit` (boolean). When it is **exactly `false`**, the shim skips the per-run commit — the
+run's edits stay uncommitted in the working tree and no `commit` event is emitted (so the
+extension's auto-reload-on-commit never fires either). Absent or any other value keeps the default
+auto-commit, so old clients are unaffected. The extension exposes this as a per-origin
+**auto-commit** checkbox (on by default) in Options and sends the resolved value with every run.
 
 **Resume (additive).** `/design` accepts an optional top-level `resume` (a session UUID). When
 present and valid, the shim passes `resume` to the SDK `query` so the run continues that

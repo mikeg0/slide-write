@@ -389,7 +389,10 @@ export async function runDesign(body, emit, aborted = () => false, _signal, repo
   const shotPath = await saveScreenshot(body.element);
   const hadError = await streamQuery(repo, buildPrompt(body, shotPath), body, emit, aborted);
   if (aborted()) return;
-  if (!hadError) await commitChanged(repo, dirty0, (body.prompt || "design change").split("\n")[0].slice(0, 72), emit);
+  // `autoCommit: false` (extension per-origin option) leaves the edits uncommitted in the working
+  // tree; absent/anything-else keeps the original auto-commit behavior.
+  if (!hadError && body.autoCommit !== false)
+    await commitChanged(repo, dirty0, (body.prompt || "design change").split("\n")[0].slice(0, 72), emit);
   emit("done");
 }
 
@@ -415,7 +418,8 @@ export async function runImage(body, emit, aborted = () => false, signal, repo =
   const prompt = buildImagePrompt({ ...body, imageInstructions: body.imageInstructions || IMAGE_INSTRUCTIONS }, tmpPath, !!image);
   const hadError = await streamQuery(repo, prompt, body, emit, aborted);
   if (aborted()) return;
-  if (!hadError) await commitChanged(repo, dirty0, `add image — ${(body.imagePrompt || "add image").split("\n")[0].slice(0, 72)}`, emit);
+  if (!hadError && body.autoCommit !== false)
+    await commitChanged(repo, dirty0, `add image — ${(body.imagePrompt || "add image").split("\n")[0].slice(0, 72)}`, emit);
   emit("done");
 }
 

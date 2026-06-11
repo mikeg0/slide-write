@@ -11,9 +11,11 @@ it and implement/extend in the order of its §12 "Build order for Claude".
 **Current state: built.** Both `shim/` and `extension/` exist and run; on top of the original
 `/design` flow the shim adds chat history, session resume, model selection, **Gemini "nano
 banana" image generation** (`POST /generate-image`, the `image_status`/`image_generated` SSE events,
-and the §7 `imageDataUrl` capture field), and **multi-host mode** (README §5.2: `--repo-root`/
+and the §7 `imageDataUrl` capture field), **multi-host mode** (README §5.2: `--repo-root`/
 `--repos` resolve the target repo per request from the `Host` header behind the §13 reverse proxy;
-single-repo localhost behavior is unchanged when those flags are absent). README.md remains the authoritative spec — it inlines every
+single-repo localhost behavior is unchanged when those flags are absent), and an **auto-commit
+opt-out** (per-origin extension checkbox → top-level `autoCommit` on each run; only an explicit
+`false` makes the shim skip the per-run commit). README.md remains the authoritative spec — it inlines every
 contract and the load-bearing code verbatim (§5 shim, §8.2 SSE reader); treat those as authoritative
 and extend them in lockstep. The mechanical parts (UI rendering, helpers) may be implemented freely
 as long as they honor the contracts.

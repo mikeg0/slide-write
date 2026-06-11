@@ -22,6 +22,7 @@
       shimUrl: ((c && c.shimUrl) || ORIGIN + "/_slidewrite").replace(/\/$/, ""),
       token: (c && c.token) || "",
       autoReload: !!(c && c.autoReload),
+      autoCommit: !(c && c.autoCommit === false),  // default ON — only an explicit false opts out
       model: (c && c.model) || "",   // persisted model selection (empty = use shim default)
       geminiKey: (c && c.geminiKey) || "",            // global Gemini key (getOrigin merges it in)
       pollInterval: (c && c.pollInterval) || 0,       // global liveness-poll seconds (getOrigin merges it in; 0 = default)
@@ -75,6 +76,7 @@
     onProbe: probe,                  // panel re-checks on open / poll / after a failed send
     configured: init.configured,
     autoReload: init.autoReload,
+    autoCommit: init.autoCommit,
     model: init.model,
     geminiKey: init.geminiKey,
     pollInterval: init.pollInterval,
@@ -182,7 +184,7 @@
     const m = c.meta || (connChanged ? null : lastMeta);
     liveCfg = next; lastMeta = m; lastConn = c;
     panel.setConfig({ shimUrl: next.shimUrl, token: next.token, meta: m, conn: { state: c.state, detail: c.detail },
-      autoReload: next.autoReload, configured: next.configured, model: next.model, geminiKey: next.geminiKey,
-      pollInterval: next.pollInterval, imageInstructions: next.imageInstructions });
+      autoReload: next.autoReload, autoCommit: next.autoCommit, configured: next.configured, model: next.model,
+      geminiKey: next.geminiKey, pollInterval: next.pollInterval, imageInstructions: next.imageInstructions });
   });
 })();
