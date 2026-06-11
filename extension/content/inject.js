@@ -90,33 +90,40 @@
   // 5. No in-page affordance: the panel is toggled by the toolbar icon (action.onClicked →
   //    background → "toggle-panel") and the keyboard command, both relayed in step 7.
 
-  // 6. Markup mode — lazily import the picker (Phase 5). Picks an element, fills the §7 context,
-  //    then opens the composer anchored to it. The panel stays open during picking (the picker
-  //    skips its own data-slidewrite-ui nodes), so the chat doesn't slide shut on every pick.
+  // 6. Markup mode — lazily import the picker (Phase 5). The picker STAYS ARMED for consecutive
+  //    picks: each click appends the §7 context to the panel's element stack (capped at 5; the cap
+  //    auto-disarms), Esc or a second 🎯 click disarms. The panel stays open during picking (the
+  //    picker skips its own data-slidewrite-ui nodes and lets clicks on it through), so the chat
+  //    stays usable between picks.
   //    We always capture the element's current pixels (cheap, img-only) so that if the user then
   //    toggles Image Generation in the composer's "+" menu the shim can do image-to-image; the
   //    composer strips that field back out for plain /design sends.
+  let stopPicker = null;
+  function stopMarkup() {
+    pickerActive = false;
+    panel.setMarkupActive(false);
+    if (stopPicker) { stopPicker(); stopPicker = null; }  // no-op if the picker already cleaned up (Esc)
+  }
   async function startMarkup() {
-    if (pickerActive) return;
+    if (pickerActive) return stopMarkup();   // 🎯 while armed toggles picking off
     pickerActive = true;
     panel.setMarkupActive(true);
     try {
       const { startPicker } = await import(chrome.runtime.getURL("content/picker.js"));
-      startPicker(async (ctx) => {
-        pickerActive = false;
-        panel.setMarkupActive(false);
-        if (!ctx) return;
+      if (!pickerActive) return;   // toggled back off while the picker module was loading
+      stopPicker = startPicker(async (ctx) => {
+        if (!ctx) return stopMarkup();       // Escape — picker has already cleaned itself up
         // Best-effort screenshot of the picked element's rendered pixels (Chrome has no
         // "screenshot this element" API — we grab the viewport and crop). Degrades silently to
         // text-only context on any failure (restricted page, tainted canvas, off-screen rect).
         const shot = await captureElementShot(ctx.rect);
         if (shot) { ctx.screenshotDataUrl = shot.dataUrl; ctx.screenshotW = shot.w; ctx.screenshotH = shot.h; }
-        panel.setElementContext(ctx);
+        const more = panel.addElementContext(ctx);
         panel.open();
+        if (!more) stopMarkup();             // hit the element cap — disarm instead of refusing picks
       }, { captureImage: true });
     } catch (e) {
-      pickerActive = false;
-      panel.setMarkupActive(false);
+      stopMarkup();
       console.warn("[slide-write] picker unavailable:", e);
     }
   }

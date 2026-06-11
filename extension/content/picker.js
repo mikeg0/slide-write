@@ -2,9 +2,12 @@
 // element context. The four robustness rules:
 //   1. Listen on `window` in the CAPTURE phase; preventDefault + stopPropagation on click so marking
 //      an element never triggers the app's own handlers (clicking a nav item doesn't navigate).
+//      Clicks on our own UI (data-slidewrite-ui) are NOT suppressed — the panel stays usable while armed.
 //   2. document.elementFromPoint, then walk up and skip our own UI (tagged data-slidewrite-ui).
 //   3. Highlight box is position:fixed; pointer-events:none, so it never intercepts the hit-test.
-//   4. Capture the §7 context, leave markup mode, hand it back to open the composer anchored to it.
+//   4. Capture the §7 context per click and hand it back — the picker STAYS ARMED for consecutive
+//      picks. It disarms on Escape (onPick(null) after cleanup) or when the consumer calls the
+//      returned stop() (🎯 toggled off, element cap reached).
 
 // Verbatim from §10.3 — never mark our own UI.
 function skipOwnUI(el) {
@@ -72,6 +75,8 @@ function captureContext(el, captureImage) {
 
 export function startPicker(onPick, { captureImage = false } = {}) {
   let current = null;
+  let paused = false;   // highlight + picking suspended while the consumer handles a pick (screenshot)
+  let done = false;
 
   const box = document.createElement("div");
   box.setAttribute("data-slidewrite-ui", "");
@@ -101,10 +106,13 @@ export function startPicker(onPick, { captureImage = false } = {}) {
     label.style.top = `${Math.max(0, r.top - 20)}px`;
   }
 
+  function hideHighlight() { box.style.display = "none"; label.style.display = "none"; }
+
   function onMove(e) {
+    if (paused) return;
     const hit = skipOwnUI(document.elementFromPoint(e.clientX, e.clientY));
     current = hit;
-    if (hit) place(hit); else { box.style.display = "none"; label.style.display = "none"; }
+    if (hit) place(hit); else hideHighlight();
   }
 
   function suppress(e) {
@@ -113,22 +121,38 @@ export function startPicker(onPick, { captureImage = false } = {}) {
     if (e.stopImmediatePropagation) e.stopImmediatePropagation();
   }
 
+  // Suppress only over pickable elements: clicks/presses on our own UI (the panel, its chips) and on
+  // bare body/html pass through untouched, so the chat stays usable while the picker is armed.
+  function maybeSuppress(e) {
+    if (paused || skipOwnUI(document.elementFromPoint(e.clientX, e.clientY))) suppress(e);
+  }
+
   function onClick(e) {
-    suppress(e);
+    if (paused) return suppress(e);   // a pick is still being handled — swallow stray clicks
     const hit = skipOwnUI(document.elementFromPoint(e.clientX, e.clientY)) || current;
-    cleanup();
-    onPick(hit ? captureContext(hit, captureImage) : null);
+    if (!hit) return;                 // our own UI / nothing pickable — let the click through, stay armed
+    suppress(e);
+    // STAY ARMED: hide the highlight before handing off (so the consumer's screenshot is clean) and
+    // pause until the (possibly async) consumer finishes, then re-arm on the next mousemove.
+    paused = true; current = null; hideHighlight();
+    Promise.resolve(onPick(captureContext(hit, captureImage))).finally(() => { paused = false; });
   }
 
   function onKey(e) {
-    if (e.key === "Escape") { suppress(e); cleanup(); onPick(null); }
+    if (e.key === "Escape") { suppress(e); stop(); onPick(null); }
+  }
+
+  function stop() {
+    if (done) return;
+    done = true;
+    cleanup();
   }
 
   function cleanup() {
     window.removeEventListener("mousemove", onMove, true);
     window.removeEventListener("click", onClick, true);
-    window.removeEventListener("mousedown", suppress, true);
-    window.removeEventListener("pointerdown", suppress, true);
+    window.removeEventListener("mousedown", maybeSuppress, true);
+    window.removeEventListener("pointerdown", maybeSuppress, true);
     window.removeEventListener("keydown", onKey, true);
     document.documentElement.style.cursor = prevCursor;
     box.remove(); label.remove();
@@ -136,7 +160,9 @@ export function startPicker(onPick, { captureImage = false } = {}) {
 
   window.addEventListener("mousemove", onMove, true);
   window.addEventListener("click", onClick, true);
-  window.addEventListener("mousedown", suppress, true);   // stop focus/nav side effects pre-click
-  window.addEventListener("pointerdown", suppress, true);
+  window.addEventListener("mousedown", maybeSuppress, true);   // stop focus/nav side effects pre-click
+  window.addEventListener("pointerdown", maybeSuppress, true);
   window.addEventListener("keydown", onKey, true);
+
+  return stop;   // consumer disarms explicitly (🎯 toggle, element cap); safe to call after Escape too
 }

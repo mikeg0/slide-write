@@ -113,16 +113,27 @@ function elementContext(element) {
   return Object.keys(ctx).length ? ctx : null;
 }
 
-function buildPrompt({ prompt = "", screen, element }, screenshotPath) {
+// Normalize a request's element targets: the §7 `elements` array (the composer stacks up to
+// MAX_ELEMENTS picks), with the legacy single `element` still accepted. Capped server-side too, so
+// an oversized payload can't balloon the prompt/context window.
+const MAX_ELEMENTS = 5;
+const elementsOf = (body) =>
+  (Array.isArray(body.elements) ? body.elements : body.element ? [body.element] : [])
+    .filter(Boolean).slice(0, MAX_ELEMENTS);
+
+function buildPrompt({ prompt = "", screen }, elements = [], shotPaths = []) {
   const parts = [String(prompt).trim()];
   if (screen) parts.push(`\n[Current screen: ${screen}]`);
-  const ctx = elementContext(element);
-  if (ctx)
-    parts.push("\n[The user clicked this on-screen element and is referring to it]\n" +
-      JSON.stringify(ctx, null, 2) +
-      "\nUse the class names / text / DOM path to locate the source and matching styles, then edit there.");
-  if (screenshotPath)
-    parts.push(`\n[A screenshot of the selected element was saved at:\n  ${screenshotPath}\n(this file is OUTSIDE the repo). Read it to see how the element currently looks before editing.]`);
+  const nth = (i) => (elements.length > 1 ? ` (element ${i + 1} of ${elements.length})` : "");
+  elements.forEach((element, i) => {
+    const ctx = elementContext(element);
+    if (ctx)
+      parts.push(`\n[The user clicked this on-screen element${nth(i)} and is referring to it]\n` +
+        JSON.stringify(ctx, null, 2) +
+        "\nUse the class names / text / DOM path to locate the source and matching styles, then edit there.");
+    if (shotPaths[i])
+      parts.push(`\n[A screenshot of the selected element${nth(i)} was saved at:\n  ${shotPaths[i]}\n(this file is OUTSIDE the repo). Read it to see how the element currently looks before editing.]`);
+  });
   return parts.join("\n");
 }
 
@@ -130,7 +141,7 @@ function buildPrompt({ prompt = "", screen, element }, screenshotPath) {
 // claude to place it per the project's conventions and wire it into the picked element. Stays
 // generic — framework specifics live in the target repo's CLAUDE.md. The per-project
 // `imageInstructions` (exact path, naming, DB write, resize…) are appended last and take precedence.
-function buildImagePrompt({ imagePrompt = "", screen, element, imageInstructions }, tmpPath, hasSource) {
+function buildImagePrompt({ imagePrompt = "", screen, imageInstructions }, elements, tmpPath, hasSource) {
   const parts = [
     (hasSource
       ? "A newly edited version of the selected image has been generated and saved on disk at:"
@@ -140,7 +151,7 @@ function buildImagePrompt({ imagePrompt = "", screen, element, imageInstructions
     "README (save path, naming, resizing, database/CDN steps), FOLLOW THAT. Otherwise copy the file into " +
     "the project's conventional static-assets location (the framework-appropriate public/static dir, or " +
     "an imported asset) with a descriptive filename.\n" +
-    "2. Wire it into the on-screen element the user selected: set the <img>'s src, or the element's CSS " +
+    "2. Wire it into the on-screen element(s) the user selected: set the <img>'s src, or the element's CSS " +
     "background-image, matching the existing patterns in the source.\n" +
     "3. Add a cache-busting query string to the referenced URL (e.g. `?v=<timestamp-or-hash>`) so an " +
     "UPDATED image with the same filename actually refreshes in the browser instead of serving the stale " +
@@ -148,11 +159,14 @@ function buildImagePrompt({ imagePrompt = "", screen, element, imageInstructions
     `Original image request: ${String(imagePrompt).trim()}`,
   ];
   if (screen) parts.push(`\n[Current screen: ${screen}]`);
-  const ctx = elementContext(element);
-  if (ctx)
-    parts.push("\n[The user selected this on-screen element — place the image here]\n" +
-      JSON.stringify(ctx, null, 2) +
-      "\nUse the class names / text / DOM path to locate the source, then edit there.");
+  const nth = (i) => (elements.length > 1 ? ` (element ${i + 1} of ${elements.length})` : "");
+  elements.forEach((element, i) => {
+    const ctx = elementContext(element);
+    if (ctx)
+      parts.push(`\n[The user selected this on-screen element${nth(i)} — place the image here]\n` +
+        JSON.stringify(ctx, null, 2) +
+        "\nUse the class names / text / DOM path to locate the source, then edit there.");
+  });
   const extra = (imageInstructions || "").trim();
   if (extra)
     parts.push("\n[Project-specific integration steps — follow these exactly; they take precedence over the above]\n" + extra);
@@ -378,11 +392,11 @@ async function commitChanged(repo, dirty0, subj, emit) {
 // Persist a picked-element screenshot (data:<mime>;base64,<data>) to a temp file OUTSIDE the repo so
 // `claude` can Read it as an image — same approach runImage uses for generated assets. Returns the
 // path, or null when there's no (well-formed) screenshot.
-async function saveScreenshot(element) {
+async function saveScreenshot(element, n = 0) {
   const m = /^data:([^;,]+);base64,(.+)$/s.exec(element?.screenshotDataUrl || "");
   if (!m) return null;
   const ext = m[1].includes("jpeg") ? "jpg" : m[1].includes("webp") ? "webp" : "png";
-  const tmpPath = join(os.tmpdir(), `slidewrite-shot-${Date.now()}.${ext}`);
+  const tmpPath = join(os.tmpdir(), `slidewrite-shot-${Date.now()}-${n}.${ext}`);  // -<n>: same-ms picks don't collide
   await writeFile(tmpPath, Buffer.from(m[2], "base64"));
   return tmpPath;
 }
@@ -392,8 +406,9 @@ async function saveScreenshot(element) {
 // `repo` defaults to the single-repo REPO; the HTTP layer passes the Host-resolved repo.
 export async function runDesign(body, emit, aborted = () => false, _signal, repo = REPO) {
   const dirty0 = new Set(await porcelainPaths(repo));
-  const shotPath = await saveScreenshot(body.element);
-  const hadError = await streamQuery(repo, buildPrompt(body, shotPath), body, emit, aborted);
+  const elements = elementsOf(body);
+  const shotPaths = await Promise.all(elements.map((el, i) => saveScreenshot(el, i)));
+  const hadError = await streamQuery(repo, buildPrompt(body, elements, shotPaths), body, emit, aborted);
   if (aborted()) return;
   // `autoCommit: false` (extension per-origin option) leaves the edits uncommitted in the working
   // tree; absent/anything-else keeps the original auto-commit behavior.
@@ -409,10 +424,14 @@ export async function runImage(body, emit, aborted = () => false, signal, repo =
   const key = body.geminiKey || GEMINI_KEY;
   if (!key) { emit("error", { message: "no Gemini API key — set one in the extension options" }); return emit("done"); }
   emit("image_status", { state: "generating" });
+  const elements = elementsOf(body);
   // Optional source image for image-to-image (the user picked an <img>): data:<mime>;base64,<data>.
+  // With multiple targets, the first element carrying pixels wins — Gemini takes one source image.
   let image;
-  const m = /^data:([^;,]+);base64,(.+)$/s.exec(body.element?.imageDataUrl || "");
-  if (m) image = { mimeType: m[1], data: m[2] };
+  for (const e of elements) {
+    const m = /^data:([^;,]+);base64,(.+)$/s.exec(e?.imageDataUrl || "");
+    if (m) { image = { mimeType: m[1], data: m[2] }; break; }
+  }
   const { bytes, mimeType } = await generateImage({ prompt: body.imagePrompt || "", key, image, signal });
   if (aborted()) return;
   const ext = mimeType.includes("jpeg") ? "jpg" : mimeType.includes("webp") ? "webp" : "png";
@@ -421,7 +440,7 @@ export async function runImage(body, emit, aborted = () => false, signal, repo =
   emit("image_generated", { tmpPath, mimeType, bytes: bytes.length });  // metadata only — no base64 over the wire
   if (aborted()) return;
   const dirty0 = new Set(await porcelainPaths(repo));
-  const prompt = buildImagePrompt({ ...body, imageInstructions: body.imageInstructions || IMAGE_INSTRUCTIONS }, tmpPath, !!image);
+  const prompt = buildImagePrompt({ ...body, imageInstructions: body.imageInstructions || IMAGE_INSTRUCTIONS }, elements, tmpPath, !!image);
   const hadError = await streamQuery(repo, prompt, body, emit, aborted);
   if (aborted()) return;
   if (!hadError && body.autoCommit !== false)

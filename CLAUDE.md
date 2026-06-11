@@ -13,9 +13,11 @@ it and implement/extend in the order of its §12 "Build order for Claude".
 banana" image generation** (`POST /generate-image`, the `image_status`/`image_generated` SSE events,
 and the §7 `imageDataUrl` capture field), **multi-host mode** (README §5.2: `--repo-root`/
 `--repos` resolve the target repo per request from the `Host` header behind the §13 reverse proxy;
-single-repo localhost behavior is unchanged when those flags are absent), and an **auto-commit
+single-repo localhost behavior is unchanged when those flags are absent), an **auto-commit
 opt-out** (per-origin extension checkbox → top-level `autoCommit` on each run; only an explicit
-`false` makes the shim skip the per-run commit). README.md remains the authoritative spec — it inlines every
+`false` makes the shim skip the per-run commit), and **multi-element targets** (the picker stays
+armed for consecutive picks; up to 5 stacked §7 captures POSTed as a top-level `elements` array,
+capped at 5 on both sides, with the legacy single `element` still accepted). README.md remains the authoritative spec — it inlines every
 contract and the load-bearing code verbatim (§5 shim, §8.2 SSE reader); treat those as authoritative
 and extend them in lockstep. The mechanical parts (UI rendering, helpers) may be implemented freely
 as long as they honor the contracts.
@@ -58,7 +60,9 @@ the dev server hot-reloads.
 - **The SSE event contract (README §6) and element-capture contract (README §7)** are the
   shim↔extension interface — change both sides together. New SSE `type`s are backward-compatible.
 - **The element picker listens on `window` in the capture phase** and tags its own UI with
-  `data-slidewrite-ui` — marking an element must never trigger the app's own handlers.
+  `data-slidewrite-ui` — marking an element must never trigger the app's own handlers. Suppression
+  is per-target: clicks on `data-slidewrite-ui` nodes (and bare body/html) pass through, so the
+  panel stays usable while the picker is armed for consecutive picks.
 
 ## Build / run
 - Shim: `cd shim && npm install`, then

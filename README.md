@@ -55,6 +55,8 @@ the extension spec. It's written to be implemented by **Claude Code** — see [�
   app hot-reloads → you see it in seconds.
 - A **Markup mode**: hover to highlight elements, click one to describe a change anchored to it; the
   clicked element's context (tag, classes, text, DOM path) is sent so `claude` finds the source.
+  Picks **stack** — the picker stays armed, so consecutive clicks add elements (up to 5 per
+  message), each shown as its own removable chip; 🎯 again or Esc finishes picking.
 - The panel streams **thinking, tool calls, file edits, tool output, a final summary, and run
   stats** live over SSE, and shows the commit each run makes.
 - **Reusable across projects.** The shim is generic; per-project knowledge comes from the target
@@ -223,21 +225,27 @@ const PREAMBLE =
   "- When done, reply with one or two sentences describing exactly what you changed.";
 ```
 
-The other load-bearing bit is **how a clicked element becomes prompt context.** `buildPrompt()`
-joins the typed request with the current `screen` and a compact JSON of the element's
-tag/class/text/`domPath`, then instructs `claude` to use those to locate the source:
+The other load-bearing bit is **how the clicked elements become prompt context.** A request may
+carry up to **5** stacked targets ([§7](#7-the-element-capture-contract) `elements`; the
+`elementsOf()` helper normalizes — legacy single `element` accepted — and re-caps server-side).
+`buildPrompt()` joins the typed request with the current `screen` and, per element, a compact JSON
+of its tag/class/text/`domPath`, then instructs `claude` to use those to locate the source:
 
 ```js
-parts.push("\n[The user clicked this on-screen element and is referring to it]\n" +
+parts.push(`\n[The user clicked this on-screen element${nth(i)} and is referring to it]\n` +
   JSON.stringify(ctx, null, 2) +
   "\nUse the class names / text / DOM path to locate the source and matching styles, then edit there.");
 ```
 
-When the request carries an element screenshot ([§7](#7-the-element-capture-contract)
-`screenshotDataUrl`), `runDesign` writes it to a temp PNG **outside the repo** (`saveScreenshot()`,
-the same temp-file pattern `runImage` uses) and `buildPrompt` appends a line telling `claude` to
-`Read` that path — its Read tool renders the image, so the agent sees how the element looks before
-editing. No Agent-SDK image-input plumbing is needed.
+`nth(i)` numbers the blocks (`" (element 2 of 3)"`) only when several were picked, so the
+single-element prompt is unchanged.
+
+When an element carries a screenshot ([§7](#7-the-element-capture-contract) `screenshotDataUrl`),
+`runDesign` writes it to a temp PNG **outside the repo** (`saveScreenshot()`, the same temp-file
+pattern `runImage` uses; one file per element, index-suffixed so same-millisecond picks don't
+collide) and `buildPrompt` appends a line telling `claude` to `Read` that path — its Read tool
+renders the image, so the agent sees how the element looks before editing. No Agent-SDK
+image-input plumbing is needed.
 
 Everything else is mechanical and may be implemented freely as long as it honors these contracts:
 
@@ -304,14 +312,16 @@ extension renders the `/meta` list in a composer dropdown and persists the choic
 
 **Image generation (additive — Gemini "nano banana").** `POST /generate-image` is an SSE route
 (same Bearer+CORS gate, same `busy` lock and per-run auto-commit as `/design`). It takes
-`{ imagePrompt, element, geminiKey, imageInstructions, screen, model, autoCommit }`. The shim calls Google's
+`{ imagePrompt, elements, geminiKey, imageInstructions, screen, model, autoCommit }` (`elements` as
+in [§7](#7-the-element-capture-contract) — ≤5 targets, legacy single `element` accepted). The shim calls Google's
 Generative Language API (model id from `--gemini-model`/`SLIDEWRITE_GEMINI_MODEL`, default
 `gemini-2.5-flash-image`) with the key in an `x-goog-api-key` header — never the URL, so it can't
-leak into logs. If `element.imageDataUrl` is present (the user picked an `<img>`; the picker captured
-its pixels via canvas), it's sent as an inline image part for image-to-image; otherwise it's
+leak into logs. If an element's `imageDataUrl` is present (the user picked an `<img>`; the picker captured
+its pixels via canvas), it's sent as an inline image part for image-to-image — the first element
+carrying pixels wins, since Gemini takes one source image; otherwise it's
 text-to-image. The decoded image is written to a temp file **outside the repo**, an `image_generated`
 event fires, and the shim then drives `claude` (via the normal §6 stream) to copy the asset into the
-project and wire it into the picked element. Key resolution: `body.geminiKey` →
+project and wire it into the picked element(s). Key resolution: `body.geminiKey` →
 `--gemini-key`/`GEMINI_API_KEY`; missing → an `error` event. `/meta` advertises
 `{ geminiModel, geminiEnv }` (`geminiEnv` = the shim has a server-side key). The extension stores one
 **global** Gemini key (shared across origins).
@@ -379,12 +389,22 @@ unaffected — only files changed by *this* run are committed. An absent/invalid
 The extension's 🕘 history view offers a **↻ Resume** action that threads subsequent sends into the
 chosen session.
 
+**Multiple element targets (additive).** `/design` and `/generate-image` accept a top-level
+`elements` array of [§7](#7-the-element-capture-contract) captures — the composer stacks up to
+**5** picks per message (capped on both sides so the prompt/context window stays sane; the shim
+re-caps with `slice(0, 5)`). The legacy single top-level `element` is still accepted (normalized to
+a one-entry array), so old clients are unaffected.
+
 ---
 
 ## 7. The element-capture contract
 
-When the user clicks an element in Markup mode, the extension POSTs (plus a top-level `screen` =
-current route/view):
+When the user clicks an element in Markup mode, its capture is added to the composer as a removable
+chip. Picks **stack** — the picker stays armed, so each consecutive click appends another target, up
+to **5 per message** (the cap auto-disarms the picker and keeps the prompt/context window sane; the
+shim re-caps server-side). Picking ends via Esc, clicking 🎯 again, or the cap. On send the extension POSTs
+them as a top-level `elements: [ … ]` array (plus a top-level `screen` = current route/view); the
+shim also still accepts the legacy single top-level `element`. Each entry:
 
 ```jsonc
 {
@@ -407,10 +427,11 @@ background worker grabs the visible tab (`chrome.tabs.captureVisibleTab`) and th
 it to `rect` (scaling by `devicePixelRatio`, clamping to the viewport, downscaling to a modest max
 edge). Capture is best-effort — restricted pages, a zero-size rect, or a load failure just yield no
 screenshot and the flow degrades to text-only. The composer shows it as a **removable attachment
-chip** (thumbnail + dimensions + ✕); removing it drops the pixels so they're never sent. On `/design`
-the screenshot IS sent (with the UI-only `screenshotW/H` stripped) — the shim writes it to a temp file
-and asks `claude` to `Read` it ([§5](#5-the-shim-shim)). On `/generate-image` it's stripped (that route
-uses `imageDataUrl` instead).
+chip** under that element's identity chip (thumbnail + dimensions + ✕); removing it drops the pixels
+so they're never sent. On `/design`
+the screenshots ARE sent (with the UI-only `screenshotW/H` stripped) — the shim writes each to a temp
+file and asks `claude` to `Read` it ([§5](#5-the-shim-shim)). On `/generate-image` they're stripped
+(that route uses `imageDataUrl` instead).
 
 `imageDataUrl` is captured on every pick where the target is an `<img>` whose pixels the picker could
 read (same-origin / CORS-enabled canvas; tainted images are silently skipped). The composer keeps it
@@ -495,7 +516,9 @@ export async function streamDesign(shimUrl, token, payload, onEvent, signal) {
 ### 8.3 `content/picker.js` — the element picker (capture-phase)
 1. **Listen on `window` in the capture phase** for `mousemove`/`click`. Capture-phase
    `preventDefault()` + `stopPropagation()` on click means marking an element **never triggers the
-   app's own handlers**.
+   app's own handlers**. Suppression is per-target: clicks/presses on the extension's own UI (the
+   panel, its chips) and on bare `body`/`html` pass through untouched, so the chat stays usable
+   while the picker is armed.
 2. **`document.elementFromPoint`**, then walk up and **skip your own UI** — tag every node you
    render with `data-slidewrite-ui` and ignore hits inside one:
    ```js
@@ -509,8 +532,13 @@ export async function streamDesign(shimUrl, token, payload, onEvent, signal) {
    }
    ```
 3. **Highlight box is `position:fixed; pointer-events:none`** at the target's `getBoundingClientRect()`.
-4. **Capture the [§7](#7-the-element-capture-contract) context**, leave markup mode, open the composer
-   anchored to the element. Build `domPath` as an `nth-of-type` chain of ≤5 ancestors, stopping at the first `id`.
+4. **Capture the [§7](#7-the-element-capture-contract) context per click and STAY ARMED** for
+   consecutive picks — each capture is handed back (the panel stacks it as a chip) and picking
+   continues. While the consumer handles a pick (screenshot capture), the highlight hides and
+   further clicks are swallowed, then picking re-arms. The picker disarms on **Escape**
+   (`onPick(null)` after cleanup) or via the **`stop()` function `startPicker` returns** — the
+   widget calls it when 🎯 is clicked again (toggle off) or the 5-element cap is reached. Build
+   `domPath` as an `nth-of-type` chain of ≤5 ancestors, stopping at the first `id`.
 
 ### 8.4 The widget & remaining files
 - **`content/panel.js`** — transcript + composer. Renders each [§6](#6-the-sse-event-contract) event
