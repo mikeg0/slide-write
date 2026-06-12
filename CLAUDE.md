@@ -81,8 +81,10 @@ the dev server hot-reloads.
 - **Validated against `@anthropic-ai/claude-agent-sdk` 0.3.168** (phase-1 spike). Confirmed: message
   `type`s are lowercase `system | assistant | user | result | stream_event`; `system/init` carries
   `session_id` + `model`; assistant/user content are Anthropic blocks (`tool_use`, `tool_result`
-  with `tool_use_id`); extra types (`system/status`, `rate_limit_event`, `system/thinking_tokens`)
-  are ignored. Shapes can still drift across versions — re-verify on upgrade.
+  with `tool_use_id`); `system/thinking_tokens` and per-assistant-message `message.usage` feed the
+  live `usage` SSE event (README §6 "Live token usage" — deduped by message id, thinking estimate
+  reset on authoritative usage); other extra types (`system/status`, `rate_limit_event`) are
+  ignored. Shapes can still drift across versions — re-verify on upgrade.
 - The run logic is the exported `runDesign(body, emit, aborted, signal, repo)`; the HTTP server only starts when
   the file is run directly (`import.meta.url` guard), so it can be imported by tests.
 - Run the shim as a **normal foreground/terminal process** (e.g. a dedicated VS Code terminal). It

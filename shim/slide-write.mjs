@@ -334,6 +334,25 @@ async function generateImage({ prompt, key, image, signal }) {
 // runDesign and runImage so the event contract lives in one place.
 async function streamQuery(repo, prompt, body, emit, aborted) {
   const tool = {}; let streamedText = false, hadError = false;
+  // Live token feed for the client's running counter (§6 `usage`, cumulative). Authoritative
+  // per-API-call usage lands with each assistant message — deduped by message id, since partials
+  // and multi-block messages repeat it (message_start seeds the entry early with the input/cache
+  // counts). Between those, `system/thinking_tokens` estimates progress while the model thinks;
+  // that estimate resets when the next authoritative usage arrives (its output_tokens already
+  // includes the thinking). Thinking-driven emits are throttled; turn boundaries emit immediately.
+  const perMsg = new Map(); let thinkingTokens = 0, lastUsageAt = 0;
+  const emitUsage = (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastUsageAt < 250) return;
+    lastUsageAt = now;
+    let inp = 0, out = 0, cr = 0, cc = 0;
+    for (const u of perMsg.values()) {
+      inp += u.input_tokens || 0; out += u.output_tokens || 0;
+      cr += u.cache_read_input_tokens || 0; cc += u.cache_creation_input_tokens || 0;
+    }
+    emit("usage", { inputTokens: inp, outputTokens: out, cacheReadTokens: cr,
+      cacheCreationTokens: cc, thinkingTokens });
+  };
   // Resolve the requested model against the allowlist; fall back to DEFAULT_MODEL (or, if that's
   // unset, omit `model` entirely so the SDK uses its own default). The actual model the SDK runs is
   // echoed back to the client in the `start` event from system/init.
@@ -354,12 +373,27 @@ async function streamQuery(repo, prompt, body, emit, aborted) {
       if (d.type === "text_delta" && d.text) { streamedText = true; emit("delta", { text: d.text }); }
       else if (d.type === "thinking_delta" && d.thinking) emit("thinking_delta", { text: d.thinking });
     }
-    else if (m.type === "assistant") for (const b of m.message.content ?? []) {
-      if (b.type !== "tool_use") continue;
-      tool[b.id] = b.name;
-      if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(b.name))
-        emit("file_edit", { tool: b.name, path: relPath(repo, b.input?.file_path || ""), id: b.id });
-      else emit("tool", { tool: b.name, detail: detailOf(b.name, b.input), id: b.id });
+    else if (m.type === "stream_event" && m.event?.type === "message_start") {
+      const msg = m.event.message;
+      if (msg?.id && msg.usage) { perMsg.set(msg.id, msg.usage); emitUsage(true); }
+    }
+    else if (m.type === "system" && m.subtype === "thinking_tokens") {
+      thinkingTokens += m.estimated_tokens_delta || 0;
+      emitUsage();
+    }
+    else if (m.type === "assistant") {
+      if (m.message?.id && m.message.usage) {
+        perMsg.set(m.message.id, m.message.usage);
+        thinkingTokens = 0;  // now counted inside this message's output_tokens
+        emitUsage(true);
+      }
+      for (const b of m.message.content ?? []) {
+        if (b.type !== "tool_use") continue;
+        tool[b.id] = b.name;
+        if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(b.name))
+          emit("file_edit", { tool: b.name, path: relPath(repo, b.input?.file_path || ""), id: b.id });
+        else emit("tool", { tool: b.name, detail: detailOf(b.name, b.input), id: b.id });
+      }
     }
     else if (m.type === "user") for (const b of (Array.isArray(m.message.content) ? m.message.content : [])) {
       if (b.type !== "tool_result") continue;

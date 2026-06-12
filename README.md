@@ -255,7 +255,9 @@ Everything else is mechanical and may be implemented freely as long as it honors
   `includePartialMessages: true`, `settingSources: ["project"]`, `systemPrompt: PREAMBLE`,
   `maxTurns: 40`. The loop dispatches on `m.type` and maps each SDK message to a §6 SSE event —
   `system/init`→`start`, `content_block_delta`→`delta`/`thinking_delta`, `tool_use`→`file_edit`
-  (for Edit/Write/MultiEdit/NotebookEdit) or `tool`, `tool_result`→`tool_result`, `result`→`result`.
+  (for Edit/Write/MultiEdit/NotebookEdit) or `tool`, `tool_result`→`tool_result`, `result`→`result`;
+  assistant-message usage (deduped by message id, seeded early by `message_start`) plus
+  `system/thinking_tokens`→ the cumulative `usage` event (§6 "Live token usage").
   `--debug`/`SW_DEBUG` logs each `m.type`/`m.subtype` to stderr. Bail immediately when `aborted()`
   (client disconnect) returns true. `--use-skills`/`SLIDEWRITE_USE_SKILLS` adds `skills: "all"` so the
   target repo's `.claude/skills/` are loaded (off by default — `settingSources:["project"]` alone does
@@ -287,6 +289,7 @@ Every frame is **one JSON object on a `data:` line**; the client reads only `dat
 | `start` | `{sessionId, model}` | status row "Started · `<model>`" |
 | `delta` | `{text}` | append to the current assistant bubble |
 | `thinking_delta` | `{text}` | append to the current thinking bubble |
+| `usage` | `{inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, thinkingTokens}` | cumulative live token counter — spinner + count in the status bar |
 | `tool` | `{tool, detail, id}` | compact tool row (`detail` = command/file/pattern) |
 | `file_edit` | `{tool, path, id}` | edit row (✏️ `path`) |
 | `tool_result` | `{tool, id, text, isError, truncated}` | collapsible output (auto-open on error) |
@@ -303,6 +306,19 @@ Adding a new `type` is backward-compatible: clients ignore unknown types.
 | `user` | `{text}` | user bubble (history replay only; live runs render the user bubble inline in `send()`) |
 
 The `user` event is emitted only by `GET /history/<id>` (below), not by a live `/design` run.
+
+**Live token usage (additive).** During a run the shim emits cumulative `usage` events so the client
+can show a running token counter while `claude` works. The authoritative per-API-call usage arrives
+with each SDK assistant message — accumulated **deduped by message id** (partials and multi-block
+messages repeat the same usage; `message_start` stream events seed an entry early with the
+input/cache counts). Between turns, the SDK's `system/thinking_tokens` estimate fills the gap while
+the model thinks: it accrues into `thinkingTokens` and resets when the next authoritative usage
+lands (whose `output_tokens` already includes that thinking — so the client's live count is
+`outputTokens + thinkingTokens` without double-counting). Thinking-driven emits are throttled
+(~250ms); turn-boundary emits are immediate. The final `result` event's `usage`/`totalCostUsd`
+remain the authority for the stats row — there is no streamed mid-run cost, so cost shows only at
+the end. `usage` is live-only: it is not persisted to transcripts and `GET /history/<id>` does not
+replay it.
 
 **Model selection (additive).** `/design` accepts an optional top-level `model` (a model id). The
 shim validates it against an allowlist advertised by `/meta` (`{ models: [{id,label}], defaultModel }`);
