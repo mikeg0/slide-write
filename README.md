@@ -107,6 +107,7 @@ port — appear at `localhost:<port>` on the machine where the browser runs. So 
 talks to `http://localhost:<port>`, and **local dev and remote dev look identical** to it.
 
 ```mermaid
+%%{init: {'theme':'neutral'}}%%
 flowchart TB
     subgraph UI["UI machine — Win11 / macOS / Linux desktop (where the browser runs)"]
         direction TB
@@ -129,8 +130,8 @@ flowchart TB
     EXT == "fetch + SSE → http://localhost:4040/design<br/>(VS Code port-forwards 4040 + 5173 to localhost)" ==> SHIM
     DEV == "HMR · hot-reloaded UI" ==> PAGE
 
-    classDef hot fill:#eaeaff,stroke:#4646a0;
-    classDef repo fill:#eafbea,stroke:#3f7f3f;
+    classDef hot fill:#bdbdbd,stroke:#404040,color:#111111;
+    classDef repo fill:#9e9e9e,stroke:#212121,color:#111111;
     class SHIM,CLAUDE hot;
     class REPO repo;
 ```
@@ -138,6 +139,10 @@ flowchart TB
 The load-bearing property: **the shim and the dev server share the repo through the filesystem.**
 `claude` writes files; the project's own dev server sees the change and hot-reloads. The shim never
 imports the project's code.
+
+The diagram above is the **default** path — the app opened at a VS Code-forwarded `localhost` URL.
+To serve it at a public hostname like `https://app.example.com` instead, see the reverse-proxy
+variant in [§13](#13-fallback-public-hostname-access-via-a-reverse-proxy).
 
 ---
 
@@ -656,6 +661,13 @@ Single-developer, trusted-local only. Not multi-tenant or public.
 
 ## 11. Quick start
 
+Two interchangeable shims — pick **Node** ([§11.1](#111-node-quick-start), the Agent SDK) or
+**Python** ([§11.2](#112-python-quick-start), drives the `claude` CLI directly; for hosts without
+Node). Both expose the identical HTTP+SSE surface, so the extension setup ([§11.3](#113-connect-the-extension-either-shim))
+is the same either way.
+
+### 11.1 Node quick start
+
 **Prerequisites:** Claude Code installed and logged in (`claude` on PATH), Node 18+, VS Code.
 
 **Per machine (once):**
@@ -668,9 +680,30 @@ cd shim && npm install        # pulls @anthropic-ai/claude-agent-sdk
 node shim/slide-write.mjs --repo /path/to/project --port 4040 \
   --origin http://localhost:5173 --token "$(openssl rand -hex 16)"
 ```
-Add `--debug` (or set `SW_DEBUG=1`) to log every SDK message (`type`/`subtype`) to stderr during a
+
+### 11.2 Python quick start
+
+For servers without Node. The shim is stdlib-only Python 3.10+, so there's **no install step** — but
+it drives the `claude` CLI, which must be on `PATH`.
+
+**Prerequisites:** Claude Code installed and logged in (`claude` on PATH — the native installer
+`curl -fsSL https://claude.ai/install.sh | bash` ships a self-contained binary that needs no Node),
+Python 3.10+, VS Code.
+
+**Per project:** run the shim pointed at the repo, on its own port:
+```bash
+python3 shim/slide-write.py --repo /path/to/project --port 4040 \
+  --origin http://localhost:5173 --token "$(openssl rand -hex 16)"
+```
+If `claude` isn't on `PATH`, point at it with `--claude-bin /path/to/claude` (or
+`SLIDEWRITE_CLAUDE_BIN`). Skills are off by default to match the Node shim; add `--use-skills` to
+enable them.
+
+### 11.3 Connect the extension (either shim)
+
+Add `--debug` (or set `SW_DEBUG=1`) to log every message (`type`/`subtype`) to stderr during a
 run — useful for seeing the raw message sequence before it's translated into SSE events.
-In **remote/WSL/container** dev, run this in a VS Code terminal on the code host — VS Code
+In **remote/WSL/container** dev, run the shim in a VS Code terminal on the code host — VS Code
 auto-forwards port 4040 (and your dev server's port) to your laptop's `localhost`. Open the app via
 its forwarded `localhost` URL.
 
@@ -733,6 +766,49 @@ per-invocation opt-in. Keep the token + an `ipAllowList` middleware as the bound
 NAT on the published port can rewrite the source to the gateway IP, so include the bridge subnet
 and treat the bearer token as the real gate). This is strictly more setup than the default; prefer
 VS Code forwarding whenever you can.
+
+The resulting topology — page, proxy, and shim all share the `app.example.com` origin, so the
+extension's call to `/_slidewrite/design` is **same-origin** (no CORS, no Private/Local Network
+Access prompt). Contrast with the default [§3](#3-architecture) diagram, where the browser reaches a
+loopback shim over a VS Code-forwarded `localhost` port:
+
+```mermaid
+%%{init: {'theme':'neutral'}}%%
+flowchart TB
+    subgraph BROWSER["Browser — any machine, public internet"]
+        direction TB
+        PAGE["app page · https://app.example.com"]
+        EXT["browser extension<br/>shimUrl = location.origin + /_slidewrite (same-origin)"]
+        PAGE -.- EXT
+    end
+
+    subgraph PROXY["Reverse proxy · Traefik — terminates TLS for app.example.com"]
+        direction TB
+        R1["router: PathPrefix(/_slidewrite) · higher priority<br/>StripPrefix → shim · + ipAllowList middleware"]
+        R2["router: Host(app.example.com) · catch-all<br/>→ app dev server"]
+    end
+
+    subgraph CODE["Code host · Docker network (remote server / WSL / container)"]
+        direction TB
+        SHIM["slide-write shim · 172.18.0.1:4040<br/>--bind docker bridge gateway · HTTP + SSE"]
+        CLAUDE["claude (headless, Agent SDK)<br/>reuses ~/.claude · runs as you (non-root)"]
+        DEV["app dev server · Vite, … (unchanged)"]
+        REPO[("repo")]
+        SHIM --> CLAUDE
+        CLAUDE -- "edits files" --> REPO
+        REPO -- "file watch → HMR" --> DEV
+    end
+
+    EXT == "fetch + SSE · POST /_slidewrite/design<br/>same-origin + Bearer token" ==> R1
+    R1 == "StripPrefix → http://172.18.0.1:4040/design" ==> SHIM
+    DEV == "serves app page + HMR (wss)" ==> R2
+    R2 == "https://app.example.com" ==> PAGE
+
+    classDef hot fill:#bdbdbd,stroke:#404040,color:#111111;
+    classDef repo fill:#9e9e9e,stroke:#212121,color:#111111;
+    class SHIM,CLAUDE hot;
+    class REPO repo;
+```
 
 ---
 
