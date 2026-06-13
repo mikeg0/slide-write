@@ -343,7 +343,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
       diagCodeNode,
     ]),
     el("div", { class: "dmsg-diag-cli" }, [
-      el("div", { class: "dmsg-diag-cli-label", text: "Python (no Node on the host)" }),
+      el("div", { class: "dmsg-diag-cli-label", text: "Python" }),
       diagCodePy,
     ]),
   ]);
