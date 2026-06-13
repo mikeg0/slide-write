@@ -17,7 +17,11 @@ single-repo localhost behavior is unchanged when those flags are absent), an **a
 opt-out** (per-origin extension checkbox → top-level `autoCommit` on each run; only an explicit
 `false` makes the shim skip the per-run commit), and **multi-element targets** (the picker stays
 armed for consecutive picks; up to 5 stacked §7 captures POSTed as a top-level `elements` array,
-capped at 5 on both sides, with the legacy single `element` still accepted). README.md remains the authoritative spec — it inlines every
+capped at 5 on both sides, with the legacy single `element` still accepted), and a **Python shim**
+(`shim/slide-write.py`, README §5.3: a stdlib-only Python 3.10+ port for hosts without Node — same
+flags/env/routes/contracts, drives the `claude` CLI headless via `-p --output-format stream-json`
+instead of the Agent SDK; `slide-write.mjs` is the reference implementation and the two must change
+together). README.md remains the authoritative spec — it inlines every
 contract and the load-bearing code verbatim (§5 shim, §8.2 SSE reader); treat those as authoritative
 and extend them in lockstep. The mechanical parts (UI rendering, helpers) may be implemented freely
 as long as they honor the contracts.
@@ -67,6 +71,8 @@ the dev server hot-reloads.
 ## Build / run
 - Shim: `cd shim && npm install`, then
   `node shim/slide-write.mjs --repo <path> --port 4040 --origin http://localhost:5173 --token <secret>`.
+- Python shim (no Node on the host): no install — `python3 shim/slide-write.py …` with the same
+  flags. Needs the `claude` CLI on PATH (native installer, no Node) or `--claude-bin <path>`.
 - Smoke test: `curl /health`, `curl -H 'Authorization: Bearer <t>' /meta`, then `POST /design`;
   expect SSE `start → file_edit → result → commit → done` and one scoped commit
   (`git reset --hard HEAD~1` to clean up). See README §12.
@@ -85,6 +91,11 @@ the dev server hot-reloads.
   live `usage` SSE event (README §6 "Live token usage" — deduped by message id, thinking estimate
   reset on authoritative usage); other extra types (`system/status`, `rate_limit_event`) are
   ignored. Shapes can still drift across versions — re-verify on upgrade.
+- **The Python shim was validated against `claude` CLI 2.1.173** — its `-p --output-format
+  stream-json` output is the same message stream the SDK yields (plus ignorable `system/status` /
+  `rate_limit_event`), and `--max-turns` is accepted though hidden from `--help`. Mind the skills
+  inversion: the CLI loads skills by default, so the Python shim passes `--disable-slash-commands`
+  unless `--use-skills` (README §5.3).
 - The run logic is the exported `runDesign(body, emit, aborted, signal, repo)`; the HTTP server only starts when
   the file is run directly (`import.meta.url` guard), so it can be imported by tests.
 - Run the shim as a **normal foreground/terminal process** (e.g. a dedicated VS Code terminal). It

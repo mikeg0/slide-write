@@ -76,7 +76,8 @@ Single-developer, trusted-local tool ([§10](#10-security-model)).
 │
 ├── shim/                           # the local agent: claude → SSE on loopback
 │   ├── package.json                # bin: "slide-write"; dep: @anthropic-ai/claude-agent-sdk
-│   └── slide-write.mjs             # the CLI (HTTP server + SDK run loop + SSE mapping + commit)
+│   ├── slide-write.mjs             # the CLI (HTTP server + SDK run loop + SSE mapping + commit)
+│   └── slide-write.py              # stdlib-only Python port for hosts without Node (§5.3)
 │
 └── extension/                      # the Manifest V3 browser extension (the universal UI)
     ├── manifest.json               # host_permissions: localhost; content script on localhost
@@ -276,6 +277,39 @@ Everything else is mechanical and may be implemented freely as long as it honors
 deltas, `tool_use`/`tool_result` blocks) can drift across SDK versions; the loop dispatches on
 `m.type` defensively — verify against the installed SDK during the phase-1 smoke test
 ([§12](#12-build-order-for-claude)).
+
+### 5.3 `shim/slide-write.py` — the Python shim (servers without Node)
+
+A stdlib-only Python 3.10+ port of `slide-write.mjs` for hosts where Node isn't available. Same
+HTTP+SSE surface, same flags/env, same §6/§7 contracts — the extension can't tell the two apart.
+Instead of the Agent SDK it shells out to the `claude` CLI headless (the zero-dep alternative §5.1
+mentions): `claude -p --output-format stream-json --verbose --include-partial-messages
+--dangerously-skip-permissions --setting-sources project --system-prompt <PREAMBLE> --max-turns 40`,
+with the prompt fed on stdin and the JSONL reframed as §6 SSE — the CLI's stream is the same message
+stream the SDK yields, so the mapping mirrors the `.mjs` line for line. `claude` itself needs no
+Node either: the native installer (`curl -fsSL https://claude.ai/install.sh | bash`) ships a
+self-contained binary that reuses the same `~/.claude` login.
+
+```
+python3 shim/slide-write.py --repo <path> --port 4040 --origin http://localhost:5173 --token <secret>
+```
+
+Differences from the Node shim (all invisible to the client):
+
+- **`--claude-bin <path>`/`SLIDEWRITE_CLAUDE_BIN`** (extra flag) — the `claude` binary to drive,
+  for environments where it isn't on `PATH` (e.g. a bare systemd unit).
+- **Skills parity is inverted at the CLI:** the CLI loads skills by *default* (the SDK doesn't), so
+  without `--use-skills` the shim passes `--disable-slash-commands` to match the Node shim's
+  no-skills default.
+- **SSE framing is close-delimited** (`Connection: close`; `BaseHTTPRequestHandler` doesn't chunk)
+  rather than Node's chunked encoding — the §8.2 fetch-reader handles both identically.
+- **Client disconnect** is detected by a failed SSE write or a socket EOF peek between stream
+  messages; either kills the `claude` child. The in-flight Gemini call has no abort signal
+  (urllib) — a disconnect during generation is noticed right after it returns.
+
+Validated against `claude` CLI 2.1.173 — same drift caveat as the SDK: re-verify the stream-json
+shapes on upgrade. Keep this file in lockstep with `slide-write.mjs` (the `.mjs` is the reference
+implementation; both must change together with the contracts).
 
 ---
 

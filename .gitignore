@@ -1,6 +1,10 @@
 # dependencies
 node_modules/
 
+# python bytecode (shim/slide-write.py)
+__pycache__/
+*.py[cod]
+
 # logs
 *.log
 
