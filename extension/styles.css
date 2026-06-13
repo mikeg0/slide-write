@@ -68,8 +68,13 @@
 }
 .dmsg-diag-title { font-size: 13px; font-weight: 600; color: #ffb4a8; }
 .dmsg-diag-text { margin: 0; font-size: 11px; line-height: 1.5; color: #c9b3b3; }
+.dmsg-diag-clis { display: flex; flex-direction: column; gap: 8px; }
+.dmsg-diag-cli { display: flex; flex-direction: column; gap: 3px; }
+.dmsg-diag-cli-label {
+  font-size: 10px; font-weight: 600; color: #9a8f8f; text-transform: uppercase; letter-spacing: 0.04em;
+}
 .dmsg-diag-code {
-  font-size: 10px; line-height: 1.4; color: #d7d7e6; background: #15151c;
+  display: block; font-size: 10px; line-height: 1.4; color: #d7d7e6; background: #15151c;
   border: 1px solid #2c2c3a; border-radius: 6px; padding: 6px 8px;
   white-space: pre-wrap; word-break: break-all; user-select: all;
 }

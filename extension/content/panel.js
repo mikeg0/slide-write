@@ -333,11 +333,24 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
   // command) from "token rejected" (unauthorized, → Options). Replaces the old flat "not connected".
   const diagTitle = el("div", { class: "dmsg-diag-title" });
   const diagText = el("p", { class: "dmsg-diag-text" });
-  const diagCode = el("code", { class: "dmsg-diag-code", hidden: "" });
+  // Two start commands — the Node reference shim and the stdlib-only Python port (hosts without
+  // Node). Each is its own copy-pasteable panel with a label.
+  const diagCodeNode = el("code", { class: "dmsg-diag-code" });
+  const diagCodePy = el("code", { class: "dmsg-diag-code" });
+  const diagCodes = el("div", { class: "dmsg-diag-clis", hidden: "" }, [
+    el("div", { class: "dmsg-diag-cli" }, [
+      el("div", { class: "dmsg-diag-cli-label", text: "Node" }),
+      diagCodeNode,
+    ]),
+    el("div", { class: "dmsg-diag-cli" }, [
+      el("div", { class: "dmsg-diag-cli-label", text: "Python (no Node on the host)" }),
+      diagCodePy,
+    ]),
+  ]);
   const diagRetry = el("button", { class: "dmsg-diag-btn", text: "↻ Retry", onclick: () => reprobe() });
   const diagSettings = el("button", { class: "dmsg-diag-btn dmsg-diag-btn-ghost", text: "⚙️ Options", onclick: () => onOpenOptions && onOpenOptions() });
   const diag = el("div", { class: "dmsg-diag", hidden: "" }, [
-    diagTitle, diagText, diagCode,
+    diagTitle, diagText, diagCodes,
     el("div", { class: "dmsg-diag-actions" }, [diagRetry, diagSettings]),
   ]);
 
@@ -374,13 +387,15 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     if (st === "unauthorized") {
       diagTitle.textContent = "Agent rejected the token";
       diagText.textContent = `The agent at ${shimHost()} is running but returned 401 Unauthorized. Open Options and set the token to match the shim's --token value.`;
-      diagCode.hidden = true;
+      diagCodes.hidden = true;
       diagSettings.hidden = false;
     } else {
       diagTitle.textContent = "Can't reach the agent";
       diagText.textContent = `Slide Write couldn't connect to the agent at ${shimHost()}. Check that the shim is running on the code machine and — in remote dev — that the port is forwarded (VS Code → Ports). Start it with:`;
-      diagCode.textContent = `node shim/slide-write.mjs --repo <path> --port ${shimPort()} --origin ${location.origin} --token <secret>`;
-      diagCode.hidden = false;
+      const tail = `--repo <path> --port ${shimPort()} --origin ${location.origin} --token <secret>`;
+      diagCodeNode.textContent = `node shim/slide-write.mjs ${tail}`;
+      diagCodePy.textContent = `python3 shim/slide-write.py ${tail}`;
+      diagCodes.hidden = false;
       diagSettings.hidden = true;
     }
   }
