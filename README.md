@@ -107,7 +107,7 @@ port — appear at `localhost:<port>` on the machine where the browser runs. So 
 talks to `http://localhost:<port>`, and **local dev and remote dev look identical** to it.
 
 ```mermaid
-%%{init: {'theme':'neutral'}}%%
+%%{init: {'theme':'neutral', 'flowchart': {'diagramPadding': 16, 'nodeSpacing': 55, 'rankSpacing': 75, 'padding': 14, 'subGraphTitleMargin': {'top': 6, 'bottom': 14}}}}%%
 flowchart TB
     subgraph UI["UI machine — Win11 / macOS / Linux desktop (where the browser runs)"]
         direction TB
@@ -217,19 +217,23 @@ entirely — the original behavior.
 any repo. It's deliberately project-agnostic (per-project knowledge comes from the target's own
 `CLAUDE.md`, loaded via `settingSources: ["project"]`):
 
-```js
-const PREAMBLE =
-  "You are editing a web app live from within its running dev environment. Your edits land on the " +
-  "repo at the working directory and the app's own dev server hot-reloads, so changes appear in the " +
-  "browser within seconds.\n\n" +
-  "FIRST, read the repo's CLAUDE.md (and README) for THIS project's conventions — where styling " +
-  "lives, where components/screens live, the framework in use. Follow them.\n\n" +
-  "- Make the SMALLEST focused change that satisfies the request, in the spirit of the existing code.\n" +
-  "- Reuse existing tokens/components/patterns; don't add dependencies unless asked.\n" +
-  "- Do NOT edit Dockerfiles, CI, or anything under .claude / .env / credentials.\n" +
-  "- Keep schema/model changes ADDITIVE; never rename/drop/retype an existing column.\n" +
-  "- When done, reply with one or two sentences describing exactly what you changed.";
-```
+Rendered, the system prompt reads:
+
+> You are editing a web app live from within its running dev environment. Your edits land on the
+> repo at the working directory and the app's own dev server hot-reloads, so changes appear in the
+> browser within seconds.
+>
+> FIRST, read the repo's CLAUDE.md (and README) for THIS project's conventions — where styling
+> lives, where components/screens live, the framework in use. Follow them.
+>
+> - Make the SMALLEST focused change that satisfies the request, in the spirit of the existing code.
+> - Reuse existing tokens/components/patterns; don't add dependencies unless asked.
+> - Do NOT edit Dockerfiles, CI, or anything under .claude / .env / credentials.
+> - Keep schema/model changes ADDITIVE; never rename, drop, or retype an existing table or column.
+> - When done, reply with one or two sentences describing exactly what you changed.
+
+The verbatim source string lives at `PREAMBLE` in `shim/slide-write.mjs` (and the Python port in
+`shim/slide-write.py`); keep this prose in sync with both if you edit it.
 
 The other load-bearing bit is **how the clicked elements become prompt context.** A request may
 carry up to **5** stacked targets ([§7](#7-the-element-capture-contract) `elements`; the
@@ -773,7 +777,7 @@ Access prompt). Contrast with the default [§3](#3-architecture) diagram, where 
 loopback shim over a VS Code-forwarded `localhost` port:
 
 ```mermaid
-%%{init: {'theme':'neutral'}}%%
+%%{init: {'theme':'neutral', 'flowchart': {'diagramPadding': 16, 'nodeSpacing': 55, 'rankSpacing': 75, 'padding': 14, 'subGraphTitleMargin': {'top': 6, 'bottom': 14}}}}%%
 flowchart TB
     subgraph BROWSER["Browser — any machine, public internet"]
         direction TB

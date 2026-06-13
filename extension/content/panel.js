@@ -154,7 +154,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
   // phase + a live token count fed by the §6 `usage` events (output + in-flight thinking estimate).
   const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
   let spinTimer = null, spinIdx = 0;
-  let runLabel = "", runTokens = null, runTokensEst = 0;
+  let runLabel = "", runModel = "", runTokens = null, runTokensEst = 0;
   const MAX_ELEMENTS = 5;           // stacked-picks cap, so the prompt/context window stays sane
   let elementCtxs = [];             // §7 element contexts (the picker appends; ≤ MAX_ELEMENTS)
   let imageMode = false;            // when true, the next send generates an image into the picked element(s)
@@ -463,8 +463,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
   function onEvent(ev) {
     switch (ev.type) {
       case "start":
-        runLabel = `running · ${ev.model || ""}`;
-        renderRunStatus();
+        runModel = ev.model || "";
+        setPhase("running");
         // Adopt the session id so chained sends keep threading into the same conversation
         // (also tracks forks while resuming inside a history detail — replay routes here too).
         if (ev.sessionId && ev.sessionId !== resumeId) resumeId = ev.sessionId;
@@ -483,10 +483,10 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
         break;
       case "image_generated": toolRow("🖼️ image generated", ev.mimeType || ""); break;
       case "user":    appendDelta("user", ev.text); break;
-      case "delta":   appendDelta("assistant", ev.text); estTokens(ev.text); break;
-      case "thinking_delta": appendDelta("thinking", ev.text); estTokens(ev.text); break;
-      case "tool":    toolRow(ev.tool, ev.detail); break;
-      case "file_edit": toolRow(`✏️ ${ev.tool}`, ev.path, "dmsg-edit"); break;
+      case "delta":   if (busy) setPhase("responding"); appendDelta("assistant", ev.text); estTokens(ev.text); break;
+      case "thinking_delta": if (busy) setPhase("thinking"); appendDelta("thinking", ev.text); estTokens(ev.text); break;
+      case "tool":    if (busy) setPhase("working"); toolRow(ev.tool, ev.detail); break;
+      case "file_edit": if (busy) setPhase("editing"); toolRow(`✏️ ${ev.tool}`, ev.path, "dmsg-edit"); break;
       case "tool_result": resultRow(ev.tool, ev.text, ev.isError, ev.truncated); break;
       case "result": {
         const bits = [
@@ -516,6 +516,15 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     if (busy && text) runTokensEst += text.length / 4;
   }
 
+  // The status verb tracks the live run phase, derived from the SSE stream: `start` → running,
+  // then thinking_delta/delta/tool/file_edit flip it to thinking/responding/working/editing as
+  // Claude moves through the turn. The model suffix stays stable across phase changes. Flips other
+  // than `start` are busy-gated so history replay (which also routes through onEvent) doesn't churn.
+  function setPhase(p) {
+    runLabel = runModel ? `${p} · ${runModel}` : p;
+    renderRunStatus();
+  }
+
   // Compose the run-status line. Only spins while busy — history replay routes `start` through
   // onEvent too, and there it must render as plain text with no timer running.
   function renderRunStatus() {
@@ -530,7 +539,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
       spinTimer = setInterval(() => { spinIdx = (spinIdx + 1) % SPIN.length; renderRunStatus(); }, 120);
     if (!b) {
       if (spinTimer) { clearInterval(spinTimer); spinTimer = null; }
-      runLabel = ""; runTokens = null; runTokensEst = 0;
+      runLabel = ""; runModel = ""; runTokens = null; runTokensEst = 0;
     }
     textarea.disabled = b || !cfg.configured;
     sendLabel.textContent = b ? "Cancel" : "Send";

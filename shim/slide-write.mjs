@@ -55,6 +55,9 @@ const GEMINI_MODEL = arg("gemini-model", process.env.SLIDEWRITE_GEMINI_MODEL ?? 
 const GEMINI_KEY   = arg("gemini-key",   process.env.GEMINI_API_KEY ?? "");
 const IMAGE_INSTRUCTIONS = arg("image-instructions", process.env.SLIDEWRITE_IMAGE_INSTRUCTIONS ?? "");
 
+// The generic system prompt prepended to every run — what makes this shim behave well against any
+// repo (per-project knowledge comes from the target's own CLAUDE.md). README §"system prompt" mirrors
+// this in human-readable prose; keep the two in sync, and mirror edits in shim/slide-write.py.
 const PREAMBLE =
   "You are editing a web app live from within its running dev environment. Your edits land on the " +
   "repo at the working directory and the app's own dev server hot-reloads, so changes appear in the " +
@@ -64,7 +67,7 @@ const PREAMBLE =
   "- Make the SMALLEST focused change that satisfies the request, in the spirit of the existing code.\n" +
   "- Reuse existing tokens/components/patterns; don't add dependencies unless asked.\n" +
   "- Do NOT edit Dockerfiles, CI, or anything under .claude / .env / credentials.\n" +
-  "- Keep schema/model changes ADDITIVE; never rename/drop/retype an existing column.\n" +
+  "- Keep schema/model changes ADDITIVE; never rename, drop, or retype an existing table or column.\n" +
   "- When done, reply with one or two sentences describing exactly what you changed.";
 
 const git = (repo, ...a) => new Promise(r => execFile("git", ["-C", repo, ...a], (_e, out) => r((out || "").trim())));
