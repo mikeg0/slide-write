@@ -139,7 +139,7 @@
 .dmsg-chip { display: flex; align-items: center; gap: 6px; background: #23232f; border: 1px solid #3a3a4a; border-radius: 8px; padding: 4px 8px; font-size: 11px; }
 /* Stack of picked-element chips (≤5 picks, each + an optional screenshot chip); scrolls past ~⅓ panel height. */
 .dmsg-chips { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; border-bottom: 1px dashed #2c2c3a; padding-bottom: 8px; }
-.dmsg-chiptext { flex: 1; color: #c9c9dd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dmsg-chiptext { flex: 1; min-width: 0; color: #c9c9dd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dmsg-shotthumb { height: 28px; max-width: 64px; border-radius: 4px; object-fit: cover; border: 1px solid #3a3a4a; flex: none; }
 
 .dmsg-inputcard {

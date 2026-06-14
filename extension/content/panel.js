@@ -641,8 +641,11 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     }
   }
 
+  // Prefer the full DOM path (§7 domPath) so the chip shows where the element lives; fall back to a
+  // bare tag#id.class identity when no path was captured. Overflow is truncated with an ellipsis by
+  // CSS (.dmsg-chiptext), and the full string is exposed via the chip's title on hover.
   const ctxLabel = (ctx) =>
-    [ctx.tag, ctx.id ? `#${ctx.id}` : "", ctx.className ? `.${String(ctx.className).split(/\s+/).join(".")}` : ""].join("");
+    ctx.domPath || [ctx.tag, ctx.id ? `#${ctx.id}` : "", ctx.className ? `.${String(ctx.className).split(/\s+/).join(".")}` : ""].join("");
   // Re-render the whole element-chip stack: per picked element an identity chip (✕ removes that
   // element) and, when a capture was taken, a screenshot chip (thumbnail + dimensions + ✕; removing
   // it drops the pixels off that element so they're never sent). The icon reflects image mode
@@ -651,8 +654,9 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     ctxChips.textContent = "";
     const icon = imageMode ? "🖼️" : "🎯";
     elementCtxs.forEach((ctx, i) => {
+      const chipText = `${icon} ${ctxLabel(ctx) || "element"}${ctx.text ? ` — "${ctx.text.slice(0, 40)}"` : ""}`;
       ctxChips.append(el("div", { class: "dmsg-chip" }, [
-        el("span", { class: "dmsg-chiptext", text: `${icon} ${ctxLabel(ctx) || "element"}${ctx.text ? ` — "${ctx.text.slice(0, 40)}"` : ""}` }),
+        el("span", { class: "dmsg-chiptext", text: chipText, title: chipText }),
         el("button", { class: "dmsg-iconbtn", text: "✕", title: "Remove element", onclick: () => removeElement(i) }),
       ]));
       if (ctx.screenshotDataUrl) ctxChips.append(el("div", { class: "dmsg-chip dmsg-shotchip" }, [
