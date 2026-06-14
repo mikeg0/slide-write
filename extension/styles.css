@@ -126,7 +126,7 @@
 .dmsg-pre { margin: 6px 0 2px; max-height: 220px; overflow: auto; background: #0e0e14; padding: 8px; border-radius: 6px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; }
 
-.dmsg-stats { color: #7a7a90; font-size: 11px; border-top: 1px dashed #2c2c3a; padding-top: 6px; }
+.dmsg-stats { color: #7a7a90; font-size: 11px; padding-top: 6px; }
 /* Persistent stats line in the composer (below the chips) — single line, ellipsized. */
 .dmsg-livestats { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dmsg-commit { color: #7ee07e; font-weight: 600; }
@@ -138,7 +138,7 @@
 .dmsg-composer { border-top: 1px solid #2c2c3a; padding: 10px; background: #1b1b25; display: flex; flex-direction: column; gap: 8px; }
 .dmsg-chip { display: flex; align-items: center; gap: 6px; background: #23232f; border: 1px solid #3a3a4a; border-radius: 8px; padding: 4px 8px; font-size: 11px; }
 /* Stack of picked-element chips (≤5 picks, each + an optional screenshot chip); scrolls past ~⅓ panel height. */
-.dmsg-chips { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
+.dmsg-chips { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; border-bottom: 1px dashed #2c2c3a; padding-bottom: 8px; }
 .dmsg-chiptext { flex: 1; color: #c9c9dd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dmsg-shotthumb { height: 28px; max-width: 64px; border-radius: 4px; object-fit: cover; border: 1px solid #3a3a4a; flex: none; }
 

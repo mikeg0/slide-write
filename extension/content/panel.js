@@ -161,6 +161,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
   let imageMode = false;            // when true, the next send generates an image into the picked element(s)
   let resumeId = null;              // when set, each send continues this past session
   let liveResumeId = null;          // live chat's session, stashed while a history detail owns resumeId
+  let threadTokens = 0;             // cumulative output tokens across the active thread's runs (shown in liveStats)
+  let liveThreadTokens = 0;         // live thread's cumulative tokens, stashed while a history detail is open
   let inHistoryDetail = false;      // viewing one past session (composer sends resume into it)
   let stream = { role: null, body: null };  // current coalescing bubble
   let target;                       // where rows render — the live transcript, or a history pane
@@ -520,7 +522,10 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
         ].filter(Boolean).join(" · ");
         if (ev.result) appendDelta("assistant", ev.result); // final-text fallback if no deltas streamed
         addRow(el("div", { class: "dmsg-row dmsg-stats", text: bits }));
-        setLiveStats(bits); // mirror the latest run's final stats in the persistent line below the chips
+        // End-of-turn: roll this run's output tokens into the thread total and show the cumulative
+        // figure in the persistent line below the chips (history replay re-sums the viewed session).
+        threadTokens += (ev.usage && ev.usage.output_tokens) || 0;
+        setLiveStats(`${bits} · Σ ${fmtTok(threadTokens)} tokens`);
         break;
       }
       case "commit":
@@ -703,6 +708,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     inHistoryDetail = false;
     resumeId = liveResumeId;
     liveResumeId = null;
+    threadTokens = liveThreadTokens;  // restore the live thread's running total
+    liveThreadTokens = 0;
     target = transcript;
     breakChain();
     renderPlaceholder();
@@ -757,8 +764,9 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     historyView.append(body);
     const note = el("div", { class: "dmsg-row dmsg-note", text: "Loading…" });
     body.append(note);
-    if (!inHistoryDetail) { liveResumeId = resumeId; inHistoryDetail = true; }
+    if (!inHistoryDetail) { liveResumeId = resumeId; liveThreadTokens = threadTokens; inHistoryDetail = true; }
     resumeId = s.id;
+    threadTokens = 0;   // replay re-accumulates the viewed session's tokens from its result events
     renderPlaceholder();
     target = body; breakChain();
     try {
@@ -789,6 +797,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
   function newChat() {
     showLive();               // leave any history view first (restores the stashed live session…)
     resumeId = null;          // …then drop it — next send starts a fresh session
+    threadTokens = 0;         // fresh thread → zero the cumulative token total
+    setLiveStats("");         // clear the persistent stats line
     clearElementContext();
     transcript.textContent = "";
     breakChain();
