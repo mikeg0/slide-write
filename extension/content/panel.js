@@ -150,6 +150,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
   let selectedModel = model || (meta && meta.defaultModel) || models[0].id;
   let busy = false;
   let controller = null;
+  let filesChangedThisRun = false;  // any file_edit this run → auto-reload-on-save reloads at `done`
   // Run-status spinner state: while busy, the status bar shows an animated frame + the current run
   // phase + a live token count fed by the §6 `usage` events (output + in-flight thinking estimate).
   const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -479,6 +480,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     switch (ev.type) {
       case "start":
         runModel = ev.model || "";
+        filesChangedThisRun = false;
         setPhase("running");
         // Adopt the session id so chained sends keep threading into the same conversation
         // (also tracks forks while resuming inside a history detail — replay routes here too).
@@ -501,7 +503,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
       case "delta":   if (busy) setPhase("responding"); appendDelta("assistant", ev.text); estTokens(ev.text); break;
       case "thinking_delta": if (busy) setPhase("thinking"); appendDelta("thinking", ev.text); estTokens(ev.text); break;
       case "tool":    if (busy) setPhase("working"); toolRow(ev.tool, ev.detail); break;
-      case "file_edit": if (busy) setPhase("editing"); toolRow(`✏️ ${ev.tool}`, ev.path, "dmsg-edit"); break;
+      case "file_edit": if (busy) { setPhase("editing"); filesChangedThisRun = true; } toolRow(`✏️ ${ev.tool}`, ev.path, "dmsg-edit"); break;
       case "tool_result": resultRow(ev.tool, ev.text, ev.isError, ev.truncated); break;
       case "result": {
         const bits = [
@@ -514,12 +516,17 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
       }
       case "commit":
         addRow(el("div", { class: "dmsg-row dmsg-commit", text: `✓ Committed ${ev.sha} · ${ev.count} file${ev.count === 1 ? "" : "s"}` }));
-        if (cfg.autoReload) { setStatus("reloading…"); setTimeout(() => location.reload(), 400); }
         break;
       case "commit_error": addRow(el("div", { class: "dmsg-row dmsg-error", text: `commit error: ${ev.message}` })); break;
       case "error":   addRow(el("div", { class: "dmsg-row dmsg-error", text: ev.message })); break;
       case "aborted": addRow(el("div", { class: "dmsg-row dmsg-note", text: "stream ended" })); break;
-      case "done":    setBusy(false); setStatus(idleStatus()); break;
+      case "done":
+        setBusy(false); setStatus(idleStatus());
+        // Auto-reload-on-save: any file changed this run → reload once the run is done (reloading
+        // mid-run would tear down the content-script SSE stream). Decoupled from `commit` so it
+        // still fires when auto-commit is off.
+        if (cfg.autoReload && filesChangedThisRun) { setStatus("reloading…"); setTimeout(() => location.reload(), 400); }
+        break;
       default: break; // unknown types are ignored (forward-compatible, §6)
     }
   }

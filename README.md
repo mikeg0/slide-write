@@ -337,12 +337,12 @@ Every frame is **one JSON object on a `data:` line**; the client reads only `dat
 | `file_edit` | `{tool, path, id}` | edit row (✏️ `path`) |
 | `tool_result` | `{tool, id, text, isError, truncated}` | collapsible output (auto-open on error) |
 | `result` | `{isError, numTurns, durationMs, totalCostUsd, usage, result}` | stats footer; `result` is the final-text fallback if no deltas streamed |
-| `commit` | `{sha, count}` | green "Committed `<sha>` · N files"; triggers auto-reload when the per-origin option is on |
-| `commit_error` | `{message}` | red error row (commit didn't land — edits remain in the working tree); auto-reload does NOT fire |
+| `commit` | `{sha, count}` | green "Committed `<sha>` · N files" |
+| `commit_error` | `{message}` | red error row (commit didn't land — edits remain in the working tree) |
 | `image_status` | `{state}` | status row (`state:"generating"` → "generating image…"); emitted only by `/generate-image` |
 | `image_generated` | `{tmpPath, mimeType, bytes}` | note row "🖼️ image generated"; metadata only (no image bytes over the wire) |
 | `error` | `{message}` | error row |
-| `done` | `{}` | end of stream; clear the busy indicator |
+| `done` | `{}` | end of stream; clear the busy indicator; if the per-origin **auto-reload on save** option is on and any `file_edit` fired this run, reload the page (for apps without hot-reload) |
 
 Adding a new `type` is backward-compatible: clients ignore unknown types.
 
@@ -436,8 +436,8 @@ Bearer+CORS gate as `/meta`, expose the **current repo's** sessions:
 
 **Auto-commit opt-out (additive).** `/design` and `/generate-image` accept an optional top-level
 `autoCommit` (boolean). When it is **exactly `false`**, the shim skips the per-run commit — the
-run's edits stay uncommitted in the working tree and no `commit` event is emitted (so the
-extension's auto-reload-on-commit never fires either). Absent or any other value keeps the default
+run's edits stay uncommitted in the working tree and no `commit` event is emitted. (Auto-reload-on-save
+still fires regardless, since it keys off `file_edit`, not `commit`.) Absent or any other value keeps the default
 auto-commit, so old clients are unaffected. The extension exposes this as a per-origin
 **auto-commit** checkbox (on by default) in Options and sends the resolved value with every run.
 
@@ -736,7 +736,7 @@ Each phase is independently testable; build and verify in order.
    end from the browser; render the [§6](#6-the-sse-event-contract) events.
 3. **Extension — picker.** `content/picker.js` ([§8.3](#83-contentpickerjs--the-element-picker-capture-phase));
    send the [§7](#7-the-element-capture-contract) contract; anchored composer; markup toggle.
-4. **Polish.** Popup enable/disable, auto-reload-on-`commit` option, token UX, the [§10](#10-security-model) checklist.
+4. **Polish.** Popup enable/disable, auto-reload-on-save option, token UX, the [§10](#10-security-model) checklist.
 5. **History & resume.** Add the `/history` + `/history/<id>` routes and the `resume` field
    ([§6](#6-the-sse-event-contract)) to the shim, then the 🕘 history view + ↻ Resume in the panel. Verify:
    ```bash

@@ -40,7 +40,7 @@ async function render() {
       <div class="origin">${c.name ? `${esc(c.name)} <span class="hint" style="font-weight:400">${origin}</span>` : origin}</div>
       <div class="controls">
         <label><input type="checkbox" class="en" ${c.enabled ? "checked" : ""}/> enabled</label>
-        <label><input type="checkbox" class="ar" ${c.autoReload ? "checked" : ""}/> auto-reload</label>
+        <label title="When on, reload the page after any run that changed a file — for apps without hot-reload"><input type="checkbox" class="ar" ${c.autoReload ? "checked" : ""}/> auto-reload on save</label>
         <label title="When off, runs leave their edits uncommitted in the repo's working tree"><input type="checkbox" class="ac" ${c.autoCommit !== false ? "checked" : ""}/> auto-commit</label>
         <button class="save primary">Save</button>
         <button class="del danger">Delete</button>
