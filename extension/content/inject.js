@@ -61,6 +61,13 @@
   const rootEl = document.createElement("div");
   rootEl.setAttribute("data-slidewrite-ui", "");
   shadow.append(rootEl);
+  // Keep our overlay's keystrokes inside the overlay: events from the chat input (and the rest of
+  // the panel) bubble out of the open shadow root to document/window, where the host app's global
+  // hotkeys (DEL, arrows, BackSpace, …) would otherwise fire — and retargeting hides our <textarea>
+  // behind this shadow host, so the app's "ignore inputs" guard misses it. stopPropagation only
+  // (NEVER preventDefault) so normal text editing still works; our own handlers (Ctrl+Enter send,
+  // menu Esc) run earlier in the path, and the picker's Esc is a window-capture listener, unaffected.
+  for (const type of ["keydown", "keyup", "keypress"]) host.addEventListener(type, (e) => e.stopPropagation());
   (document.body || document.documentElement).append(host);
 
   // 3. If already wired up, probe the shim (§11): /health for reachability, /meta for repo + auth.
