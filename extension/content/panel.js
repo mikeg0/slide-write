@@ -178,6 +178,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
   const MAX_ELEMENTS = 5;           // stacked-picks cap, so the prompt/context window stays sane
   let elementCtxs = [];             // §7 element contexts (the picker appends; ≤ MAX_ELEMENTS)
   let imageMode = false;            // when true, the next send generates an image into the picked element(s)
+  let queue = [];                   // follow-up intents typed while a run is in flight; drained at run end
   let resumeId = null;              // when set, each send continues this past session
   let liveResumeId = null;          // live chat's session, stashed while a history detail owns resumeId
   let threadTokens = 0;             // cumulative output tokens across the active thread's runs (shown in liveStats)
@@ -245,6 +246,9 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     class: "dmsg-input", rows: "3",
     placeholder: "Describe what you want to create…",
     onkeydown: (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); } },
+    // While a run is in flight the send button toggles between Cancel (empty box) and Queue (typed
+    // text); keep it in sync as the user types.
+    oninput: () => { if (busy) updateSendBtn(); },
     // Ctrl/Cmd+V of a copied image: stack it as a synthetic pasted-image context. Only an image item
     // is intercepted — text paste falls through untouched (no preventDefault). preventDefault must
     // run synchronously, before the async decode, so detect the image up front.
@@ -287,8 +291,11 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     ]),
     sendBtn,
   ]);
+  // Queued follow-ups: messages typed while a run streams, shown as removable pending rows directly
+  // above the stats line. Drained one-at-a-time as each run finishes (renderQueue rebuilds it).
+  const queuedList = el("div", { class: "dmsg-queued", hidden: "" });
   const inputCard = el("div", { class: "dmsg-inputcard" }, [textarea, toolbar]);
-  const composer = el("div", { class: "dmsg-composer" }, [ctxChips, liveStats, inputCard]);
+  const composer = el("div", { class: "dmsg-composer" }, [ctxChips, queuedList, liveStats, inputCard]);
 
   // Render the model button label + menu items to reflect `models` / `selectedModel`.
   function renderModels() {
@@ -575,8 +582,9 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
         setLiveStats(`${finLabel}${finToks ? ` · ${fmtTok(finToks)} tokens` : ""}`);
         // Auto-reload-on-save: any file changed this run → reload once the run is done (reloading
         // mid-run would tear down the content-script SSE stream). Decoupled from `commit` so it
-        // still fires when auto-commit is off.
-        if (cfg.autoReload && filesChangedThisRun) { setLiveStats("reloading…"); setTimeout(() => location.reload(), 400); }
+        // still fires when auto-commit is off. Deferred while a queue is pending — reloading now
+        // would drop the queued follow-ups; the final run in the queue triggers the reload instead.
+        if (cfg.autoReload && filesChangedThisRun && !queue.length) { setLiveStats("reloading…"); setTimeout(() => location.reload(), 400); }
         break;
       }
       default: break; // unknown types are ignored (forward-compatible, §6)
@@ -615,11 +623,32 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
       if (spinTimer) { clearInterval(spinTimer); spinTimer = null; }
       runLabel = ""; runModel = ""; runTokens = null; runTokensEst = 0;
     }
-    textarea.disabled = b || !cfg.configured;
-    sendLabel.textContent = b ? "Cancel" : "Send";
-    sendIcon.textContent = b ? "■" : "➤";
-    sendBtn.title = b ? "Cancel run" : "Send (⌘/Ctrl+Enter)";
-    sendBtn.classList.toggle("dmsg-busy", b);
+    // Textarea stays live while busy so the user can type a follow-up to queue (only its own
+    // availability gates on configured).
+    textarea.disabled = !cfg.configured;
+    updateSendBtn();
+  }
+
+  // The send button is context-sensitive: idle → Send; busy with a typed follow-up → Queue (it gets
+  // enqueued and dispatched when the current run ends); busy with an empty box → Cancel the run.
+  function updateSendBtn() {
+    if (!busy) {
+      sendLabel.textContent = "Send";
+      sendIcon.textContent = "➤";
+      sendBtn.title = "Send (⌘/Ctrl+Enter)";
+      sendBtn.classList.remove("dmsg-busy");
+      return;
+    }
+    sendBtn.classList.add("dmsg-busy");
+    if (textarea.value.trim()) {
+      sendLabel.textContent = "Queue";
+      sendIcon.textContent = "＋";
+      sendBtn.title = "Queue this message to run when the current one finishes (⌘/Ctrl+Enter)";
+    } else {
+      sendLabel.textContent = "Cancel";
+      sendIcon.textContent = "■";
+      sendBtn.title = "Cancel run";
+    }
   }
 
   // Reflect cfg.configured across the UI: live composer vs. the "set up" prompt.
@@ -632,52 +661,96 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     plusBtn.disabled = !ok;
     newChatBtn.disabled = !ok;
     historyBtn.disabled = !ok;
-    textarea.disabled = busy || !ok;
+    textarea.disabled = !ok;
     sendBtn.disabled = !ok;
     renderConn();
   }
 
-  async function send() {
-    if (busy) { controller && controller.abort(); return; }
+  // Press Send / ⌘-Enter. Idle → dispatch immediately. Busy → if there's a typed follow-up, queue
+  // it (drained when the current run finishes); otherwise cancel the run (and drop any queue).
+  function send() {
     if (!cfg.configured) return;
+    if (busy) {
+      const intent = readComposer();
+      if (intent) { enqueue(intent); updateSendBtn(); }
+      else { clearQueue(); controller && controller.abort(); }
+      return;
+    }
+    const intent = readComposer();
+    if (intent) dispatch(intent);
+  }
+
+  // Snapshot the composer into a send intent and reset it for the next message. The element/image
+  // state is captured here (before clearElementContext resets it) so a queued follow-up carries the
+  // context the user had when they typed it. Returns null when the box is empty.
+  function readComposer() {
     const prompt = textarea.value.trim();
-    if (!prompt) return;
-    // Capture image mode before clearElementContext() resets it.
-    const image = imageMode;
+    if (!prompt) return null;
+    const intent = { prompt, image: imageMode, elements: elementCtxs.slice(), model: selectedModel };
+    textarea.value = "";
+    clearElementContext();
+    return intent;
+  }
+
+  // Run one intent: build the §7 payload (resolving resumeId LIVE so a queued follow-up threads into
+  // whatever session the prior run settled on), stream it, then drain the next queued intent.
+  function dispatch(intent) {
+    const { prompt, image, elements, model } = intent;
     let payload, path;
     if (image) {
-      payload = { imagePrompt: prompt, screen: location.pathname + location.search + location.hash, model: selectedModel,
+      payload = { imagePrompt: prompt, screen: location.pathname + location.search + location.hash, model,
         geminiKey: cfg.geminiKey, imageInstructions: cfg.imageInstructions, autoCommit: cfg.autoCommit };
       // Strip the element screenshots — /generate-image uses imageDataUrl (the canvas-read source
       // pixels) for image-to-image; the screenshots would just bloat the payload.
-      if (elementCtxs.length)
-        payload.elements = elementCtxs.map(({ screenshotDataUrl, screenshotW, screenshotH, ...rest }) => rest);
+      if (elements.length)
+        payload.elements = elements.map(({ screenshotDataUrl, screenshotW, screenshotH, ...rest }) => rest);
       path = "/generate-image";
     } else {
-      payload = { prompt, screen: location.pathname + location.search + location.hash, model: selectedModel, autoCommit: cfg.autoCommit };
+      payload = { prompt, screen: location.pathname + location.search + location.hash, model, autoCommit: cfg.autoCommit };
       // Drop imageDataUrl (only meaningful to /generate-image) and the UI-only screenshot dimensions,
       // but KEEP screenshotDataUrl — the shim writes each to a temp file for claude to Read.
-      if (elementCtxs.length)
-        payload.elements = elementCtxs.map(({ imageDataUrl, screenshotW, screenshotH, ...rest }) => rest);
+      if (elements.length)
+        payload.elements = elements.map(({ imageDataUrl, screenshotW, screenshotH, ...rest }) => rest);
       if (resumeId) payload.resume = resumeId;
       path = "/design";
     }
     addRow(el("div", { class: "dmsg-bubble dmsg-user" }, [el("div", { class: "dmsg-bubbletext", text: prompt })]));
-    textarea.value = "";
-    clearElementContext();
     setBusy(true);
     controller = new AbortController();
-    try {
-      await streamDesign(cfg.shimUrl, cfg.token, payload, onEvent, controller.signal, path);
-    } catch (e) {
-      // A network-level failure here ("Failed to fetch") usually means the shim went down mid-send —
-      // re-probe so the diagnostics banner explains what's wrong instead of leaving a bare error row.
-      if (e.name !== "AbortError") { onEvent({ type: "error", message: String(e.message || e) }); reprobe(); }
-    } finally {
-      setBusy(false);
-      controller = null;
-    }
+    return streamDesign(cfg.shimUrl, cfg.token, payload, onEvent, controller.signal, path)
+      .catch((e) => {
+        // A network-level failure here ("Failed to fetch") usually means the shim went down mid-send —
+        // re-probe so the diagnostics banner explains what's wrong instead of leaving a bare error row.
+        if (e.name !== "AbortError") { onEvent({ type: "error", message: String(e.message || e) }); reprobe(); }
+      })
+      .finally(() => {
+        setBusy(false);
+        controller = null;
+        // Drain the next queued follow-up (an explicit cancel already emptied the queue).
+        if (queue.length) { const next = queue.shift(); renderQueue(); dispatch(next); }
+      });
   }
+
+  // --- Queued follow-ups ---------------------------------------------------------------------
+  function enqueue(intent) {
+    queue.push(intent);
+    renderQueue();
+    setStatus(`queued ${queue.length} message${queue.length === 1 ? "" : "s"} — running after the current one`);
+  }
+  function renderQueue() {
+    queuedList.textContent = "";
+    queue.forEach((it, i) => {
+      const label = `${it.image ? "🖼️ " : ""}${it.prompt}`;
+      queuedList.append(el("div", { class: "dmsg-queueitem" }, [
+        el("span", { class: "dmsg-queueitem-badge", text: `⏳ ${i + 1}` }),
+        el("span", { class: "dmsg-queueitem-text", text: label, title: label }),
+        el("button", { class: "dmsg-iconbtn", text: "✕", title: "Remove from queue", onclick: () => removeQueued(i) }),
+      ]));
+    });
+    queuedList.hidden = !queue.length;
+  }
+  function removeQueued(i) { queue.splice(i, 1); renderQueue(); }
+  function clearQueue() { queue = []; renderQueue(); }
 
   // Prefer the full DOM path (§7 domPath) so the chip shows where the element lives; fall back to a
   // bare tag#id.class identity when no path was captured. Overflow is truncated with an ellipsis by
@@ -852,6 +925,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     resumeId = null;          // …then drop it — next send starts a fresh session
     threadTokens = 0;         // fresh thread → zero the cumulative token total
     setLiveStats("");         // clear the persistent stats line
+    clearQueue();             // drop any pending follow-ups bound to the old thread
     clearElementContext();
     transcript.textContent = "";
     breakChain();
