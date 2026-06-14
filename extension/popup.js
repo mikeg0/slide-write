@@ -48,7 +48,7 @@ $("save").addEventListener("click", async () => {
     const r = await fetch(`${shimUrl}/meta`, { headers: { Authorization: `Bearer ${value.token}` } });
     if (!r.ok) { status.className = "status err"; status.textContent = `meta ${r.status} — check token`; return; }
     const m = await r.json();
-    status.className = "status ok"; status.textContent = `wired to ${m.project} @ ${m.branch}`;
+    status.className = "status ok"; status.textContent = `wired to ${m.project}${m.branch ? ` @ ${m.branch}` : " (no git)"}`;
   } catch (e) {
     status.className = "status err"; status.textContent = "agent unreachable";
   }

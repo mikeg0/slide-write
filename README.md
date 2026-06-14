@@ -462,7 +462,8 @@ When the user clicks an element in Markup mode, its capture is added to the comp
 chip. Picks **stack** — the picker stays armed, so each consecutive click appends another target, up
 to **5 per message** (the cap auto-disarms the picker and keeps the prompt/context window sane; the
 shim re-caps server-side). Picking ends via Esc, clicking 🎯 again, or the cap. On send the extension POSTs
-them as a top-level `elements: [ … ]` array (plus a top-level `screen` = current route/view); the
+them as a top-level `elements: [ … ]` array (plus a top-level `screen` = current route/view, i.e.
+`location.pathname + location.search + location.hash`, so hash-based routes are captured too); the
 shim also still accepts the legacy single top-level `element`. Each entry:
 
 ```jsonc

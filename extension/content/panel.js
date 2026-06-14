@@ -372,7 +372,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
   function idleStatus() {
     if (!cfg.configured) return "not configured";
     const st = cfg.conn && cfg.conn.state;
-    if (st === "live" || (!st && cfg.meta)) return cfg.meta ? `wired to ${cfg.meta.project} @ ${cfg.meta.branch}` : "connected";
+    if (st === "live" || (!st && cfg.meta)) return cfg.meta ? `wired to ${cfg.meta.project}${cfg.meta.branch ? ` @ ${cfg.meta.branch}` : " (no git)"}` : "connected";
     if (st === "unauthorized") return "agent rejected the token — check Options";
     if (st === "unreachable") return `agent offline — can't reach ${shimHost()}`;
     return "not connected";
@@ -594,7 +594,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     const image = imageMode;
     let payload, path;
     if (image) {
-      payload = { imagePrompt: prompt, screen: location.pathname + location.search, model: selectedModel,
+      payload = { imagePrompt: prompt, screen: location.pathname + location.search + location.hash, model: selectedModel,
         geminiKey: cfg.geminiKey, imageInstructions: cfg.imageInstructions, autoCommit: cfg.autoCommit };
       // Strip the element screenshots — /generate-image uses imageDataUrl (the canvas-read source
       // pixels) for image-to-image; the screenshots would just bloat the payload.
@@ -602,7 +602,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
         payload.elements = elementCtxs.map(({ screenshotDataUrl, screenshotW, screenshotH, ...rest }) => rest);
       path = "/generate-image";
     } else {
-      payload = { prompt, screen: location.pathname + location.search, model: selectedModel, autoCommit: cfg.autoCommit };
+      payload = { prompt, screen: location.pathname + location.search + location.hash, model: selectedModel, autoCommit: cfg.autoCommit };
       // Drop imageDataUrl (only meaningful to /generate-image) and the UI-only screenshot dimensions,
       // but KEEP screenshotDataUrl — the shim writes each to a temp file for claude to Read.
       if (elementCtxs.length)
