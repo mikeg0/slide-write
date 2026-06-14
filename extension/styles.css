@@ -126,7 +126,7 @@
 .dmsg-pre { margin: 6px 0 2px; max-height: 220px; overflow: auto; background: #0e0e14; padding: 8px; border-radius: 6px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; }
 
-.dmsg-stats { color: #7a7a90; font-size: 11px; padding-top: 6px; }
+.dmsg-stats { color: #7a7a90; font-size: 11px; }
 /* Persistent stats line in the composer (below the chips) — single line, ellipsized. */
 .dmsg-livestats { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dmsg-commit { color: #7ee07e; font-weight: 600; }
