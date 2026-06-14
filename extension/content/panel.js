@@ -566,13 +566,19 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
       case "commit_error": addRow(el("div", { class: "dmsg-row dmsg-error", text: `commit error: ${ev.message}` })); break;
       case "error":   addRow(el("div", { class: "dmsg-row dmsg-error", text: ev.message })); break;
       case "aborted": addRow(el("div", { class: "dmsg-row dmsg-note", text: "stream ended" })); break;
-      case "done":
+      case "done": {
+        // Settle the live verb to "finished" (capture model/tokens before setBusy clears them) so
+        // the run-status line stops reading "responding" once the turn is complete.
+        const finModel = runModel, finToks = (runTokens || 0) + Math.floor(runTokensEst);
         setBusy(false); setStatus(idleStatus());
+        const finLabel = finModel ? `finished · ${finModel}` : "finished";
+        setLiveStats(`${finLabel}${finToks ? ` · ${fmtTok(finToks)} tokens` : ""}`);
         // Auto-reload-on-save: any file changed this run → reload once the run is done (reloading
         // mid-run would tear down the content-script SSE stream). Decoupled from `commit` so it
         // still fires when auto-commit is off.
         if (cfg.autoReload && filesChangedThisRun) { setLiveStats("reloading…"); setTimeout(() => location.reload(), 400); }
         break;
+      }
       default: break; // unknown types are ignored (forward-compatible, §6)
     }
   }
