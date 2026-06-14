@@ -193,10 +193,21 @@ def build_prompt(body, elements=(), shot_paths=()):
                 + "\nUse the class names / text / DOM path to locate the source and matching styles, then edit there."
             )
         if i < len(shot_paths) and shot_paths[i]:
-            parts.append(
-                f"\n[A screenshot of the selected element{nth(i)} was saved at:\n  {shot_paths[i]}\n"
-                "(this file is OUTSIDE the repo). Read it to see how the element currently looks before editing.]"
-            )
+            # Pasted clipboard image (no DOM ctx): neutral wording — claude decides from the request
+            # whether it's a visual reference or an asset to place. Picked-element screenshots keep
+            # the "how it currently looks" framing.
+            if isinstance(element, dict) and element.get("pasted"):
+                parts.append(
+                    f"\n[The user pasted this image{nth(i)}. It was saved at:\n  {shot_paths[i]}\n"
+                    "(this file is OUTSIDE the repo). Read it. Depending on the request, use it as a "
+                    "visual reference for your edits, or — if they want it placed in the app — copy it "
+                    "into the project's assets and wire it in.]"
+                )
+            else:
+                parts.append(
+                    f"\n[A screenshot of the selected element{nth(i)} was saved at:\n  {shot_paths[i]}\n"
+                    "(this file is OUTSIDE the repo). Read it to see how the element currently looks before editing.]"
+                )
     return "\n".join(parts)
 
 
@@ -231,6 +242,8 @@ def build_image_prompt(body, elements, tmp_path, has_source):
                 + json.dumps(ctx, indent=2)
                 + "\nUse the class names / text / DOM path to locate the source, then edit there."
             )
+    if any(isinstance(e, dict) and e.get("pasted") for e in elements):
+        parts.append("\n[The base image was pasted by the user, not picked from the page.]")
     extra = (body.get("imageInstructions") or "").strip()
     if extra:
         parts.append(

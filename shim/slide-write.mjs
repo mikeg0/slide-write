@@ -134,8 +134,14 @@ function buildPrompt({ prompt = "", screen }, elements = [], shotPaths = []) {
       parts.push(`\n[The user clicked this on-screen element${nth(i)} and is referring to it]\n` +
         JSON.stringify(ctx, null, 2) +
         "\nUse the class names / text / DOM path to locate the source and matching styles, then edit there.");
-    if (shotPaths[i])
-      parts.push(`\n[A screenshot of the selected element${nth(i)} was saved at:\n  ${shotPaths[i]}\n(this file is OUTSIDE the repo). Read it to see how the element currently looks before editing.]`);
+    if (shotPaths[i]) {
+      // Pasted clipboard image (no DOM ctx): neutral wording — claude decides from the request
+      // whether it's a visual reference or an asset to place. Picked-element screenshots keep the
+      // "how it currently looks" framing.
+      parts.push(element && element.pasted
+        ? `\n[The user pasted this image${nth(i)}. It was saved at:\n  ${shotPaths[i]}\n(this file is OUTSIDE the repo). Read it. Depending on the request, use it as a visual reference for your edits, or — if they want it placed in the app — copy it into the project's assets and wire it in.]`
+        : `\n[A screenshot of the selected element${nth(i)} was saved at:\n  ${shotPaths[i]}\n(this file is OUTSIDE the repo). Read it to see how the element currently looks before editing.]`);
+    }
   });
   return parts.join("\n");
 }
@@ -170,6 +176,8 @@ function buildImagePrompt({ imagePrompt = "", screen, imageInstructions }, eleme
         JSON.stringify(ctx, null, 2) +
         "\nUse the class names / text / DOM path to locate the source, then edit there.");
   });
+  if (elements.some((e) => e && e.pasted))
+    parts.push("\n[The base image was pasted by the user, not picked from the page.]");
   const extra = (imageInstructions || "").trim();
   if (extra)
     parts.push("\n[Project-specific integration steps — follow these exactly; they take precedence over the above]\n" + extra);

@@ -255,7 +255,9 @@ When an element carries a screenshot ([§7](#7-the-element-capture-contract) `sc
 pattern `runImage` uses; one file per element, index-suffixed so same-millisecond picks don't
 collide) and `buildPrompt` appends a line telling `claude` to `Read` that path — its Read tool
 renders the image, so the agent sees how the element looks before editing. No Agent-SDK
-image-input plumbing is needed.
+image-input plumbing is needed. Clipboard-pasted images ([§7](#7-the-element-capture-contract)
+`pasted`) ride the same `elements`/`screenshotDataUrl` temp-file path; `buildPrompt` only swaps in
+neutral "[The user pasted this image…]" wording keyed off the `pasted` flag.
 
 Everything else is mechanical and may be implemented freely as long as it honors these contracts:
 
@@ -476,7 +478,8 @@ shim also still accepts the legacy single top-level `element`. Each entry:
   "rect": { "x": 1180, "y": 16, "w": 64, "h": 32 },
   "imageDataUrl": "data:image/png;base64,…",      // optional; present only when the target is an <img>
   "screenshotDataUrl": "data:image/png;base64,…", // optional; a screenshot of the picked element
-  "screenshotW": 64, "screenshotH": 32            // UI-only (chip label); not forwarded to the shim
+  "screenshotW": 64, "screenshotH": 32,           // UI-only (chip label); not forwarded to the shim
+  "pasted": true                                  // optional; set only for clipboard-pasted images (no DOM fields)
 }
 ```
 Centralized, semantic class names usually pinpoint the source; for CSS-in-JS / hashed classes, lean
@@ -500,6 +503,16 @@ image-to-image in `/generate-image`; for plain `/design` sends the composer stri
 never bloats a non-image request. Image Generation is a per-send toggle, not a separate picker: pick
 any element with 🎯, flip the toggle, and the shim places the generated image as the `<img>`'s `src`
 or the element's CSS `background-image` depending on the element type.
+
+**Pasted images.** With the composer focused, Ctrl/Cmd+V of a copied image (e.g. a screenshot)
+creates a synthetic capture — no DOM fields, `pasted: true`, with both `screenshotDataUrl` and
+`imageDataUrl` set to the same PNG downscaled to a max edge of 1024. It stacks as a removable
+`📋 pasted image · W×H` chip against the same 5-target cap (text paste falls through untouched). On
+`/design` the kept `screenshotDataUrl` is written to a temp file for `claude` to `Read`; on
+`/generate-image` the kept `imageDataUrl` is used as the image-to-image source. Keyed off `pasted`,
+the shim swaps the "screenshot of the selected element" wording for neutral "[The user pasted this
+image…]" wording so `claude` decides from the request whether it's a visual reference or an asset to
+place.
 
 ---
 

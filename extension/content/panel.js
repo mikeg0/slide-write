@@ -90,6 +90,25 @@ function renderMarkdown(src) {
   return out.join("");
 }
 
+// Downscale a pasted-from-clipboard image blob to a PNG data URL (max edge 1024, like the picker's
+// captureImageData), returning a synthetic element context: no DOM fields, both screenshotDataUrl
+// (→ /design temp file → Read) and imageDataUrl (→ /generate-image image-to-image source) set to
+// the same URL, tagged `pasted` so the shim emits paste-specific wording. Null on any failure.
+async function pastedImageCtx(blob) {
+  try {
+    const bmp = await createImageBitmap(blob);
+    const max = 1024;
+    const scale = Math.min(1, max / Math.max(bmp.width, bmp.height));
+    const w = Math.max(1, Math.round(bmp.width * scale)), h = Math.max(1, Math.round(bmp.height * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    canvas.getContext("2d").drawImage(bmp, 0, 0, w, h);
+    if (bmp.close) bmp.close();
+    const url = canvas.toDataURL("image/png");
+    return { pasted: true, screenshotDataUrl: url, imageDataUrl: url, screenshotW: w, screenshotH: h };
+  } catch { return null; }
+}
+
 const fmtMs = (ms) => (ms == null ? "" : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`);
 const fmtUsd = (u) => (u == null ? "" : `$${u.toFixed(4)}`);
 const fmtTok = (n) => (n < 1000 ? `${n}` : n < 100000 ? `${(n / 1000).toFixed(1)}k` : `${Math.round(n / 1000)}k`);
@@ -226,6 +245,19 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     class: "dmsg-input", rows: "3",
     placeholder: "Describe what you want to create…",
     onkeydown: (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); } },
+    // Ctrl/Cmd+V of a copied image: stack it as a synthetic pasted-image context. Only an image item
+    // is intercepted — text paste falls through untouched (no preventDefault). preventDefault must
+    // run synchronously, before the async decode, so detect the image up front.
+    onpaste: (e) => {
+      const items = e.clipboardData ? Array.from(e.clipboardData.items || []) : [];
+      let blob = null;
+      for (const it of items) if (it.kind === "file" && /^image\//.test(it.type)) { blob = it.getAsFile(); break; }
+      if (!blob) for (const f of (e.clipboardData ? e.clipboardData.files || [] : [])) if (/^image\//.test(f.type)) { blob = f; break; }
+      if (!blob) return;   // not an image — let normal text paste through
+      e.preventDefault();
+      if (elementCtxs.length >= MAX_ELEMENTS) { setStatus(`element limit reached (${MAX_ELEMENTS} max)`); return; }
+      pastedImageCtx(blob).then((ctx) => { if (ctx) addElementContext(ctx); });
+    },
   });
 
   // Model selector — a text button (current model + chevron) over a menu that opens upward.
@@ -654,6 +686,17 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     ctxChips.textContent = "";
     const icon = imageMode ? "🖼️" : "🎯";
     elementCtxs.forEach((ctx, i) => {
+      // Pasted images have no DOM — render a single thumbnail chip (no identity chip), whose ✕
+      // removes the whole entry (clearScreenshot would strand an invisible entry that still counts
+      // against the cap and still sends imageDataUrl).
+      if (ctx.pasted) {
+        ctxChips.append(el("div", { class: "dmsg-chip dmsg-shotchip" }, [
+          el("img", { class: "dmsg-shotthumb", src: ctx.screenshotDataUrl, alt: "" }),
+          el("span", { class: "dmsg-chiptext", text: `📋 pasted image · ${ctx.screenshotW}×${ctx.screenshotH}` }),
+          el("button", { class: "dmsg-iconbtn", text: "✕", title: "Remove pasted image", onclick: () => removeElement(i) }),
+        ]));
+        return;
+      }
       const chipText = `${icon} ${ctxLabel(ctx) || "element"}${ctx.text ? ` — "${ctx.text.slice(0, 40)}"` : ""}`;
       ctxChips.append(el("div", { class: "dmsg-chip" }, [
         el("span", { class: "dmsg-chiptext", text: chipText, title: chipText }),
