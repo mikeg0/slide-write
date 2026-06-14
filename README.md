@@ -612,6 +612,12 @@ export async function streamDesign(shimUrl, token, payload, onEvent, signal) {
    (`onPick(null)` after cleanup) or via the **`stop()` function `startPicker` returns** — the
    widget calls it when 🎯 is clicked again (toggle off) or the 5-element cap is reached. Build
    `domPath` as an `nth-of-type` chain of ≤5 ancestors, stopping at the first `id`.
+5. **Shift+click copies the full target path** to the clipboard (a power-user shortcut) **in
+   addition to** the normal pick — the element is still captured into the chat context. Unlike
+   `domPath`, this path is uncapped and never stops at an `id`: it walks all the way up to `<body>`,
+   keeping every class and an `nth-of-type` disambiguator so the result resolves uniquely via
+   `document.querySelector`. Uses `navigator.clipboard.writeText` (inside the click gesture) with an
+   `execCommand("copy")` fallback, and shows a brief "✓ Path copied" confirmation.
 
 ### 8.4 The widget & remaining files
 - **`content/panel.js`** — transcript + composer. Renders each [§6](#6-the-sse-event-contract) event

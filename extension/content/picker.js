@@ -40,6 +40,53 @@ function buildDomPath(el) {
   return parts.join(" > ");
 }
 
+// Build the FULL root-to-element selector for Shift+click copy: unlike buildDomPath this is uncapped
+// and never stops at an id — it walks all the way up to (and including) <body>, keeping every class
+// and an nth-of-type disambiguator, so the result resolves uniquely via document.querySelector.
+function buildFullPath(el) {
+  const parts = [];
+  let n = el;
+  while (n && n.nodeType === 1 && n !== document.documentElement) {
+    let seg = n.tagName.toLowerCase();
+    if (n.id) seg += `#${n.id}`;
+    else if (n.classList && n.classList.length) seg += "." + Array.from(n.classList).join(".");
+    const parent = n.parentElement;
+    if (parent) {
+      const sameTag = Array.from(parent.children).filter((c) => c.tagName === n.tagName);
+      if (sameTag.length > 1) seg += `:nth-of-type(${sameTag.indexOf(n) + 1})`;
+    }
+    parts.unshift(seg);
+    n = n.parentElement;
+  }
+  return parts.join(" > ");
+}
+
+// Best-effort copy: the async Clipboard API works here because onClick runs inside the user's click
+// gesture; fall back to a temporary (data-slidewrite-ui tagged) textarea + execCommand for contexts
+// where it's unavailable or rejects. Never throws — just warns on total failure.
+function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(() => execCommandCopy(text));
+  } else {
+    execCommandCopy(text);
+  }
+}
+
+function execCommandCopy(text) {
+  try {
+    const ta = document.createElement("textarea");
+    ta.setAttribute("data-slidewrite-ui", "");
+    ta.value = text;
+    ta.style.cssText = "position:fixed;top:-9999px;left:-9999px;opacity:0;";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  } catch (e) {
+    console.warn("[slide-write] clipboard copy failed:", e);
+  }
+}
+
 // Best-effort capture of an <img>'s current pixels as a PNG data-URL, for image-to-image. Returns
 // null for non-images, not-yet-loaded images, or a tainted (cross-origin, no-CORS) canvas — callers
 // then fall back to pure text-to-image. Downscaled to keep the payload modest.
@@ -108,6 +155,16 @@ export function startPicker(onPick, { captureImage = false } = {}) {
 
   function hideHighlight() { box.style.display = "none"; label.style.display = "none"; }
 
+  // Transient "✓ Path copied" confirmation after a Shift+click copy. Reuses the highlight label;
+  // safe to call after hideHighlight() because onMove is suspended (paused) until the pick finishes.
+  function flashCopied(e) {
+    label.textContent = "✓ Path copied";
+    label.style.display = "block";
+    label.style.left = `${e.clientX + 8}px`;
+    label.style.top = `${Math.max(0, e.clientY - 20)}px`;
+    setTimeout(() => { if (!done) label.style.display = "none"; }, 1200);
+  }
+
   function onMove(e) {
     if (paused) return;
     const hit = skipOwnUI(document.elementFromPoint(e.clientX, e.clientY));
@@ -132,9 +189,12 @@ export function startPicker(onPick, { captureImage = false } = {}) {
     const hit = skipOwnUI(document.elementFromPoint(e.clientX, e.clientY)) || current;
     if (!hit) return;                 // our own UI / nothing pickable — let the click through, stay armed
     suppress(e);
+    const shiftCopy = e.shiftKey;
+    if (shiftCopy) copyToClipboard(buildFullPath(hit));   // additive: still does the normal pick below
     // STAY ARMED: hide the highlight before handing off (so the consumer's screenshot is clean) and
     // pause until the (possibly async) consumer finishes, then re-arm on the next mousemove.
     paused = true; current = null; hideHighlight();
+    if (shiftCopy) flashCopied(e);   // after hideHighlight() so it isn't immediately re-hidden
     Promise.resolve(onPick(captureContext(hit, captureImage))).finally(() => { paused = false; });
   }
 
