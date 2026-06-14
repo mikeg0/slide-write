@@ -23,14 +23,12 @@
 
 .dmsg-header {
   display: flex; align-items: center; gap: 8px;
-  padding: 10px 12px; border-bottom: 1px solid #2c2c3a; background: #1b1b25;
+  padding: 8px 12px; border-bottom: 1px solid #2c2c3a; background: #1b1b25;
 }
-.dmsg-title { font-weight: 600; flex: 1; }
-/* Muted status line directly under the header: connection/run state, or a hovered button's help. */
-.dmsg-statusbar {
-  padding: 5px 12px; border-bottom: 1px solid #2c2c3a; background: #181820;
-  min-height: 23px;
-}
+/* Title + a small status line stacked beneath it; min-width:0 lets the status ellipsize. */
+.dmsg-headerleft { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.dmsg-title { font-weight: 600; }
+/* Muted status line under the title: connection state, or a hovered button's help. */
 .dmsg-status { color: #9a9ab0; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
 .dmsg-iconbtn {
   border: none; background: transparent; color: #c8c8da; cursor: pointer;
@@ -129,6 +127,8 @@
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; }
 
 .dmsg-stats { color: #7a7a90; font-size: 11px; border-top: 1px dashed #2c2c3a; padding-top: 6px; }
+/* Persistent stats line in the composer (below the chips) — single line, ellipsized. */
+.dmsg-livestats { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dmsg-commit { color: #7ee07e; font-weight: 600; }
 .dmsg-error { color: #ff8a8a; }
 .dmsg-note { color: #7a7a90; font-style: italic; }

@@ -185,19 +185,22 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     class: "dmsg-iconbtn", title: "Options", text: "⚙️",
     onclick: () => onOpenOptions && onOpenOptions(),
   });
-  const header = el("div", { class: "dmsg-header" }, [
+  // Title block — the title with a muted status line stacked directly beneath it. The status line
+  // normally shows the "wired to <project>" connection state; while a header button is hovered it
+  // borrows that button's tooltip text, then reverts on mouse-out. Hover is handled by delegation
+  // (below) so it tracks dynamic titles (e.g. the 🎯 button's "Picking…" label) at the moment of hover.
+  const titleblock = el("div", { class: "dmsg-headerleft" }, [
     el("span", { class: "dmsg-title", text: "Slide Write" }),
+    status,
+  ]);
+  const header = el("div", { class: "dmsg-header" }, [
+    titleblock,
     markupBtn,
     newChatBtn,
     historyBtn,
     settingsBtn,
     el("button", { class: "dmsg-iconbtn", title: "Close (Esc)", text: "✕", onclick: () => api.close() }),
   ]);
-  // Status bar — a muted line directly under the header. Normally shows the "wired to <project>"
-  // connection state; while a header button is hovered it borrows that button's tooltip text, then
-  // reverts on mouse-out. Hover is handled by delegation so it tracks dynamic titles (e.g. the 🎯
-  // button's "Picking…" label) at the moment of hover.
-  const statusbar = el("div", { class: "dmsg-statusbar" }, [status]);
   header.addEventListener("mouseover", (e) => {
     const btn = e.target.closest && e.target.closest("button[title]");
     if (btn) setHoverHelp(btn.getAttribute("title"));
@@ -214,6 +217,9 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
   // Picked elements render as a stack of chips (one identity chip + optional screenshot chip each),
   // each individually removable — re-rendered wholesale by renderChips().
   const ctxChips = el("div", { class: "dmsg-chips", hidden: "" });
+  // Persistent stats line directly below the chips: hosts the live run status (spinner · phase ·
+  // model · tokens) while a run streams, then the latest run's final stats (turns · time · cost).
+  const liveStats = el("div", { class: "dmsg-stats dmsg-livestats", hidden: "" });
   const textarea = el("textarea", {
     class: "dmsg-input", rows: "3",
     placeholder: "Describe what you want to create…",
@@ -248,7 +254,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     sendBtn,
   ]);
   const inputCard = el("div", { class: "dmsg-inputcard" }, [textarea, toolbar]);
-  const composer = el("div", { class: "dmsg-composer" }, [ctxChips, inputCard]);
+  const composer = el("div", { class: "dmsg-composer" }, [ctxChips, liveStats, inputCard]);
 
   // Render the model button label + menu items to reflect `models` / `selectedModel`.
   function renderModels() {
@@ -355,7 +361,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     el("div", { class: "dmsg-diag-actions" }, [diagRetry, diagSettings]),
   ]);
 
-  const panel = el("div", { class: "dmsg-panel", "data-slidewrite-ui": "" }, [header, statusbar, diag, setup, transcript, historyView, composer]);
+  const panel = el("div", { class: "dmsg-panel", "data-slidewrite-ui": "" }, [header, diag, setup, transcript, historyView, composer]);
   root.append(panel);
 
   // Status text is two layers: `baseStatus` is the persistent connection/run state (set via
@@ -365,6 +371,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
   function renderStatus() { status.textContent = hoverHelp != null ? hoverHelp : baseStatus; }
   function setStatus(t) { baseStatus = t; renderStatus(); }
   function setHoverHelp(t) { hoverHelp = t; renderStatus(); }
+  // Persistent stats line below the chips: live run status while busy, latest final stats after.
+  function setLiveStats(t) { liveStats.textContent = t || ""; liveStats.hidden = !t; }
 
   const shimHost = () => { try { return new URL(cfg.shimUrl).host; } catch { return cfg.shimUrl; } };
   const shimPort = () => { try { return new URL(cfg.shimUrl).port || "4040"; } catch { return "4040"; } };
@@ -512,6 +520,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
         ].filter(Boolean).join(" · ");
         if (ev.result) appendDelta("assistant", ev.result); // final-text fallback if no deltas streamed
         addRow(el("div", { class: "dmsg-row dmsg-stats", text: bits }));
+        setLiveStats(bits); // mirror the latest run's final stats in the persistent line below the chips
         break;
       }
       case "commit":
@@ -525,7 +534,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
         // Auto-reload-on-save: any file changed this run → reload once the run is done (reloading
         // mid-run would tear down the content-script SSE stream). Decoupled from `commit` so it
         // still fires when auto-commit is off.
-        if (cfg.autoReload && filesChangedThisRun) { setStatus("reloading…"); setTimeout(() => location.reload(), 400); }
+        if (cfg.autoReload && filesChangedThisRun) { setLiveStats("reloading…"); setTimeout(() => location.reload(), 400); }
         break;
       default: break; // unknown types are ignored (forward-compatible, §6)
     }
@@ -552,7 +561,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
   function renderRunStatus() {
     const n = (runTokens || 0) + Math.floor(runTokensEst);
     const toks = runTokens != null || runTokensEst ? ` · ${fmtTok(n)} tokens` : "";
-    setStatus(busy ? `${SPIN[spinIdx]} ${runLabel || "starting…"}${toks}` : `${runLabel}${toks}`);
+    setLiveStats(busy ? `${SPIN[spinIdx]} ${runLabel || "starting…"}${toks}` : `${runLabel}${toks}`);
   }
 
   function setBusy(b) {
