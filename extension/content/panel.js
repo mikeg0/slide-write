@@ -417,6 +417,12 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
 
   const shimHost = () => { try { return new URL(cfg.shimUrl).host; } catch { return cfg.shimUrl; } };
   const shimPort = () => { try { return new URL(cfg.shimUrl).port || "4040"; } catch { return "4040"; } };
+  // Detect the README §13 reverse-proxy (Traefik) topology from the configured shimUrl alone — we
+  // can't query /meta here since this fires precisely when the shim is unreachable. The default
+  // shimUrl is `location.origin + "/_slidewrite"` (a same-origin path prefix); the direct/loopback
+  // setup overrides it to `http://localhost:<port>` (root path). So a non-root pathname ⇒ behind a
+  // proxy, where the shim must bind the docker bridge gateway (`--bind`) instead of pure loopback.
+  const isReverseProxy = () => { try { return new URL(cfg.shimUrl).pathname.replace(/\/+$/, "") !== ""; } catch { return false; } };
   // The persistent status line, derived from the probed connection state (see inject.js `probe`).
   function idleStatus() {
     if (!cfg.configured) return "not configured";
@@ -441,8 +447,13 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
       diagSettings.hidden = false;
     } else {
       diagTitle.textContent = "Can't reach the agent";
-      diagText.textContent = `Slide Write couldn't connect to the agent at ${shimHost()}. Check that the shim is running on the code machine and — in remote dev — that the port is forwarded (VS Code → Ports). Start it with:`;
-      const tail = `--repo <path> --port ${shimPort()} --origin ${location.origin} --token <secret>`;
+      const proxied = isReverseProxy();
+      diagText.textContent = proxied
+        ? `Slide Write couldn't connect to the agent at ${shimHost()} (via the ${new URL(cfg.shimUrl).pathname.replace(/\/+$/, "")} reverse-proxy route). Check that the shim is running on the code machine, bound to the proxy network, and that the proxy is up. Start it with:`
+        : `Slide Write couldn't connect to the agent at ${shimHost()}. Check that the shim is running on the code machine and — in remote dev — that the port is forwarded (VS Code → Ports). Start it with:`;
+      // Behind a reverse proxy the shim must bind the docker bridge gateway, not pure loopback (§13).
+      const bind = proxied ? " --bind <docker bridge gateway>" : "";
+      const tail = `--repo <path> --port ${shimPort()} --origin ${location.origin} --token <secret>${bind}`;
       diagCodeNode.textContent = `node shim/slide-write.mjs ${tail}`;
       diagCodePy.textContent = `python3 shim/slide-write.py ${tail}`;
       diagCodes.hidden = false;
