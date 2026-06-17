@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Slide Write",
-  "version": "0.2.25",
+  "version": "0.2.26",
   "description": "Portable AI design assistant — click an element or type a request and an agent edits the running app's source live.",
   "icons": {
     "16": "icons/icon16.png",
@@ -9,12 +9,12 @@
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
-  "permissions": ["storage", "activeTab", "scripting"],
+  "permissions": ["storage", "activeTab", "scripting", "sidePanel", "tabs"],
   "host_permissions": ["http://localhost/*", "http://127.0.0.1/*", "https://localhost/*"],
   "optional_host_permissions": ["https://*/*", "http://*/*"],
   "background": { "service_worker": "background.js" },
   "action": {
-    "default_title": "Slide Write — toggle panel",
+    "default_title": "Slide Write — open panel",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",
@@ -22,6 +22,7 @@
       "128": "icons/icon128.png"
     }
   },
+  "side_panel": { "default_path": "sidepanel.html" },
   "options_page": "options.html",
   "content_scripts": [{
     "matches": ["http://localhost/*", "http://127.0.0.1/*", "https://localhost/*"],
@@ -29,13 +30,13 @@
     "run_at": "document_idle"
   }],
   "web_accessible_resources": [{
-    "resources": ["content/sse.js", "content/panel.js", "content/picker.js", "styles.css"],
+    "resources": ["content/picker.js"],
     "matches": ["https://*/*", "http://*/*"]
   }],
   "commands": {
     "toggle-panel": {
       "suggested_key": { "default": "Ctrl+Shift+E", "mac": "Command+Shift+E" },
-      "description": "Toggle the Slide Write panel"
+      "description": "Open the Slide Write panel"
     }
   }
 }

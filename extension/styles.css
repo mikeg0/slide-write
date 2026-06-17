@@ -1,25 +1,20 @@
-/* Slide Write — injected into the Shadow root ONLY, so it can't collide with the host page. */
-:host { all: initial; }
+/* Slide Write — loaded into the side-panel document (sidepanel.html). The panel fills the panel
+   viewport; the browser handles docking + page reflow, so there's no transform/drawer animation. */
+html, body { margin: 0; padding: 0; height: 100%; }
+body { background: #14141b; color: #e6e6ef; }
 
 .dmsg-panel, .dmsg-panel * {
   box-sizing: border-box;
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
-/* Panel shell — full-height right-hand drawer. Closed = slid off-screen to the right; opening
-   slides it in while the host page is pushed left by the same width (see ensurePushStyle). */
+/* Panel shell — fills the side-panel document. */
 .dmsg-panel {
-  position: fixed; top: 0; right: 0; bottom: 0; z-index: 1;
-  width: 390px; max-width: 100vw;
+  position: absolute; inset: 0;
   display: flex; flex-direction: column;
   background: #14141b; color: #e6e6ef;
-  border-left: 1px solid #2c2c3a;
-  box-shadow: -10px 0 40px rgba(0, 0, 0, .45);
   overflow: hidden; font-size: 13px;
-  transform: translateX(100%);
-  transition: transform .28s cubic-bezier(.4, 0, .2, 1);
 }
-.dmsg-panel.dmsg-open { transform: translateX(0); }
 
 .dmsg-header {
   display: flex; align-items: center; gap: 8px;

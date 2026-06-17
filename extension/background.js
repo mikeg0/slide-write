@@ -125,34 +125,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true; // keep the channel open for the async response
 });
 
-// Toggle the panel in a tab's content script. If the content script isn't mounted (origin not
-// enabled, or the page was opened before it was enabled), the message has no receiver and rejects —
-// guide the user to setup instead of failing silently (the symptom: "the icon does nothing").
-async function togglePanel(tab) {
-  if (!tab || tab.id == null) return;
-  try {
-    await chrome.tabs.sendMessage(tab.id, { type: "toggle-panel" });
-  } catch {
-    openSetup(tab); // no receiving end → not wired up on this origin yet
-  }
+// The chat UI is now a side panel (sidepanel.html). setPanelBehavior makes the toolbar icon open it
+// directly, so no action.onClicked handler is needed (and the panel renders its own "set up" state
+// for un-wired origins — no openSetup detour). Re-applied on startup/install in case it was reset.
+function initSidePanel() {
+  if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior)
+    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
 }
+chrome.runtime.onStartup.addListener(initSidePanel);
+chrome.runtime.onInstalled.addListener(initSidePanel);
+initSidePanel();
 
-// Open the options page with this tab's origin pre-filled in the "add origin" form, so the user
-// lands ready to enable it. (openOptionsPage can't carry a query param, so create the tab directly.)
-function openSetup(tab) {
-  let origin = "";
-  try { origin = tab && tab.url ? new URL(tab.url).origin : ""; } catch { /* chrome://, etc. */ }
-  const url = chrome.runtime.getURL("options.html") + (origin ? `?origin=${encodeURIComponent(origin)}` : "");
-  chrome.tabs.create({ url });
-}
-
-// Toolbar icon click → toggle (or, if not yet wired up, open setup). (No default_popup, so
-// action.onClicked fires.)
-chrome.action.onClicked.addListener((tab) => { togglePanel(tab); });
-
-// Keyboard shortcut → same path against the active tab.
+// Keyboard shortcut → open the side panel for the active tab's window. A command counts as the user
+// gesture chrome.sidePanel.open() requires (Chrome 116+). There's no programmatic close — the
+// panel's own ✕ closes it.
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== "toggle-panel") return;
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  togglePanel(tab);
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab) await chrome.sidePanel.open({ windowId: tab.windowId });
+  } catch { /* needs a user gesture / Chrome 116+ */ }
 });

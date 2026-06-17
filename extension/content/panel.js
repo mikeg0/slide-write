@@ -130,24 +130,6 @@ function relTime(iso) {
   return new Date(iso).toLocaleDateString();
 }
 
-// Width of the right-hand drawer, kept in sync with `.dmsg-panel` in styles.css. Used to push the
-// host page over by the same amount when the drawer opens.
-const PANEL_WIDTH = 390;
-
-// Inject (once) a light-DOM rule that shifts the app's <html> left while the drawer is open, so the
-// whole page slides over instead of being covered. Lives outside the shadow root because it must
-// affect the host page; scoped to a data attribute we toggle, and skipped on narrow viewports where
-// the drawer overlays full-width instead.
-function ensurePushStyle() {
-  if (document.getElementById("slidewrite-push-style")) return;
-  const s = document.createElement("style");
-  s.id = "slidewrite-push-style";
-  s.textContent =
-    `html{transition:margin-right .28s cubic-bezier(.4,0,.2,1)}` +
-    `@media (min-width:700px){html[data-slidewrite-open]{margin-right:${PANEL_WIDTH}px !important}}`;
-  (document.head || document.documentElement).append(s);
-}
-
 // Built-in fallback model list — used until /meta (which advertises the shim's allowlist) arrives,
 // or when the shim is unreachable. Kept in sync with the shim's MODELS.
 const FALLBACK_MODELS = [
@@ -157,11 +139,12 @@ const FALLBACK_MODELS = [
   { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
 ];
 
-export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup, onOpenOptions, onProbe, onSelectModel, autoReload, autoCommit, configured, geminiKey, pollInterval, imageInstructions }) {
+export function createPanel({ root, shimUrl, token, meta, conn, model, screen, origin, onMarkup, onOpenOptions, onProbe, onSelectModel, onReload, onClose, autoReload, autoCommit, configured, geminiKey, pollInterval, imageInstructions }) {
   // Live config — reassignable via api.setConfig so enabling the origin in Options flips the panel
-  // from its disabled "set up" state to live, with no page reload.
+  // from its disabled "set up" state to live, with no reload. `screen` is the active tab's route
+  // (sidepanel.js keeps it current as the tab navigates/switches), sent with each run.
   let cfg = { shimUrl, token, meta, conn: conn || { state: null }, autoReload: !!autoReload,
-    autoCommit: autoCommit !== false, configured: !!configured,
+    autoCommit: autoCommit !== false, configured: !!configured, screen: screen || "", origin: origin || "",
     geminiKey: geminiKey || "", pollInterval: pollInterval || 0, imageInstructions: imageInstructions || "" };
   // Model selection state. `models` is the menu list (server-driven via /meta, else fallback);
   // `selectedModel` is the chosen id sent with each /design request and persisted by inject.js.
@@ -453,7 +436,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
         : `Slide Write couldn't connect to the agent at ${shimHost()}. Check that the shim is running on the code machine and — in remote dev — that the port is forwarded (VS Code → Ports). Start it with:`;
       // Behind a reverse proxy the shim must bind the docker bridge gateway, not pure loopback (§13).
       const bind = proxied ? " --bind <docker bridge gateway>" : "";
-      const tail = `--repo <path> --port ${shimPort()} --origin ${location.origin} --token <secret>${bind}`;
+      const tail = `--repo <path> --port ${shimPort()} --origin ${cfg.origin || "<app origin>"} --token <secret>${bind}`;
       diagCodeNode.textContent = `node shim/slide-write.mjs ${tail}`;
       diagCodePy.textContent = `python3 shim/slide-write.py ${tail}`;
       diagCodes.hidden = false;
@@ -595,7 +578,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
         // mid-run would tear down the content-script SSE stream). Decoupled from `commit` so it
         // still fires when auto-commit is off. Deferred while a queue is pending — reloading now
         // would drop the queued follow-ups; the final run in the queue triggers the reload instead.
-        if (cfg.autoReload && filesChangedThisRun && !queue.length) { setLiveStats("reloading…"); setTimeout(() => location.reload(), 400); }
+        if (cfg.autoReload && filesChangedThisRun && !queue.length) { setLiveStats("reloading…"); setTimeout(() => onReload && onReload(), 400); }
         break;
       }
       default: break; // unknown types are ignored (forward-compatible, §6)
@@ -709,7 +692,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     const { prompt, image, elements, model } = intent;
     let payload, path;
     if (image) {
-      payload = { imagePrompt: prompt, screen: location.pathname + location.search + location.hash, model,
+      payload = { imagePrompt: prompt, screen: cfg.screen || "", model,
         geminiKey: cfg.geminiKey, imageInstructions: cfg.imageInstructions, autoCommit: cfg.autoCommit };
       // Strip the element screenshots — /generate-image uses imageDataUrl (the canvas-read source
       // pixels) for image-to-image; the screenshots would just bloat the payload.
@@ -717,7 +700,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
         payload.elements = elements.map(({ screenshotDataUrl, screenshotW, screenshotH, ...rest }) => rest);
       path = "/generate-image";
     } else {
-      payload = { prompt, screen: location.pathname + location.search + location.hash, model, autoCommit: cfg.autoCommit };
+      payload = { prompt, screen: cfg.screen || "", model, autoCommit: cfg.autoCommit };
       // Drop imageDataUrl (only meaningful to /generate-image) and the UI-only screenshot dimensions,
       // but KEEP screenshotDataUrl — the shim writes each to a temp file for claude to Read.
       if (elements.length)
@@ -942,24 +925,25 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     breakChain();
   }
 
-  ensurePushStyle();
-
   const api = {
     el: panel,
-    isOpen: () => panel.classList.contains("dmsg-open"),
+    // The side panel is always visible while its document is loaded — "open" just means focus +
+    // live polling; "close" closes the side-panel document (onClose → window.close).
+    isOpen: () => true,
     open() {
-      panel.classList.add("dmsg-open");
-      document.documentElement.toggleAttribute("data-slidewrite-open", true); // push the page left
       textarea.focus();
       reprobe();        // re-check on open so a stale "wired to" flips to offline immediately
       startPolling();   // keep it live while visible
     },
     close() {
-      panel.classList.remove("dmsg-open");
-      document.documentElement.toggleAttribute("data-slidewrite-open", false);
       stopPolling();
+      onClose && onClose();
     },
-    toggle() { api.isOpen() ? api.close() : api.open(); },
+    toggle() { onClose && onClose(); },
+    // Reset to a fresh thread for a new origin/tab (sidepanel.js calls this on origin change).
+    resetThread: () => newChat(),
+    // Abort an in-flight run (e.g. when the active tab switches origins mid-run).
+    cancel: () => { if (controller) controller.abort(); },
     addElementContext,
     // Reflect picker (markup) mode on the 🎯 button so it reads as toggled-on while picking.
     setMarkupActive(on) {
@@ -971,7 +955,9 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, onMarkup,
     // refreshes the model list from a freshly-fetched /meta and keeps the selection valid.
     setConfig(next) {
       const intervalChanged = next.pollInterval != null && next.pollInterval !== cfg.pollInterval;
-      cfg = { ...cfg, ...next, configured: !!next.configured };
+      // Only flip `configured` when the caller actually supplied it — a screen-only update
+      // (same-origin navigation) must not knock a live panel back into its "set up" state.
+      cfg = { ...cfg, ...next, configured: next.configured != null ? !!next.configured : cfg.configured };
       if (next.meta && Array.isArray(next.meta.models) && next.meta.models.length) models = next.meta.models;
       if (next.model && models.some((m) => m.id === next.model)) selectedModel = next.model;
       if (!models.some((m) => m.id === selectedModel)) selectedModel = (next.meta && next.meta.defaultModel) || models[0].id;
