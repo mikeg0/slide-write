@@ -3,8 +3,8 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 Slide Write — a portable AI design assistant: a tiny local **shim** that drives `claude` headless
-against a target repo and streams the run as SSE, plus a **browser extension** that injects an
-element-picker + chat overlay into the running app. Click an element or type a request → `claude`
+against a target repo and streams the run as SSE, plus a **browser extension** that adds an
+element-picker to the running app and a chat panel in the browser side panel. Click an element or type a request → `claude`
 edits the real source → the dev server hot-reloads. **README.md is the authoritative spec** — read
 it and implement/extend in the order of its §12 "Build order for Claude".
 
@@ -30,9 +30,11 @@ as long as they honor the contracts.
 - `shim/` — a cross-platform **Node CLI** (`slide-write.mjs`) that serves HTTP+SSE on
   `127.0.0.1:<port>` and drives `claude` via `@anthropic-ai/claude-agent-sdk` with `cwd` = the
   target repo. Reuses `~/.claude` (no API key). Auto-commits only the files it edits (no push).
-- `extension/` — Manifest V3 browser extension; the universal, framework-agnostic UI (element picker
-  + chat) injected via a content script into a Shadow DOM. Talks HTTP+SSE to the shim at
-  `http://localhost:<port>`.
+- `extension/` — Manifest V3 browser extension; the universal, framework-agnostic UI. The **chat
+  panel lives in the browser side panel** (`sidepanel.html`/`sidepanel.js`, an extension page that
+  persists while open); the **element picker stays a content script** in the page
+  (`content/inject.js`, a picker-only bridge). The two coordinate over runtime messaging. The side
+  panel talks HTTP+SSE to the shim at `http://localhost:<port>`.
 
 **Transport = VS Code port forwarding.** The shim binds loopback on whatever machine the code lives
 on; VS Code forwards that port (and the app's dev port) to the UI machine's `localhost`. So local
@@ -52,11 +54,19 @@ the dev server hot-reloads.
   not just Edit/Write tool calls — `claude` often edits via `Bash`, which Edit-tracking misses.
   Parse porcelain **untrimmed** (the `porcelainPaths()` helper): a leading status-column space is
   significant for `line.slice(3)`, so a trimming `git()` would corrupt the first path.
-- **The SSE stream runs in the content script, not the MV3 service worker** (the worker is killed
-  ~30s idle, mid-run). The reader uses `fetch` + `getReader`, never `EventSource`.
-- **The bearer token + the CORS origin allowlist are the two security gates.** Every shim route
-  except `/health` requires `Authorization: Bearer <token>` (401 first). CORS approves only the
-  app's origin → doubles as anti-CSRF. Never commit a token.
+- **The SSE stream runs in the side-panel page, not the MV3 service worker** (the worker is killed
+  ~30s idle, mid-run; a side-panel document persists while open, so the read loop survives a full
+  run). It must NOT move back into the service worker. The reader uses `fetch` + `getReader`, never
+  `EventSource`.
+- **The bearer token + the CORS origin allowlist are the two security gates against web origins.**
+  Every shim route except `/health` requires `Authorization: Bearer <token>` (401 first). CORS
+  approves only the app's origin, so a random web page can't read the shim. (The chat itself fetches
+  from the side-panel extension page, which — with the `<all_urls>` host permission — is exempt from
+  CORS; that's fine, it's trusted extension UI, and CORS still blocks web origins.) Never commit a
+  token.
+- **The extension requires `<all_urls>` host permission** — load-bearing for the element-screenshot
+  crop: `chrome.tabs.captureVisibleTab` needs `<all_urls>` or a per-tab `activeTab` gesture, and the
+  side panel never gets `activeTab`. Don't narrow it back to localhost-only or screenshots break.
 - **Reuse the host's `claude` login** via the Agent SDK — no `ANTHROPIC_API_KEY`. Credential
   portability across Win/macOS/Linux is the `claude` CLI's job, not the shim's.
 - **Project knowledge lives in the TARGET repo's CLAUDE.md** (loaded via `settingSources:
@@ -65,8 +75,10 @@ the dev server hot-reloads.
   shim↔extension interface — change both sides together. New SSE `type`s are backward-compatible.
 - **The element picker listens on `window` in the capture phase** and tags its own UI with
   `data-slidewrite-ui` — marking an element must never trigger the app's own handlers. Suppression
-  is per-target: clicks on `data-slidewrite-ui` nodes (and bare body/html) pass through, so the
-  panel stays usable while the picker is armed for consecutive picks.
+  is per-target: clicks on `data-slidewrite-ui` nodes (the picker's highlight overlay) and bare
+  body/html pass through. The content script (`inject.js`) is a picker bridge only: it arms/disarms
+  on `sw-arm-picker`/`sw-disarm-picker` from the side panel, crops the element screenshot (needs the
+  page's window dims), and posts `sw-element-picked`/`sw-picker-state` back.
 
 ## Build / run
 - Shim: `cd shim && npm install`, then
@@ -79,8 +91,10 @@ the dev server hot-reloads.
 - **Version bump:** whenever any code under `extension/` changes, bump the patch level of the
   SemVer `version` in `extension/manifest.json` (e.g. `0.2.1` → `0.2.2`) in the same change.
 - Extension: load `extension/` unpacked; in options add the app origin → `shimUrl` + token; enable.
-  Non-localhost origins prompt for a runtime host permission and get a dynamically registered
-  content script (README §8.1); localhost stays zero-config via the static manifest entries.
+  Click the toolbar icon to open the side panel. Non-localhost origins prompt for a runtime host
+  permission and get a dynamically registered picker content script (README §8.1); localhost stays
+  zero-config via the static manifest entries. (Adding `<all_urls>` may flag the extension for
+  permission re-acceptance on reload.)
 - No test framework or linter yet.
 
 ## Gotchas

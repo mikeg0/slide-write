@@ -1,8 +1,8 @@
 # Slide Write
 
-**A portable, project-agnostic AI design assistant.** A browser extension injects an
-element-picker + chat overlay into your running app. Click an element or type a request; a tiny
-local **shim** drives **`claude`** headless against your repo; your dev server hot-reloads; the
+**A portable, project-agnostic AI design assistant.** A browser extension adds an element-picker to
+your running app and a chat panel in the browser's side panel. Click an element or type a request; a
+tiny local **shim** drives **`claude`** headless against your repo; your dev server hot-reloads; the
 change appears live — with **zero changes to the target project's source.**
 
 The shim runs `claude` the same way your editor already does (headless, streaming) and reuses your
@@ -50,9 +50,10 @@ the extension spec. It's written to be implemented by **Claude Code** — see [�
 
 ## 1. What you get
 
-- A **browser extension** with a toolbar button / shortcut that injects a chat panel into the app's
-  page. Type a prompt ("make the primary button green") → the shim drives `claude` → the running
-  app hot-reloads → you see it in seconds.
+- A **browser extension** with a toolbar button / shortcut that opens a chat panel in the browser's
+  **side panel** (docked beside the page, which reflows to make room). Type a prompt ("make the
+  primary button green") → the shim drives `claude` → the running app hot-reloads → you see it in
+  seconds.
 - A **Markup mode**: hover to highlight elements, click one to describe a change anchored to it; the
   clicked element's context (tag, classes, text, DOM path) is sent so `claude` finds the source.
   Picks **stack** — the picker stays armed, so consecutive clicks add elements (up to 5 per
@@ -80,18 +81,20 @@ Single-developer, trusted-local tool ([§10](#10-security-model)).
 │   └── slide-write.py              # stdlib-only Python port for hosts without Node (§5.3)
 │
 └── extension/                      # the Manifest V3 browser extension (the universal UI)
-    ├── manifest.json               # host_permissions: localhost; content script on localhost
-    ├── background.js               # config store (chrome.storage); options/popup messaging
+    ├── manifest.json               # side_panel + <all_urls>; content script (picker) on localhost
+    ├── background.js               # config store (chrome.storage); messaging; opens the side panel
+    ├── sidepanel.html              # the side-panel document (loads styles.css + sidepanel.js)
+    ├── sidepanel.js                # side-panel host: per-active-tab config, SSE, picker bridge (§8.4)
     ├── content/
-    │   ├── inject.js               # bootstrap: mount the Shadow-DOM widget on enabled origins
+    │   ├── inject.js               # content script: picker bridge only — arms picker, crops shots (§8.4)
     │   ├── picker.js               # capture-phase element picker (§8.3)
-    │   ├── panel.js                # chat transcript + composer (renders the §6 events)
+    │   ├── panel.js                # chat transcript + composer (renders the §6 events; runs in the panel)
     │   └── sse.js                  # fetch + getReader SSE reader (§8.2, verbatim)
     ├── options.html
     ├── options.js                  # per-origin config: enabled + token + shim URL
     ├── popup.html
     ├── popup.js                    # quick enable/disable + "wired to <project>" via /meta
-    └── styles.css                  # injected into the Shadow root only
+    └── styles.css                  # the side-panel document's styles
 ```
 
 No Docker, no compose overlay, no reverse-proxy config — the shim is a plain process and the
@@ -111,8 +114,8 @@ talks to `http://localhost:<port>`, and **local dev and remote dev look identica
 flowchart TB
     subgraph UI["UI machine — Win11 / macOS / Linux desktop (where the browser runs)"]
         direction TB
-        PAGE["app page · http://localhost:5173"]
-        EXT["browser extension<br/>content script: element picker + chat panel + SSE reader"]
+        PAGE["app page · http://localhost:5173<br/>content script: element picker"]
+        EXT["browser side panel<br/>chat panel + SSE reader + picker bridge"]
         PAGE -.- EXT
     end
 
@@ -483,7 +486,7 @@ shim also still accepts the legacy single top-level `element`. Each entry:
 }
 ```
 Centralized, semantic class names usually pinpoint the source; for CSS-in-JS / hashed classes, lean
-on `text` + `domPath` + `screen`, or add framework-fiber data ([§8.4](#84-the-widget--remaining-files)).
+on `text` + `domPath` + `screen`, or add framework-fiber data ([§8.4](#84-the-widget-the-bridge--remaining-files)).
 
 `screenshotDataUrl` is captured on **every** pick: Chrome has no "screenshot this element" API, so the
 background worker grabs the visible tab (`chrome.tabs.captureVisibleTab`) and the content script crops
@@ -518,55 +521,72 @@ place.
 
 ## 8. The browser extension (`extension/`)
 
-Manifest V3. The UI is **injected** into the page via a content script, rendered into a **Shadow
-DOM** so host and panel styles never collide.
+Manifest V3. The chat UI lives in the browser's **side panel** (`sidepanel.html`, an extension page)
+— so it docks beside the page (which reflows) instead of overlapping it, and it **persists while
+open**, surviving a whole run regardless of the MV3 service-worker idle-kill. The element **picker**
+stays a **content script** in the page (`content/inject.js`) — only a content script can hit-test
+the app's DOM and overlay a highlight. The two halves coordinate over runtime messaging ([§8.4](#84-the-widget-the-bridge--remaining-files)).
 
 ### 8.1 `manifest.json`
 ```jsonc
 {
   "manifest_version": 3,
   "name": "Slide Write",
-  "version": "0.1.0",
-  "permissions": ["storage", "scripting", "activeTab"],
-  "host_permissions": ["http://localhost/*", "http://127.0.0.1/*", "https://localhost/*"],
+  "version": "0.2.x",
+  "permissions": ["storage", "activeTab", "scripting", "sidePanel", "tabs"],
+  "host_permissions": ["<all_urls>"],
   "optional_host_permissions": ["https://*/*", "http://*/*"],
   "background": { "service_worker": "background.js" },
-  "action": { "default_popup": "popup.html" },
+  "action": { "default_title": "Slide Write — open panel", "default_icon": { /* … */ } },
+  "side_panel": { "default_path": "sidepanel.html" },
   "content_scripts": [{
     "matches": ["http://localhost/*", "http://127.0.0.1/*", "https://localhost/*"],
     "js": ["content/inject.js"],
     "run_at": "document_idle"
+  }],
+  "web_accessible_resources": [{
+    "resources": ["content/picker.js"],
+    "matches": ["https://*/*", "http://*/*"]
   }]
 }
 ```
-`http://localhost/*` matches any port, so it covers every project's dev server and the forwarded
-shim port. `inject.js` mounts the widget only if `chrome.storage` has an **enabled** entry for
-`location.origin` — inert otherwise.
+**`host_permissions: ["<all_urls>"]` is load-bearing**, not laziness: the element-screenshot crop
+calls `chrome.tabs.captureVisibleTab`, which Chrome only grants with `<all_urls>` **or** a per-tab
+`activeTab` gesture — a narrow host match (`http://localhost/*`) never satisfies it. The old in-page
+panel happened to get `activeTab` from the toolbar click; opening a side panel doesn't, so the broad
+host permission is what keeps screenshots working across tab switches and reloads.
 
-**Non-localhost origins (the §13 reverse-proxy fallback) are runtime-granted, not baked into the
-manifest.** Install-time host access stays localhost-only; `optional_host_permissions` lets
-options/popup call `chrome.permissions.request({ origins })` on the save click (a user gesture is
-required), and on grant the background registers `content/inject.js` for that origin via
+The action has **no `default_popup`** — clicking the toolbar icon opens the side panel.
+`background.js` calls `chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })` (the
+setting persists, so it's set explicitly on `onStartup`/`onInstalled`); the `toggle-panel` command
+opens it via `chrome.sidePanel.open({ windowId })`.
+
+The content-script `content_scripts` entry (the picker) still matches localhost only; the side panel
+itself works on every tab. **Non-localhost origins (the §13 reverse-proxy fallback) get a
+runtime-granted picker content script:** `optional_host_permissions` lets options/popup call
+`chrome.permissions.request({ origins })` on the save click (user gesture), and on grant the
+background registers `content/inject.js` for that origin via
 `chrome.scripting.registerContentScripts` (id `sw:<origin>`). Disabling unregisters; deleting also
 removes the permission; `onStartup`/`onInstalled` reconcile the registry against config + granted
-permissions (registrations survive restarts but are cleared on extension reload/update). Match
-patterns can't carry a port, so a grant covers the whole host — inject.js's per-origin config gate
-keeps other ports inert. `web_accessible_resources.matches` is the one intentionally-broad entry
-(`https://*/*`, `http://*/*`): the panel/picker ES modules must be importable on any granted
-origin, and it exposes only the extension's own JS/CSS, not host access.
+permissions (cleared on extension reload/update). `web_accessible_resources` exposes only
+`content/picker.js` — the one module the page-context content script imports; the chat modules
+(`panel.js`/`sse.js`) load as same-origin resources of the side-panel page and need no exposure.
 
-### 8.2 `content/sse.js` — the SSE reader (verbatim; runs in the content script, not the SW)
-⚠️ The stream lives in the **content script** because MV3 service workers are killed after ~30s
-idle, mid-run. `EventSource` can't POST or set headers, so read the `fetch` body manually:
+### 8.2 `content/sse.js` — the SSE reader (verbatim; runs in the side panel, not the SW)
+⚠️ The stream lives in the **side-panel page**, not the MV3 service worker (killed after ~30s idle,
+mid-run) and no longer in a content script — a side-panel document persists as long as it's open, so
+the read loop survives a whole run. (It also means the fetch originates from the extension page, so
+with the `<all_urls>` host permission it isn't subject to CORS — see [§10](#10-security-model).)
+`EventSource` can't POST or set headers, so read the `fetch` body manually:
 ```js
-export async function streamDesign(shimUrl, token, payload, onEvent, signal) {
-  const res = await fetch(`${shimUrl}/design`, {
+export async function streamDesign(shimUrl, token, payload, onEvent, signal, path = "/design") {
+  const res = await fetch(`${shimUrl}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "Accept": "text/event-stream",
                "Authorization": `Bearer ${token}` },
     body: JSON.stringify(payload), signal,
   });
-  if (!res.ok || !res.body) throw new Error(`design failed: ${res.status}`);
+  if (!res.ok || !res.body) throw new Error(`request failed: ${res.status}`);
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
@@ -589,9 +609,10 @@ export async function streamDesign(shimUrl, token, payload, onEvent, signal) {
 ### 8.3 `content/picker.js` — the element picker (capture-phase)
 1. **Listen on `window` in the capture phase** for `mousemove`/`click`. Capture-phase
    `preventDefault()` + `stopPropagation()` on click means marking an element **never triggers the
-   app's own handlers**. Suppression is per-target: clicks/presses on the extension's own UI (the
-   panel, its chips) and on bare `body`/`html` pass through untouched, so the chat stays usable
-   while the picker is armed.
+   app's own handlers**. Suppression is per-target: clicks/presses on the picker's own overlay (the
+   highlight box + label, tagged `data-slidewrite-ui`) and on bare `body`/`html` pass through
+   untouched. (The chat panel is no longer in the page — it's the side panel — so the picker's only
+   own-UI in the page is its highlight overlay.)
 2. **`document.elementFromPoint`**, then walk up and **skip your own UI** — tag every node you
    render with `data-slidewrite-ui` and ignore hits inside one:
    ```js
@@ -606,12 +627,13 @@ export async function streamDesign(shimUrl, token, payload, onEvent, signal) {
    ```
 3. **Highlight box is `position:fixed; pointer-events:none`** at the target's `getBoundingClientRect()`.
 4. **Capture the [§7](#7-the-element-capture-contract) context per click and STAY ARMED** for
-   consecutive picks — each capture is handed back (the panel stacks it as a chip) and picking
-   continues. While the consumer handles a pick (screenshot capture), the highlight hides and
-   further clicks are swallowed, then picking re-arms. The picker disarms on **Escape**
-   (`onPick(null)` after cleanup) or via the **`stop()` function `startPicker` returns** — the
-   widget calls it when 🎯 is clicked again (toggle off) or the 5-element cap is reached. Build
-   `domPath` as an `nth-of-type` chain of ≤5 ancestors, stopping at the first `id`.
+   consecutive picks — each capture is handed to `content/inject.js`, which crops the screenshot and
+   posts it to the side panel (which stacks it as a chip), and picking continues. While the consumer
+   handles a pick (screenshot capture), the highlight hides and further clicks are swallowed, then
+   picking re-arms. The picker disarms on **Escape** (`onPick(null)` after cleanup) or via the
+   **`stop()` function `startPicker` returns** — the bridge calls it when the side panel sends
+   `sw-disarm-picker` (🎯 toggled off, or the 5-element cap reached). Build `domPath` as an
+   `nth-of-type` chain of ≤5 ancestors, stopping at the first `id`.
 5. **Shift+click copies the full target path** to the clipboard (a power-user shortcut) **in
    addition to** the normal pick — the element is still captured into the chat context. Unlike
    `domPath`, this path is uncapped and never stops at an `id`: it walks all the way up to `<body>`,
@@ -619,29 +641,45 @@ export async function streamDesign(shimUrl, token, payload, onEvent, signal) {
    `document.querySelector`. Uses `navigator.clipboard.writeText` (inside the click gesture) with an
    `execCommand("copy")` fallback, and shows a brief "✓ Path copied" confirmation.
 
-### 8.4 The widget & remaining files
-- **`content/panel.js`** — transcript + composer. Renders each [§6](#6-the-sse-event-contract) event
-  as a row; **coalesce consecutive same-role streaming deltas** into one bubble; tool/result rows
-  break the chain. Footer textarea (⌘/Ctrl+Enter), disabled while a run is in flight;
-  `AbortController` cancels on close. The composer's toolbar row holds a model selector (populated
-  from `/meta`, persisted per-origin) and the send button, modeled on the Claude AI chat composer.
-  A 🕘 header button opens a **history view**: `GET /history` lists this repo's past sessions; picking
-  one calls `GET /history/<id>` and **replays it read-only** through the same `onEvent` renderer (the
-  live transcript is left intact). A **↻ Resume** action sets a resume chip and threads subsequent
-  sends into that session via the `/design` `resume` field.
-- **`content/sse.js`** — the SSE reader plus `fetchHistory`/`fetchHistoryDetail` JSON GET helpers.
-- **`content/inject.js`** — create a host node + `attachShadow({mode:'open'})`, inject `styles.css`
-  into the shadow root, mount the panel + a toolbar affordance, wire the shortcut. Look up config for
-  `location.origin`; call `GET <shimUrl>/meta`; show "wired to `<project>` @ `<branch>`" in the header.
-- **`background.js`** — owns `chrome.storage` config; serves get/set to options & popup. No network.
-- **`options.html/js`** — per-origin rows: `{ origin, enabled, token, shimUrl }`.
-- **`popup.html/js`** — toggle enable for the active tab's origin; show `/meta` confirmation.
-- **`styles.css`** — scoped to the shadow root (`:host`, `.sw-*`).
+### 8.4 The widget, the bridge & remaining files
 
-**Extension-only superpower (roadmap):** because the content script runs *in the page*, it can read
-the React fiber (`__reactFiber$…`) on the clicked node to recover the component name + `_debugSource`
-(file:line) in dev builds, and send it alongside the DOM context — far more precise than
-class/`domPath` grepping for CSS-in-JS / hashed-class projects. Optional, framework-specific.
+The UI is split across two contexts that talk over runtime messaging:
+
+- **`sidepanel.html` / `sidepanel.js`** — the side-panel **host**. On load (and on every active-tab
+  change — `tabs.onActivated`/`onUpdated`, `windows.onFocusChanged`) it resolves the active tab's
+  origin, looks up that origin's config via the background store, probes `GET <shimUrl>/meta`, and
+  mounts the panel. The single side panel **follows the active tab**: switching to a different origin
+  re-loads its config and resets the thread (a same-origin navigation just updates the `screen`
+  value). It owns the picker bridge: the 🎯 button sends `sw-arm-picker` /`sw-disarm-picker` to the
+  active tab's content script, and it listens for `sw-element-picked` (→ stack a chip) and
+  `sw-picker-state` (→ reflect the 🎯 toggle).
+- **`content/inject.js`** — the page-side **picker bridge** (all that's left in the page). Inert until
+  the side panel arms it; then it imports `content/picker.js`, and for each pick crops the element
+  screenshot — `captureElementShot` asks `background.js` for `chrome.tabs.captureVisibleTab` (only the
+  background can call it) and crops to the element's rect using the page's `devicePixelRatio` /
+  viewport (which is why this must run in the page, not the panel) — then posts the [§7](#7-the-element-capture-contract)
+  context back with `chrome.runtime.sendMessage({ type: "sw-element-picked", … })`.
+- **`content/panel.js`** — transcript + composer, now mounted into the side-panel document. Renders
+  each [§6](#6-the-sse-event-contract) event as a row; **coalesce consecutive same-role streaming
+  deltas** into one bubble; tool/result rows break the chain. Footer textarea (⌘/Ctrl+Enter);
+  `AbortController` cancels on close. The composer's toolbar row holds a model selector (populated
+  from `/meta`, persisted per-origin) and the send button. A 🕘 header button opens a **history
+  view**: `GET /history` lists this repo's past sessions; picking one calls `GET /history/<id>` and
+  **replays it read-only** through the same `onEvent` renderer. A **↻ Resume** action threads
+  subsequent sends into that session via the `/design` `resume` field. Page-bound actions are
+  injected as callbacks by `sidepanel.js`: `screen` comes from the active tab's URL, auto-reload-on-
+  save calls `chrome.tabs.reload`, and ✕ closes the side panel (`window.close`).
+- **`content/sse.js`** — the SSE reader plus `fetchHistory`/`fetchHistoryDetail` JSON GET helpers.
+- **`background.js`** — owns `chrome.storage` config; serves get/set to side panel, options & popup;
+  performs `captureVisibleTab` on request; opens the side panel from the toolbar action / command.
+- **`options.html/js`** — per-origin rows: `{ origin, enabled, token, shimUrl }`.
+- **`popup.html/js`** — quick enable/disable for an origin; show `/meta` confirmation.
+- **`styles.css`** — the side-panel document's styles (the panel fills the panel viewport).
+
+**Roadmap:** the picker content script runs *in the page*, so it can read the React fiber
+(`__reactFiber$…`) on the clicked node to recover the component name + `_debugSource` (file:line) in
+dev builds and post it alongside the DOM context — far more precise than class/`domPath` grepping for
+CSS-in-JS / hashed-class projects. Optional, framework-specific.
 
 ---
 
@@ -649,10 +687,11 @@ class/`domPath` grepping for CSS-in-JS / hashed-class projects. Optional, framew
 
 Per origin, the options page stores `{ enabled, token, shimUrl }` — e.g.
 `http://localhost:5173 → http://localhost:4040`. The shim and app run on different ports
-(cross-origin), so `shimUrl` is explicit (not derivable). On load the content script looks up
-`location.origin`; if enabled, it calls `GET <shimUrl>/meta` and shows **"wired to `<project>` @
-`<branch>`"** so you can confirm the tab points at the repo you expect. Run several projects at once
-— each shim on its own port, each origin mapped accordingly.
+(cross-origin), so `shimUrl` is explicit (not derivable). The side panel looks up the **active
+tab's** origin; if enabled, it calls `GET <shimUrl>/meta` and shows **"wired to `<project>` @
+`<branch>`"** so you can confirm the tab points at the repo you expect, and re-resolves whenever you
+switch tabs. Run several projects at once — each shim on its own port, each origin mapped
+accordingly.
 
 ---
 
@@ -667,9 +706,17 @@ The shim runs **arbitrary code edits + shell** in a repo as you. Defenses:
   bridge gateway so a containerized proxy can reach the host shim); don't use it otherwise.
 - **Bearer token.** Every route except `/health` requires `Authorization: Bearer <SLIDEWRITE_TOKEN>`;
   reject with 401 first. Use a random secret per project; never commit it.
-- **CORS allowlist = anti-CSRF.** A JSON POST triggers a preflight; the shim only approves your app's
-  origin, so a random site you browse can't drive the shim even though it's on localhost. Combined
-  with the token, two independent gates.
+- **CORS allowlist = anti-CSRF.** The shim's `Access-Control-Allow-Origin` only names your app's
+  origin, so a random site you browse can't read responses from the shim even though it's on
+  localhost. (The chat itself now fetches from the extension's **side-panel page**, which — as an
+  extension page with the `<all_urls>` host permission — isn't subject to CORS at all; that's
+  expected, since the side panel is trusted extension UI, not a web origin. CORS still blocks
+  arbitrary web pages, and the Bearer token gates everyone.) Two independent gates against web-origin
+  attackers: token + CORS.
+- **Extension host scope.** The extension requests `<all_urls>` (required for
+  `captureVisibleTab`-based element screenshots, §8.1). It's broad read/screenshot access on the
+  browser side, appropriate for a single-developer tool; the per-origin enable + token still gate
+  where it actually does anything. The shim's own defenses below are unchanged by it.
 - **Runs as you (non-root).** Edits are host-owned; `bypassPermissions` is allowed without root
   hacks. Optional hardening: a `canUseTool` deny-list (WebFetch/WebSearch, `git push`) to blunt
   prompt-injection exfiltration.
@@ -751,11 +798,14 @@ Each phase is independently testable; build and verify in order.
    ```
    Expect `start → file_edit → result → commit → done`, then one scoped commit
    (`git reset --hard HEAD~1` to clean up). Confirm SDK message shapes here.
-2. **Extension — minimal.** `manifest.json`, `background.js`, `options.*`, `content/inject.js` +
-   `content/sse.js` + `content/panel.js` (chat only, no picker). Drive a text-prompt change end to
-   end from the browser; render the [§6](#6-the-sse-event-contract) events.
-3. **Extension — picker.** `content/picker.js` ([§8.3](#83-contentpickerjs--the-element-picker-capture-phase));
-   send the [§7](#7-the-element-capture-contract) contract; anchored composer; markup toggle.
+2. **Extension — minimal.** `manifest.json` (`side_panel`, `<all_urls>`), `background.js`,
+   `options.*`, `sidepanel.html` + `sidepanel.js` + `content/panel.js` + `content/sse.js` (chat only,
+   no picker). Click the toolbar icon → the side panel opens, resolves the active tab's origin, and
+   drives a text-prompt change end to end; render the [§6](#6-the-sse-event-contract) events.
+3. **Extension — picker.** `content/picker.js` + the `content/inject.js` bridge
+   ([§8.3](#83-contentpickerjs--the-element-picker-capture-phase)/[§8.4](#84-the-widget-the-bridge--remaining-files));
+   side panel arms the picker, receives the [§7](#7-the-element-capture-contract) contract + cropped
+   screenshot over messaging; anchored composer; markup toggle.
 4. **Polish.** Popup enable/disable, auto-reload-on-save option, token UX, the [§10](#10-security-model) checklist.
 5. **History & resume.** Add the `/history` + `/history/<id>` routes and the `resume` field
    ([§6](#6-the-sse-event-contract)) to the shim, then the 🕘 history view + ↻ Resume in the panel. Verify:
@@ -767,7 +817,7 @@ Each phase is independently testable; build and verify in order.
    ```
    Expect the resumed run to reference prior context and still commit only its own changes. In the UI:
    🕘 → pick a session → read-only replay → ↻ Resume → follow-up threads into that session.
-6. **(Optional)** fiber-based element resolution ([§8.4](#84-the-widget--remaining-files)).
+6. **(Optional)** fiber-based element resolution ([§8.4](#84-the-widget-the-bridge--remaining-files)).
 
 ---
 

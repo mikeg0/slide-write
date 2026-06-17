@@ -77,10 +77,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         const windowId = _sender && _sender.tab ? _sender.tab.windowId : undefined;
         const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
         return sendResponse({ ok: true, dataUrl });
-      } catch (e) {
-        console.warn("[slide-write] captureVisibleTab failed:", e);
-        return sendResponse({ ok: false, error: String((e && e.message) || e) });
-      }
+      } catch (e) { return sendResponse({ ok: false, error: String((e && e.message) || e) }); }
     }
     const cfg = await load();
     switch (msg && msg.type) {
