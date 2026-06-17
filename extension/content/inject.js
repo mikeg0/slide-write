@@ -29,7 +29,8 @@
         // text-only context on any failure (restricted page, tainted canvas, off-screen rect).
         const shot = await captureElementShot(ctx.rect);
         if (shot) { ctx.screenshotDataUrl = shot.dataUrl; ctx.screenshotW = shot.w; ctx.screenshotH = shot.h; }
-        chrome.runtime.sendMessage({ type: "sw-element-picked", ctx }).catch(() => {});
+        else console.warn("[slide-write] element screenshot capture returned no image for rect", ctx.rect);
+        chrome.runtime.sendMessage({ type: "sw-element-picked", ctx }).catch((e) => console.warn("[slide-write] sw-element-picked send failed:", e));
       }, { captureImage: true });
     } catch (e) {
       armed = false; stopPicker = null; reportState(false);

@@ -77,7 +77,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         const windowId = _sender && _sender.tab ? _sender.tab.windowId : undefined;
         const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
         return sendResponse({ ok: true, dataUrl });
-      } catch (e) { return sendResponse({ ok: false, error: String((e && e.message) || e) }); }
+      } catch (e) {
+        console.warn("[slide-write] captureVisibleTab failed:", e);
+        return sendResponse({ ok: false, error: String((e && e.message) || e) });
+      }
     }
     const cfg = await load();
     switch (msg && msg.type) {
@@ -125,25 +128,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true; // keep the channel open for the async response
 });
 
-// The chat UI is a side panel (sidepanel.html). We open it from action.onClicked ourselves rather
-// than via setPanelBehavior({ openPanelOnActionClick: true }) for a load-bearing reason: clicking
-// the action grants the extension the `activeTab` permission for that tab, and
-// chrome.tabs.captureVisibleTab (the element-screenshot crop, routed through the captureTab handler
-// above) REQUIRES activeTab or <all_urls> — a plain host permission isn't enough. With
-// openPanelOnActionClick, onClicked never fires, activeTab is never granted, and every screenshot
-// crop silently fails. onClicked is itself the user gesture chrome.sidePanel.open() needs
-// (Chrome 116+). There's no programmatic close — the panel's own ✕ closes it.
-function openPanel(tab) {
-  if (!tab || tab.windowId == null) return;
-  chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {});
+// The chat UI is a side panel (sidepanel.html). The <all_urls> host permission satisfies
+// chrome.tabs.captureVisibleTab (the element-screenshot crop) without needing the per-tab activeTab
+// grant, so we can open the panel straight from the toolbar icon via setPanelBehavior. The setting
+// PERSISTS across reloads, so set it explicitly on startup/install rather than relying on a prior
+// value. There's no programmatic close — the panel's own ✕ closes it.
+function initSidePanel() {
+  if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior)
+    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
 }
-chrome.action.onClicked.addListener(openPanel);
+chrome.runtime.onStartup.addListener(initSidePanel);
+chrome.runtime.onInstalled.addListener(initSidePanel);
+initSidePanel();
 
-// Keyboard shortcut → same path (a command is also a user gesture and likewise grants activeTab).
+// Keyboard shortcut → open the side panel for the active tab's window (Chrome 116+; needs the gesture).
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== "toggle-panel") return;
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    openPanel(tab);
+    if (tab) await chrome.sidePanel.open({ windowId: tab.windowId });
   } catch { /* needs a user gesture / Chrome 116+ */ }
 });
