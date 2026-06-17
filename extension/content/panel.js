@@ -195,7 +195,6 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, screen, o
   // borrows that button's tooltip text, then reverts on mouse-out. Hover is handled by delegation
   // (below) so it tracks dynamic titles (e.g. the 🎯 button's "Picking…" label) at the moment of hover.
   const titleblock = el("div", { class: "dmsg-headerleft" }, [
-    el("span", { class: "dmsg-title", text: "Slide Write" }),
     status,
   ]);
   const header = el("div", { class: "dmsg-header" }, [
@@ -204,7 +203,6 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, screen, o
     newChatBtn,
     historyBtn,
     settingsBtn,
-    el("button", { class: "dmsg-iconbtn", title: "Close (Esc)", text: "✕", onclick: () => api.close() }),
   ]);
   header.addEventListener("mouseover", (e) => {
     const btn = e.target.closest && e.target.closest("button[title]");
