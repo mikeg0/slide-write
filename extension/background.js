@@ -125,24 +125,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true; // keep the channel open for the async response
 });
 
-// The chat UI is now a side panel (sidepanel.html). setPanelBehavior makes the toolbar icon open it
-// directly, so no action.onClicked handler is needed (and the panel renders its own "set up" state
-// for un-wired origins — no openSetup detour). Re-applied on startup/install in case it was reset.
-function initSidePanel() {
-  if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior)
-    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+// The chat UI is a side panel (sidepanel.html). We open it from action.onClicked ourselves rather
+// than via setPanelBehavior({ openPanelOnActionClick: true }) for a load-bearing reason: clicking
+// the action grants the extension the `activeTab` permission for that tab, and
+// chrome.tabs.captureVisibleTab (the element-screenshot crop, routed through the captureTab handler
+// above) REQUIRES activeTab or <all_urls> — a plain host permission isn't enough. With
+// openPanelOnActionClick, onClicked never fires, activeTab is never granted, and every screenshot
+// crop silently fails. onClicked is itself the user gesture chrome.sidePanel.open() needs
+// (Chrome 116+). There's no programmatic close — the panel's own ✕ closes it.
+function openPanel(tab) {
+  if (!tab || tab.windowId == null) return;
+  chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {});
 }
-chrome.runtime.onStartup.addListener(initSidePanel);
-chrome.runtime.onInstalled.addListener(initSidePanel);
-initSidePanel();
+chrome.action.onClicked.addListener(openPanel);
 
-// Keyboard shortcut → open the side panel for the active tab's window. A command counts as the user
-// gesture chrome.sidePanel.open() requires (Chrome 116+). There's no programmatic close — the
-// panel's own ✕ closes it.
+// Keyboard shortcut → same path (a command is also a user gesture and likewise grants activeTab).
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== "toggle-panel") return;
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab) await chrome.sidePanel.open({ windowId: tab.windowId });
+    openPanel(tab);
   } catch { /* needs a user gesture / Chrome 116+ */ }
 });
