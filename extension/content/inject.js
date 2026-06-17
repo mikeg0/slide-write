@@ -6,6 +6,14 @@
 // posts picks back the same way. The picker STAYS ARMED for consecutive picks; the side panel
 // disarms it on the 🎯 toggle or at the element cap, and Escape disarms it from here.
 (() => {
+  // Guard against double-injection. This same file can reach a tab three ways — the static localhost
+  // content_scripts entry, a dynamically registered per-origin script (§8.1), and on-demand
+  // chrome.scripting.executeScript from the side panel for STALE tabs (loaded before the extension
+  // was enabled). All run in the extension's one ISOLATED world per tab and share `window`, so a
+  // flag here keeps a second injection from registering a duplicate set of listeners.
+  if (window.__slidewritePickerBridge) return;
+  window.__slidewritePickerBridge = true;
+
   let armed = false;
   let stopPicker = null;   // the picker's disarm fn while armed (null otherwise)
 
@@ -16,7 +24,7 @@
   }
 
   async function armPicker() {
-    if (armed) return;
+    if (armed) { reportState(true); return; }   // already armed — re-echo so a drifted panel re-syncs
     armed = true;
     reportState(true);
     try {
@@ -38,7 +46,7 @@
   }
 
   function disarmPicker() {
-    if (!armed) return;
+    if (!armed) { reportState(false); return; }   // already disarmed — re-echo so a drifted panel re-syncs
     armed = false;
     if (stopPicker) { stopPicker(); stopPicker = null; }  // no-op if the picker already cleaned up
     reportState(false);
@@ -48,7 +56,14 @@
     if (!msg) return;
     if (msg.type === "sw-arm-picker") armPicker();
     else if (msg.type === "sw-disarm-picker") disarmPicker();
+    else if (msg.type === "sw-query-picker") reportState(armed);   // panel asks for the authoritative state
   });
+
+  // A fresh injection (initial load OR the app's hot-reload after an edit) always starts disarmed.
+  // Proactively tell the side panel so its 🎯 toggle resets if a reload killed a previously-armed
+  // picker — otherwise the button stays "on" while the page-side picker is gone. Harmless when no
+  // panel is listening (the sendMessage rejection is swallowed).
+  reportState(false);
 
   // Capture the visible tab (via the background worker — chrome.tabs isn't available here) and crop
   // it to the element's rect. The picker's own highlight overlay is gone by now (cleanup() runs

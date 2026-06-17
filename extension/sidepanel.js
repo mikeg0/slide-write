@@ -60,20 +60,43 @@ let syncing = false;
 // The 🎯 button calls onMarkup → we toggle the picker in the active tab's content script. The content
 // script reports armed/disarmed via "sw-picker-state" (covers Escape + the element-cap auto-disarm),
 // and posts each pick back via "sw-element-picked".
-function togglePicker() {
+async function togglePicker() {
   if (activeTabId == null) return;
+  const tabId = activeTabId;
   const type = pickerArmed ? "sw-disarm-picker" : "sw-arm-picker";
-  chrome.tabs.sendMessage(activeTabId, { type }).catch(() => {
-    // No receiving end → no content script on this tab (origin not enabled, or the page predates it).
-    pickerArmed = false;
-    panel && panel.setMarkupActive(false);
-  });
+  try {
+    await chrome.tabs.sendMessage(tabId, { type });
+  } catch {
+    // No receiving end → the picker bridge isn't in this tab. When DISARMING there's nothing to do,
+    // so just clear the button. When ARMING, the tab is likely STALE (loaded before the extension
+    // was enabled, or a non-localhost origin whose dynamic script isn't registered) — inject the
+    // bridge on demand, then retry once. The bridge guards against double-injection itself.
+    if (pickerArmed) { pickerArmed = false; panel && panel.setMarkupActive(false); return; }
+    if (!(await ensurePickerInjected(tabId))) { panel && panel.setMarkupActive(false); return; }
+    try { await chrome.tabs.sendMessage(tabId, { type: "sw-arm-picker" }); }
+    catch { panel && panel.setMarkupActive(false); }
+  }
+}
+
+// Inject the picker bridge into a tab that has no content script yet (stale page / not-yet-registered
+// origin). <all_urls> host permission covers executeScript on any normal page; it rejects on
+// restricted pages (chrome://, the web store, view-source, …), where the picker simply can't run.
+async function ensurePickerInjected(tabId) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content/inject.js"] });
+    return true;
+  } catch (e) {
+    console.warn("[slide-write] could not inject picker into this tab:", e?.message || e);
+    return false;
+  }
 }
 chrome.runtime.onMessage.addListener((msg, sender) => {
   if (!msg || !panel) return;
   // Only trust picker traffic from the tab we're currently bound to.
   if (sender.tab && sender.tab.id !== activeTabId) return;
   if (msg.type === "sw-picker-state") {
+    // The content script's reported state is authoritative — it echoes on every arm/disarm (even
+    // no-ops) and on fresh load, so this is how the 🎯 button stays in sync through drift + reloads.
     pickerArmed = !!msg.active;
     panel.setMarkupActive(pickerArmed);
   } else if (msg.type === "sw-element-picked") {
@@ -81,6 +104,18 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
     panel.open();
     if (!more && activeTabId != null) chrome.tabs.sendMessage(activeTabId, { type: "sw-disarm-picker" }).catch(() => {});
   }
+});
+
+// Esc disarms the picker even when keyboard focus is in the side panel. The page-side Escape handler
+// (picker.js) only fires when the app tab itself has focus, but the picker is armed by clicking the
+// 🎯 button HERE, so focus usually stays in the panel until the user clicks into the page. This
+// covers that gap. Only acts while armed, so it never steals Esc from menus/other panel UI.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || !pickerArmed || activeTabId == null) return;
+  chrome.tabs.sendMessage(activeTabId, { type: "sw-disarm-picker" }).catch(() => {
+    pickerArmed = false;
+    panel && panel.setMarkupActive(false);
+  });
 });
 
 // --- Mount + tab-follow ----------------------------------------------------------------------------
@@ -121,9 +156,17 @@ async function syncActiveTab() {
     const newId = tab ? tab.id : null;
     const newOrigin = tab ? originOf(tab.url) : null;
     const newScreen = tab ? screenOf(tab.url) : "";
-    // Leaving a tab where the picker is still armed → disarm it there.
-    if (newId !== activeTabId && pickerArmed && activeTabId != null)
-      chrome.tabs.sendMessage(activeTabId, { type: "sw-disarm-picker" }).catch(() => {});
+    // Leaving a tab where the picker is still armed → disarm it there, and clear our local state so
+    // the 🎯 button doesn't carry the old tab's armed state onto the new tab.
+    if (newId !== activeTabId) {
+      if (pickerArmed && activeTabId != null)
+        chrome.tabs.sendMessage(activeTabId, { type: "sw-disarm-picker" }).catch(() => {});
+      pickerArmed = false;
+      panel.setMarkupActive(false);
+      // Ask the tab we just bound to for its authoritative picker state (it echoes via
+      // sw-picker-state); harmless no-op if it has no content script.
+      if (newId != null) chrome.tabs.sendMessage(newId, { type: "sw-query-picker" }).catch(() => {});
+    }
     activeTabId = newId;
     if (newOrigin === currentOrigin) { panel.setConfig({ screen: newScreen }); return; }  // same origin, new route
     currentOrigin = newOrigin;
