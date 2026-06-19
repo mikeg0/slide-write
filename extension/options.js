@@ -11,25 +11,18 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-// Request, in ONE chrome.permissions.request, everything an enabled origin needs:
-//   • the host permission for a non-localhost origin (content-script picker, §8.1 — manifest grants
-//     localhost only; match patterns can't carry a port, so the grant covers the whole host), and
-//   • the optional `debugger` permission when the origin opts into the chrome.debugger picker.
-// It MUST be the FIRST await in a click handler — chrome.permissions.request needs the user gesture,
-// and a single combined request keeps that gesture for both grants. Re-requesting an already-granted
-// permission is a silent no-op, so we never pre-check with contains() (that extra await would consume
-// the gesture).
+// Non-localhost origins need a runtime-granted host permission (manifest grants localhost only).
+// Must be the FIRST await in a click handler — chrome.permissions.request needs the user gesture.
+// Match patterns can't carry a port, so the grant covers the whole host (like the localhost entry).
+// (The chrome.debugger picker's `debugger` permission is NOT requested here: Chrome forbids `debugger`
+// as an optional permission, so it's declared required in the manifest and always granted.)
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
-async function requestGrants(origin, { enabled, dbg }) {
-  if (!enabled) return true;                       // nothing to pick on a disabled origin
-  const req = {};
+async function requestHost(origin) {
   try {
     const u = new URL(origin);
-    if (!LOCAL_HOSTS.has(u.hostname)) req.origins = [`${u.protocol}//${u.hostname}/*`];
-  } catch { /* non-URL origin → no host pattern */ }
-  if (dbg) req.permissions = ["debugger"];
-  if (!req.origins && !req.permissions) return true;  // localhost + content-script picker → nothing to ask
-  try { return await chrome.permissions.request(req); } catch { return false; }
+    if (LOCAL_HOSTS.has(u.hostname)) return true;
+    return await chrome.permissions.request({ origins: [`${u.protocol}//${u.hostname}/*`] });
+  } catch { return false; }
 }
 
 async function render() {
@@ -64,7 +57,7 @@ async function render() {
     row.querySelector(".save").addEventListener("click", async () => {
       const enabled = row.querySelector(".en").checked;
       const dbg = row.querySelector(".dbg").checked;
-      if (!(await requestGrants(origin, { enabled, dbg })))
+      if (enabled && !(await requestHost(origin)))
         return flash(row.querySelector(".save"), "Permission denied");
       await send({ type: "setOrigin", origin, value: {
         name: row.querySelector(".name").value.trim(),
@@ -118,7 +111,7 @@ $("add").addEventListener("click", async () => {
   if (!origin) return;
   const enabled = $("a-enabled").checked;
   const dbg = $("a-dbg").checked;
-  if (!(await requestGrants(origin, { enabled, dbg })))
+  if (enabled && !(await requestHost(origin)))
     return flash($("add"), "Permission denied");
   await send({ type: "setOrigin", origin, value: {
     name: $("a-name").value.trim(),

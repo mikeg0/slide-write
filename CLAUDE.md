@@ -23,9 +23,11 @@ flags/env/routes/contracts, drives the `claude` CLI headless via `-p --output-fo
 instead of the Agent SDK; `slide-write.mjs` is the reference implementation and the two must change
 together), and an **opt-in `chrome.debugger` picker** (README §8.5: the per-origin `debuggerPicker`
 checkbox routes the 🎯 button through the Chrome DevTools Protocol in `background.js` — now an ES
-module importing `content/capture.js` — instead of the content-script picker; gated by the optional
-`debugger` permission, it reaches cross-origin iframes, and both backends emit the identical §7
-contract so nothing downstream changes). README.md remains the authoritative spec — it inlines every
+module importing `content/capture.js` — instead of the content-script picker; needs the `debugger`
+permission, declared **required** in the manifest because Chrome forbids `debugger` as optional, so it
+ships always-granted with the broader install warning; it reaches cross-origin iframes, and both
+backends emit the identical §7 contract so nothing downstream changes). README.md remains the
+authoritative spec — it inlines every
 contract and the load-bearing code verbatim (§5 shim, §8.2 SSE reader); treat those as authoritative
 and extend them in lockstep. The mechanical parts (UI rendering, helpers) may be implemented freely
 as long as they honor the contracts.

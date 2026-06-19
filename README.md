@@ -634,12 +634,13 @@ export async function streamDesign(shimUrl, token, payload, onEvent, signal, pat
    **`stop()` function `startPicker` returns** — the bridge calls it when the side panel sends
    `sw-disarm-picker` (🎯 toggled off, or the 5-element cap reached). Build `domPath` as an
    `nth-of-type` chain of ≤5 ancestors, stopping at the first `id`.
-5. **Shift+click copies the full target path** to the clipboard (a power-user shortcut) **in
-   addition to** the normal pick — the element is still captured into the chat context. Unlike
-   `domPath`, this path is uncapped and never stops at an `id`: it walks all the way up to `<body>`,
-   keeping every class and an `nth-of-type` disambiguator so the result resolves uniquely via
-   `document.querySelector`. Uses `navigator.clipboard.writeText` (inside the click gesture) with an
-   `execCommand("copy")` fallback, and shows a brief "✓ Path copied" confirmation.
+5. **Every pick copies the full target path** to the clipboard **in addition to** the normal pick —
+   the element is still captured into the chat context (parity with the [§8.5](#85-opt-in-chromedebugger-picker)
+   CDP picker, which also copies on every pick). Unlike `domPath`, this path is uncapped and never
+   stops at an `id`: it walks all the way up to `<body>`, keeping every class and an `nth-of-type`
+   disambiguator so the result resolves uniquely via `document.querySelector`. Uses
+   `navigator.clipboard.writeText` (inside the click gesture) with an `execCommand("copy")` fallback,
+   and shows a brief "✓ Path copied" confirmation.
 
 ### 8.4 The widget, the bridge & remaining files
 
@@ -700,16 +701,18 @@ Why offer it:
   every frame, so you can pick elements the in-page content script can't see.
 - **Device-accurate screenshots.** `Page.captureScreenshot` clips to the node's box model — no
   `devicePixelRatio` / viewport crop math, and it captures beyond the viewport.
-- **Auto-copies the CSS selector on every pick.** The inspect event carries no modifier state, so the
-  [§8.3](#83-contentpickerjs--the-element-picker-capture-phase) Shift+click affordance can't be
-  replicated — instead every pick copies the uncapped `fullPath` to the clipboard.
+- **Auto-copies the CSS selector on every pick** — the uncapped `fullPath`, same as the
+  [§8.3](#83-contentpickerjs--the-element-picker-capture-phase) content-script picker. (The inspect
+  event carries no modifier state, so this backend never had a per-modifier variant to begin with.)
 
 Costs / behavior:
 
-- Needs the **optional `debugger` permission** (manifest `optional_permissions`). The options page
-  requests it on the enable click — bundled into the same `chrome.permissions.request` as the host
-  permission so one user gesture covers both. Chrome shows a **"Slide Write started debugging this
-  browser"** banner while picking; finishing (🎯/Esc/cap) detaches and clears it.
+- Needs the **`debugger` permission**, declared **required** in the manifest (Chrome forbids
+  `debugger` as an optional permission, so it can't be requested on demand). It's therefore always
+  granted, and the extension shows the broader install-time permission warning — adding it prompts a
+  one-time permission re-acceptance on reload, even for users who never turn the mode on. Chrome also
+  shows a **"Slide Write started debugging this browser"** banner while picking; finishing
+  (🎯/Esc/cap) detaches and clears it.
 - **One debugger slot per tab:** if DevTools (or another debugger) is attached, `attach` fails. The
   background reports `sw-picker-error`, the panel surfaces it (`panel.notify`, red row), and it
   **stays in debugger mode** — close DevTools and click 🎯 again (no auto-fallback to the content-script

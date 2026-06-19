@@ -69,13 +69,13 @@ async function reconcile() {
 chrome.runtime.onStartup.addListener(reconcile);
 chrome.runtime.onInstalled.addListener(reconcile);
 
-// --- Opt-in CDP element picker (§8.x) --------------------------------------------------------------
+// --- Opt-in CDP element picker (§8.5) --------------------------------------------------------------
 // The alternative picker, used only by origins that opt into `debuggerPicker`. Driven via
 // chrome.debugger / the Chrome DevTools Protocol — NOT a content script. The native inspector overlay
 // (Overlay.setInspectMode) is browser-drawn, descends into iframes (cross-origin included), and is
 // reached only through chrome.debugger, which lives in the worker. The `debugger` permission is
-// optional (manifest "optional_permissions"); options.js requests it on the enable click, so attach
-// fails cleanly via reportError if it was never granted.
+// REQUIRED in the manifest (Chrome forbids `debugger` as optional), so chrome.debugger is always
+// available here — but it still only attaches when the user arms the picker on a debuggerPicker origin.
 //
 // Promise wrappers around the callback-style debugger API (works on every Chrome that ships it).
 function dbgAttach(target, version) {
@@ -143,15 +143,6 @@ async function installEscape(target) {
 
 async function startPicker(tabId) {
   if (tabId == null) { reportState(false); return; }
-  // `debugger` is optional (manifest "optional_permissions"): until it's granted the whole
-  // chrome.debugger namespace is undefined. options.js requests it on the enable click, so reaching
-  // here without it means the user hasn't opted this origin in (or revoked it) — say so, don't crash.
-  if (!chrome.debugger) {
-    reportError('Enable the "debugger picker" for this origin in Slide Write’s options (it needs the optional "debugger" permission).');
-    reportState(false);
-    return;
-  }
-  bindDebuggerListeners();
   if (picker && picker.tabId === tabId) { reportState(true); return; }  // already armed here
   if (picker) await stopPicker();                                       // armed elsewhere → move
 
@@ -188,10 +179,10 @@ async function stopPicker() {
   await dbgDetach(target);
 }
 
-// Auto-copy the picked element's full selector to the clipboard. This restores the old Shift+click
-// "copy full path" affordance, which the CDP picker can't replicate the same way: the inspect event
-// (Overlay.inspectNodeRequested) carries no modifier state, so there's no Shift to key off — every
-// pick copies instead. Runs in the page's top frame with userGesture:true to synthesize the
+// Auto-copy the picked element's full selector to the clipboard — same "copy full path" affordance
+// the §8.3 content-script picker does (both copy on every pick). The inspect event
+// (Overlay.inspectNodeRequested) carries no modifier state, so there's nothing to gate on anyway.
+// Runs in the page's top frame with userGesture:true to synthesize the
 // transient activation the async Clipboard API requires; the app tab is focused (the user just
 // clicked it), so writeText resolves. Best-effort: a missing clipboard permission / unfocused doc is
 // swallowed (the pick still flows to the panel regardless).
@@ -250,40 +241,24 @@ async function handlePick(backendNodeId) {
   else await armInspect(target).catch(async () => { await stopPicker(); reportState(false); });
 }
 
-function onDebuggerEvent(source, method, params) {
+chrome.debugger.onEvent.addListener((source, method, params) => {
   if (!picker || source.tabId !== picker.tabId) return;
   if (method === "Overlay.inspectNodeRequested") {
     handlePick(params.backendNodeId);
   } else if (method === "Runtime.bindingCalled" && params && params.name === CANCEL_BINDING) {
     stopPicker().then(() => reportState(false));   // Escape
   }
-}
-// User clicked "Cancel" on the debug banner, or DevTools opened mid-pick → reset so the 🎯 un-sticks.
-function onDebuggerDetach(source) {
-  if (picker && source.tabId === picker.tabId) { picker = null; reportState(false); }
-}
+});
 
-// Bind the chrome.debugger event listeners exactly once — but only when the namespace EXISTS. Because
-// `debugger` is an optional permission, chrome.debugger is undefined until the user opts an origin in;
-// touching it at load would throw and take the whole worker (config store included) down. So bind on
-// worker load IF already granted (covers restarts after a prior grant), again when the permission is
-// granted mid-session (permissions.onAdded), and defensively at startPicker time.
-let dbgListenersBound = false;
-function bindDebuggerListeners() {
-  if (dbgListenersBound || !chrome.debugger) return;
-  dbgListenersBound = true;
-  chrome.debugger.onEvent.addListener(onDebuggerEvent);
-  chrome.debugger.onDetach.addListener(onDebuggerDetach);
-}
-bindDebuggerListeners();
-chrome.permissions.onAdded.addListener((p) => {
-  if (p && Array.isArray(p.permissions) && p.permissions.includes("debugger")) bindDebuggerListeners();
+// User clicked "Cancel" on the debug banner, or DevTools opened mid-pick → reset so the 🎯 un-sticks.
+chrome.debugger.onDetach.addListener((source) => {
+  if (picker && source.tabId === picker.tabId) { picker = null; reportState(false); }
 });
 
 // Message API. Config shape:
 //   { geminiKey?, pollInterval?, origins: { "<origin>": { enabled, token, shimUrl?, autoReload?, autoCommit?, model?, imageInstructions?, debuggerPicker? } } }
 // `debuggerPicker` (default false) opts the origin into the chrome.debugger picker instead of the
-// content-script one; it needs the optional `debugger` permission (requested by options.js on enable).
+// content-script one (the `debugger` permission is declared required in the manifest — see §8.5).
 // `autoCommit` defaults to true when absent (only an explicit false disables the shim's per-run commit).
 // `geminiKey` and `pollInterval` (seconds; liveness-poll cadence while the panel is open) are global;
 // everything else is per-origin.

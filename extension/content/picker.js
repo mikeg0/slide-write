@@ -40,9 +40,10 @@ function buildDomPath(el) {
   return parts.join(" > ");
 }
 
-// Build the FULL root-to-element selector for Shift+click copy: unlike buildDomPath this is uncapped
-// and never stops at an id — it walks all the way up to (and including) <body>, keeping every class
-// and an nth-of-type disambiguator, so the result resolves uniquely via document.querySelector.
+// Build the FULL root-to-element selector for the auto-copy-to-clipboard target: unlike buildDomPath
+// this is uncapped and never stops at an id — it walks all the way up to (and including) <body>,
+// keeping every class and an nth-of-type disambiguator, so the result resolves uniquely via
+// document.querySelector.
 function buildFullPath(el) {
   const parts = [];
   let n = el;
@@ -155,7 +156,7 @@ export function startPicker(onPick, { captureImage = false } = {}) {
 
   function hideHighlight() { box.style.display = "none"; label.style.display = "none"; }
 
-  // Transient "✓ Path copied" confirmation after a Shift+click copy. Reuses the highlight label;
+  // Transient "✓ Path copied" confirmation after the auto-copy on a pick. Reuses the highlight label;
   // safe to call after hideHighlight() because onMove is suspended (paused) until the pick finishes.
   function flashCopied(e) {
     label.textContent = "✓ Path copied";
@@ -189,12 +190,11 @@ export function startPicker(onPick, { captureImage = false } = {}) {
     const hit = skipOwnUI(document.elementFromPoint(e.clientX, e.clientY)) || current;
     if (!hit) return;                 // our own UI / nothing pickable — let the click through, stay armed
     suppress(e);
-    const shiftCopy = e.shiftKey;
-    if (shiftCopy) copyToClipboard(buildFullPath(hit));   // additive: still does the normal pick below
+    copyToClipboard(buildFullPath(hit));   // auto-copy the full selector on EVERY pick (parity with the §8.5 CDP picker)
     // STAY ARMED: hide the highlight before handing off (so the consumer's screenshot is clean) and
     // pause until the (possibly async) consumer finishes, then re-arm on the next mousemove.
     paused = true; current = null; hideHighlight();
-    if (shiftCopy) flashCopied(e);   // after hideHighlight() so it isn't immediately re-hidden
+    flashCopied(e);   // after hideHighlight() so it isn't immediately re-hidden
     Promise.resolve(onPick(captureContext(hit, captureImage))).finally(() => { paused = false; });
   }
 
