@@ -19,6 +19,7 @@ function resolve(c, origin) {
     geminiKey: (c && c.geminiKey) || "",
     pollInterval: (c && c.pollInterval) || 0,
     imageInstructions: (c && c.imageInstructions) || "",
+    debuggerPicker: !!(c && c.debuggerPicker),  // opt-in: route the picker through chrome.debugger
   };
 }
 // Same contract as inject.js's probe: { state:"live", meta } · "unauthorized" · "unreachable" · null.
@@ -57,12 +58,21 @@ let pickerArmed = false;
 let syncing = false;
 
 // --- Element picker bridge -------------------------------------------------------------------------
-// The 🎯 button calls onMarkup → we toggle the picker in the active tab's content script. The content
-// script reports armed/disarmed via "sw-picker-state" (covers Escape + the element-cap auto-disarm),
-// and posts each pick back via "sw-element-picked".
+// The 🎯 button calls onMarkup → we toggle the picker. Two backends coexist, selected per origin:
+//   • content-script (default): toggle the active tab's content script (sw-arm/disarm-picker).
+//   • chrome.debugger (opt-in `debuggerPicker`): toggle the CDP picker in the background worker
+//     (sw-picker-start/stop). The background also surfaces attach failures via "sw-picker-error".
+// Either backend reports armed/disarmed via "sw-picker-state" (covers Escape + the element-cap
+// auto-disarm) and posts each pick back via "sw-element-picked", so the UI handling is shared.
 async function togglePicker() {
   if (activeTabId == null) return;
   const tabId = activeTabId;
+  // Debugger-picker mode: the worker owns the picker — no content script, no on-demand injection.
+  if (liveCfg && liveCfg.debuggerPicker) {
+    chrome.runtime.sendMessage({ type: pickerArmed ? "sw-picker-stop" : "sw-picker-start", tabId })
+      .catch(() => { pickerArmed = false; panel && panel.setMarkupActive(false); });
+    return;
+  }
   const type = pickerArmed ? "sw-disarm-picker" : "sw-arm-picker";
   try {
     await chrome.tabs.sendMessage(tabId, { type });
@@ -90,32 +100,46 @@ async function ensurePickerInjected(tabId) {
     return false;
   }
 }
+// Disarm whichever picker backend is armed on a tab, clearing the 🎯 button optimistically. Sending
+// to BOTH backends is safe — each is a no-op when its mode isn't the active one (no content script
+// listening / no CDP attach on that tab) — so callers needn't know the current mode. The backend's
+// authoritative "sw-picker-state(false)" follows and confirms it.
+function disarmPicker(tabId = activeTabId) {
+  pickerArmed = false;
+  panel && panel.setMarkupActive(false);
+  if (tabId == null) return;
+  chrome.tabs.sendMessage(tabId, { type: "sw-disarm-picker" }).catch(() => {});      // content-script
+  chrome.runtime.sendMessage({ type: "sw-picker-stop", tabId }).catch(() => {});     // chrome.debugger
+}
 chrome.runtime.onMessage.addListener((msg, sender) => {
   if (!msg || !panel) return;
-  // Only trust picker traffic from the tab we're currently bound to.
+  // Only trust picker traffic from the tab we're currently bound to. CDP-picker messages come from
+  // the background worker (no sender.tab), so they pass this guard — the worker is authoritative there.
   if (sender.tab && sender.tab.id !== activeTabId) return;
   if (msg.type === "sw-picker-state") {
-    // The content script's reported state is authoritative — it echoes on every arm/disarm (even
-    // no-ops) and on fresh load, so this is how the 🎯 button stays in sync through drift + reloads.
+    // The backend's reported state is authoritative — content-script echoes on every arm/disarm (even
+    // no-ops) and on fresh load; the CDP picker reports on arm/stop/detach — so this keeps the 🎯
+    // button in sync through drift, reloads, and the element-cap auto-disarm.
     pickerArmed = !!msg.active;
     panel.setMarkupActive(pickerArmed);
+  } else if (msg.type === "sw-picker-error") {
+    // CDP picker couldn't attach (DevTools open, a restricted page, or the debugger permission was
+    // never granted) — surface it in the transcript; the backend also reports state false.
+    panel.notify(msg.message, { error: true });
   } else if (msg.type === "sw-element-picked") {
     const more = panel.addElementContext(msg.ctx);
     panel.open();
-    if (!more && activeTabId != null) chrome.tabs.sendMessage(activeTabId, { type: "sw-disarm-picker" }).catch(() => {});
+    if (!more) disarmPicker();
   }
 });
 
 // Esc disarms the picker even when keyboard focus is in the side panel. The page-side Escape handler
-// (picker.js) only fires when the app tab itself has focus, but the picker is armed by clicking the
-// 🎯 button HERE, so focus usually stays in the panel until the user clicks into the page. This
-// covers that gap. Only acts while armed, so it never steals Esc from menus/other panel UI.
+// (picker.js / the CDP binding) only fires when the app tab itself has focus, but the picker is armed
+// by clicking the 🎯 button HERE, so focus usually stays in the panel until the user clicks into the
+// page. This covers that gap. Only acts while armed, so it never steals Esc from menus/other panel UI.
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape" || !pickerArmed || activeTabId == null) return;
-  chrome.tabs.sendMessage(activeTabId, { type: "sw-disarm-picker" }).catch(() => {
-    pickerArmed = false;
-    panel && panel.setMarkupActive(false);
-  });
+  disarmPicker();
 });
 
 // --- Mount + tab-follow ----------------------------------------------------------------------------
@@ -156,15 +180,15 @@ async function syncActiveTab() {
     const newId = tab ? tab.id : null;
     const newOrigin = tab ? originOf(tab.url) : null;
     const newScreen = tab ? screenOf(tab.url) : "";
-    // Leaving a tab where the picker is still armed → disarm it there, and clear our local state so
-    // the 🎯 button doesn't carry the old tab's armed state onto the new tab.
+    // Leaving a tab where the picker is still armed → disarm it there (either backend), and clear our
+    // local state so the 🎯 button doesn't carry the old tab's armed state onto the new tab.
     if (newId !== activeTabId) {
-      if (pickerArmed && activeTabId != null)
-        chrome.tabs.sendMessage(activeTabId, { type: "sw-disarm-picker" }).catch(() => {});
+      if (pickerArmed) disarmPicker(activeTabId);
       pickerArmed = false;
       panel.setMarkupActive(false);
-      // Ask the tab we just bound to for its authoritative picker state (it echoes via
-      // sw-picker-state); harmless no-op if it has no content script.
+      // Ask the tab we just bound to for its authoritative content-script picker state (it echoes via
+      // sw-picker-state); harmless no-op if it has no content script. The CDP picker reports its own
+      // state on arm, so it needs no query here.
       if (newId != null) chrome.tabs.sendMessage(newId, { type: "sw-query-picker" }).catch(() => {});
     }
     activeTabId = newId;

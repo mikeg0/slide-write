@@ -21,7 +21,11 @@ capped at 5 on both sides, with the legacy single `element` still accepted), and
 (`shim/slide-write.py`, README §5.3: a stdlib-only Python 3.10+ port for hosts without Node — same
 flags/env/routes/contracts, drives the `claude` CLI headless via `-p --output-format stream-json`
 instead of the Agent SDK; `slide-write.mjs` is the reference implementation and the two must change
-together). README.md remains the authoritative spec — it inlines every
+together), and an **opt-in `chrome.debugger` picker** (README §8.5: the per-origin `debuggerPicker`
+checkbox routes the 🎯 button through the Chrome DevTools Protocol in `background.js` — now an ES
+module importing `content/capture.js` — instead of the content-script picker; gated by the optional
+`debugger` permission, it reaches cross-origin iframes, and both backends emit the identical §7
+contract so nothing downstream changes). README.md remains the authoritative spec — it inlines every
 contract and the load-bearing code verbatim (§5 shim, §8.2 SSE reader); treat those as authoritative
 and extend them in lockstep. The mechanical parts (UI rendering, helpers) may be implemented freely
 as long as they honor the contracts.
@@ -32,9 +36,11 @@ as long as they honor the contracts.
   target repo. Reuses `~/.claude` (no API key). Auto-commits only the files it edits (no push).
 - `extension/` — Manifest V3 browser extension; the universal, framework-agnostic UI. The **chat
   panel lives in the browser side panel** (`sidepanel.html`/`sidepanel.js`, an extension page that
-  persists while open); the **element picker stays a content script** in the page
-  (`content/inject.js`, a picker-only bridge). The two coordinate over runtime messaging. The side
-  panel talks HTTP+SSE to the shim at `http://localhost:<port>`.
+  persists while open); the **element picker defaults to a content script** in the page
+  (`content/inject.js`, a picker-only bridge), with an **opt-in `chrome.debugger` backend** (§8.5,
+  driven from `background.js` + `content/capture.js`) as the per-origin alternative. The two
+  coordinate over runtime messaging. The side panel talks HTTP+SSE to the shim at
+  `http://localhost:<port>`.
 
 **Transport = VS Code port forwarding.** The shim binds loopback on whatever machine the code lives
 on; VS Code forwards that port (and the app's dev port) to the UI machine's `localhost`. So local
@@ -73,12 +79,17 @@ the dev server hot-reloads.
   ["project"]`). Keep the shim's `PREAMBLE` generic — no project specifics here.
 - **The SSE event contract (README §6) and element-capture contract (README §7)** are the
   shim↔extension interface — change both sides together. New SSE `type`s are backward-compatible.
-- **The element picker listens on `window` in the capture phase** and tags its own UI with
-  `data-slidewrite-ui` — marking an element must never trigger the app's own handlers. Suppression
-  is per-target: clicks on `data-slidewrite-ui` nodes (the picker's highlight overlay) and bare
-  body/html pass through. The content script (`inject.js`) is a picker bridge only: it arms/disarms
-  on `sw-arm-picker`/`sw-disarm-picker` from the side panel, crops the element screenshot (needs the
-  page's window dims), and posts `sw-element-picked`/`sw-picker-state` back.
+- **The default content-script picker listens on `window` in the capture phase** and tags its own UI
+  with `data-slidewrite-ui` — marking an element must never trigger the app's own handlers.
+  Suppression is per-target: clicks on `data-slidewrite-ui` nodes (the picker's highlight overlay) and
+  bare body/html pass through. The content script (`inject.js`) is a picker bridge only: it
+  arms/disarms on `sw-arm-picker`/`sw-disarm-picker` from the side panel, crops the element screenshot
+  (needs the page's window dims), and posts `sw-element-picked`/`sw-picker-state` back. The opt-in
+  `chrome.debugger` backend (§8.5) bypasses all of this — it uses the browser's native inspector
+  overlay (no in-page UI, no window listener) and is armed via `sw-picker-start`/`sw-picker-stop` to
+  `background.js` — but it posts the **same** `sw-element-picked`/`sw-picker-state` (plus
+  `sw-picker-error`) and emits the same §7 contract, so the two backends are interchangeable to the
+  side panel and everything downstream.
 
 ## Build / run
 - Shim: `cd shim && npm install`, then

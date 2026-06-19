@@ -11,16 +11,25 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-// Non-localhost origins need a runtime-granted host permission (manifest grants localhost only).
-// Must be the FIRST await in a click handler — chrome.permissions.request needs the user gesture.
-// Match patterns can't carry a port, so the grant covers the whole host (like the localhost entry).
+// Request, in ONE chrome.permissions.request, everything an enabled origin needs:
+//   • the host permission for a non-localhost origin (content-script picker, §8.1 — manifest grants
+//     localhost only; match patterns can't carry a port, so the grant covers the whole host), and
+//   • the optional `debugger` permission when the origin opts into the chrome.debugger picker.
+// It MUST be the FIRST await in a click handler — chrome.permissions.request needs the user gesture,
+// and a single combined request keeps that gesture for both grants. Re-requesting an already-granted
+// permission is a silent no-op, so we never pre-check with contains() (that extra await would consume
+// the gesture).
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
-async function requestHost(origin) {
+async function requestGrants(origin, { enabled, dbg }) {
+  if (!enabled) return true;                       // nothing to pick on a disabled origin
+  const req = {};
   try {
     const u = new URL(origin);
-    if (LOCAL_HOSTS.has(u.hostname)) return true;
-    return await chrome.permissions.request({ origins: [`${u.protocol}//${u.hostname}/*`] });
-  } catch { return false; }
+    if (!LOCAL_HOSTS.has(u.hostname)) req.origins = [`${u.protocol}//${u.hostname}/*`];
+  } catch { /* non-URL origin → no host pattern */ }
+  if (dbg) req.permissions = ["debugger"];
+  if (!req.origins && !req.permissions) return true;  // localhost + content-script picker → nothing to ask
+  try { return await chrome.permissions.request(req); } catch { return false; }
 }
 
 async function render() {
@@ -42,6 +51,7 @@ async function render() {
         <label><input type="checkbox" class="en" ${c.enabled ? "checked" : ""}/> enabled</label>
         <label title="When on, reload the page after any run that changed a file — for apps without hot-reload"><input type="checkbox" class="ar" ${c.autoReload ? "checked" : ""}/> auto-reload on save</label>
         <label title="When off, runs leave their edits uncommitted in the repo's working tree"><input type="checkbox" class="ac" ${c.autoCommit !== false ? "checked" : ""}/> auto-commit</label>
+        <label title="Use the chrome.debugger inspector instead of the in-page picker — reaches cross-origin iframes and captures device-accurate screenshots; needs the debugger permission and can't run while DevTools is open on the tab"><input type="checkbox" class="dbg" ${c.debuggerPicker ? "checked" : ""}/> debugger picker</label>
         <button class="save primary">Save</button>
         <button class="del danger">Delete</button>
       </div>
@@ -53,13 +63,15 @@ async function render() {
       </div>`;
     row.querySelector(".save").addEventListener("click", async () => {
       const enabled = row.querySelector(".en").checked;
-      if (enabled && !(await requestHost(origin)))
+      const dbg = row.querySelector(".dbg").checked;
+      if (!(await requestGrants(origin, { enabled, dbg })))
         return flash(row.querySelector(".save"), "Permission denied");
       await send({ type: "setOrigin", origin, value: {
         name: row.querySelector(".name").value.trim(),
         enabled,
         autoReload: row.querySelector(".ar").checked,
         autoCommit: row.querySelector(".ac").checked,
+        debuggerPicker: dbg,
         token: row.querySelector(".tok").value.trim(),
         shimUrl: row.querySelector(".url").value.trim() || undefined,
         imageInstructions: row.querySelector(".imgsteps").value.trim(),
@@ -105,13 +117,15 @@ $("add").addEventListener("click", async () => {
   const origin = normOrigin($("a-origin").value);
   if (!origin) return;
   const enabled = $("a-enabled").checked;
-  if (enabled && !(await requestHost(origin)))
+  const dbg = $("a-dbg").checked;
+  if (!(await requestGrants(origin, { enabled, dbg })))
     return flash($("add"), "Permission denied");
   await send({ type: "setOrigin", origin, value: {
     name: $("a-name").value.trim(),
     enabled,
     autoReload: $("a-autoreload").checked,
     autoCommit: $("a-autocommit").checked,
+    debuggerPicker: dbg,
     token: $("a-token").value.trim(),
     shimUrl: $("a-url").value.trim() || undefined,
     imageInstructions: $("a-imgsteps").value.trim(),

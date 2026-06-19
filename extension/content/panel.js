@@ -943,6 +943,12 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, screen, o
     // Abort an in-flight run (e.g. when the active tab switches origins mid-run).
     cancel: () => { if (controller) controller.abort(); },
     addElementContext,
+    // Surface an out-of-band message (e.g. the CDP picker failing to attach) as a transcript row +
+    // status line. `error` styles it red. Used by sidepanel.js for "sw-picker-error".
+    notify(message, { error = false } = {}) {
+      addRow(el("div", { class: `dmsg-row ${error ? "dmsg-error" : ""}`, text: message }));
+      setStatus(message);
+    },
     // Reflect picker (markup) mode on the 🎯 button so it reads as toggled-on while picking.
     setMarkupActive(on) {
       markupBtn.classList.toggle("dmsg-iconbtn-active", on);

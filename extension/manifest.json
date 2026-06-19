@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Slide Write",
-  "version": "0.2.32",
+  "version": "0.2.33",
   "description": "Portable AI design assistant — click an element or type a request and an agent edits the running app's source live.",
   "icons": {
     "16": "icons/icon16.png",
@@ -10,9 +10,10 @@
     "128": "icons/icon128.png"
   },
   "permissions": ["storage", "activeTab", "scripting", "sidePanel", "tabs"],
+  "optional_permissions": ["debugger"],
   "host_permissions": ["<all_urls>"],
   "optional_host_permissions": ["https://*/*", "http://*/*"],
-  "background": { "service_worker": "background.js" },
+  "background": { "service_worker": "background.js", "type": "module" },
   "action": {
     "default_title": "Slide Write — open panel",
     "default_icon": {

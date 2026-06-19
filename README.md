@@ -671,7 +671,8 @@ The UI is split across two contexts that talk over runtime messaging:
   save calls `chrome.tabs.reload`, and ✕ closes the side panel (`window.close`).
 - **`content/sse.js`** — the SSE reader plus `fetchHistory`/`fetchHistoryDetail` JSON GET helpers.
 - **`background.js`** — owns `chrome.storage` config; serves get/set to side panel, options & popup;
-  performs `captureVisibleTab` on request; opens the side panel from the toolbar action / command.
+  performs `captureVisibleTab` on request; drives the opt-in `chrome.debugger` picker
+  ([§8.5](#85-opt-in-chromedebugger-picker)); opens the side panel from the toolbar action / command.
 - **`options.html/js`** — per-origin rows: `{ origin, enabled, token, shimUrl }`.
 - **`popup.html/js`** — quick enable/disable for an origin; show `/meta` confirmation.
 - **`styles.css`** — the side-panel document's styles (the panel fills the panel viewport).
@@ -680,6 +681,46 @@ The UI is split across two contexts that talk over runtime messaging:
 (`__reactFiber$…`) on the clicked node to recover the component name + `_debugSource` (file:line) in
 dev builds and post it alongside the DOM context — far more precise than class/`domPath` grepping for
 CSS-in-JS / hashed-class projects. Optional, framework-specific.
+
+### 8.5 Opt-in `chrome.debugger` picker
+
+A per-origin alternative to the [§8.3](#83-contentpickerjs--the-element-picker-capture-phase)
+content-script picker, off by default. Enable it with the **"debugger picker"** checkbox on the
+options page (per origin, stored as `origins[<origin>].debuggerPicker`). When on, the side panel
+routes the 🎯 button through `background.js` instead of the page: it sends `sw-picker-start` /
+`sw-picker-stop` to the background worker, which drives the **Chrome DevTools Protocol** via
+`chrome.debugger` — `Overlay.setInspectMode` for the highlight, `DOM.resolveNode` +
+`Runtime.callFunctionOn` to run `swCapture` (`content/capture.js`) in the picked node's own frame, and
+`Page.captureScreenshot` (clip) for the thumbnail. `background.js` is therefore an ES module
+(`"background.type": "module"`) so it can `import` `capture.js`.
+
+Why offer it:
+
+- **Reaches cross-origin iframes.** The native inspector overlay is browser-drawn and descends into
+  every frame, so you can pick elements the in-page content script can't see.
+- **Device-accurate screenshots.** `Page.captureScreenshot` clips to the node's box model — no
+  `devicePixelRatio` / viewport crop math, and it captures beyond the viewport.
+- **Auto-copies the CSS selector on every pick.** The inspect event carries no modifier state, so the
+  [§8.3](#83-contentpickerjs--the-element-picker-capture-phase) Shift+click affordance can't be
+  replicated — instead every pick copies the uncapped `fullPath` to the clipboard.
+
+Costs / behavior:
+
+- Needs the **optional `debugger` permission** (manifest `optional_permissions`). The options page
+  requests it on the enable click — bundled into the same `chrome.permissions.request` as the host
+  permission so one user gesture covers both. Chrome shows a **"Slide Write started debugging this
+  browser"** banner while picking; finishing (🎯/Esc/cap) detaches and clears it.
+- **One debugger slot per tab:** if DevTools (or another debugger) is attached, `attach` fails. The
+  background reports `sw-picker-error`, the panel surfaces it (`panel.notify`, red row), and it
+  **stays in debugger mode** — close DevTools and click 🎯 again (no auto-fallback to the content-script
+  picker).
+- **No content script / no [§8.1](#81-manifestjson) dynamic registration** is needed in this mode —
+  the worker reaches the page directly.
+
+Both backends post the same `sw-picker-state` / `sw-element-picked` messages and produce the **identical
+[§7](#7-the-element-capture-contract) element contract**, so the shim, the [§6](#6-the-sse-event-contract)
+SSE stream, and the composer are unaware of which picker was used (the Python shim is unaffected — the
+picker is extension-only).
 
 ---
 
