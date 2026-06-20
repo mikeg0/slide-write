@@ -160,6 +160,8 @@ def element_context(element):
         for k, v in {
             "tag": element.get("tag"), "id": element.get("id"), "class": element.get("className"),
             "text": element.get("text"), "domPath": element.get("domPath"), "rect": element.get("rect"),
+            # §7: authored CSS rules + source/line (CDP picker only)
+            "matchedStyles": element.get("matchedStyles"),
         }.items()
         if v
     }
@@ -190,7 +192,9 @@ def build_prompt(body, elements=(), shot_paths=()):
             parts.append(
                 f"\n[The user clicked this on-screen element{nth(i)} and is referring to it]\n"
                 + json.dumps(ctx, indent=2)
-                + "\nUse the class names / text / DOM path to locate the source and matching styles, then edit there."
+                + "\nUse the class names / text / DOM path to locate the source. When `matchedStyles` is "
+                + "present, each rule's `source`+`line` is the authored origin of those styles — prefer "
+                + "editing there (`source` is a dev-server URL; strip the origin/query to map it to a repo path)."
             )
         if i < len(shot_paths) and shot_paths[i]:
             # Pasted clipboard image (no DOM ctx): neutral wording — claude decides from the request

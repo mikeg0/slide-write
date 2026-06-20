@@ -112,6 +112,7 @@ function elementContext(element) {
   const ctx = Object.fromEntries(Object.entries({
     tag: element.tag, id: element.id, class: element.className,
     text: element.text, domPath: element.domPath, rect: element.rect,
+    matchedStyles: element.matchedStyles,   // §7: authored CSS rules + source/line (CDP picker only)
   }).filter(([, v]) => v));
   return Object.keys(ctx).length ? ctx : null;
 }
@@ -133,7 +134,9 @@ function buildPrompt({ prompt = "", screen }, elements = [], shotPaths = []) {
     if (ctx)
       parts.push(`\n[The user clicked this on-screen element${nth(i)} and is referring to it]\n` +
         JSON.stringify(ctx, null, 2) +
-        "\nUse the class names / text / DOM path to locate the source and matching styles, then edit there.");
+        "\nUse the class names / text / DOM path to locate the source. When `matchedStyles` is present, " +
+        "each rule's `source`+`line` is the authored origin of those styles — prefer editing there " +
+        "(`source` is a dev-server URL; strip the origin/query to map it to a repo path).");
     if (shotPaths[i]) {
       // Pasted clipboard image (no DOM ctx): neutral wording — claude decides from the request
       // whether it's a visual reference or an asset to place. Picked-element screenshots keep the

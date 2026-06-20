@@ -479,6 +479,12 @@ shim also still accepts the legacy single top-level `element`. Each entry:
   "text": "New",                    // textContent, trimmed, ≤120 chars
   "domPath": "div.topbar > button.btn.btn-primary",  // nth-of-type chain, ≤5 ancestors, stops at first id
   "rect": { "x": 1180, "y": 16, "w": 64, "h": 32 },
+  "matchedStyles": [                              // optional; CDP picker only (§8.5) — authored CSS that applies
+    { "selector": ".btn-primary",                //   winning rule first; user-agent/injected rules dropped
+      "source": "/src/components/Button.module.css",  // dev-server URL; strip origin/query → repo path
+      "line": 42,                                //   1-based, within `source`
+      "sourceMapURL": "Button.module.css.map",   //   optional; present for SCSS / extracted CSS-in-JS (unresolved)
+      "props": { "background-color": "#2563eb", "padding": "8px 16px" } } ],
   "imageDataUrl": "data:image/png;base64,…",      // optional; present only when the target is an <img>
   "screenshotDataUrl": "data:image/png;base64,…", // optional; a screenshot of the picked element
   "screenshotW": 64, "screenshotH": 32,           // UI-only (chip label); not forwarded to the shim
@@ -487,6 +493,19 @@ shim also still accepts the legacy single top-level `element`. Each entry:
 ```
 Centralized, semantic class names usually pinpoint the source; for CSS-in-JS / hashed classes, lean
 on `text` + `domPath` + `screen`, or add framework-fiber data ([§8.4](#84-the-widget-the-bridge--remaining-files)).
+
+`matchedStyles` is the strongest "which file/rule do I edit?" signal, and the one field **only the
+[§8.5](#85-opt-in-chromedebugger-picker) `chrome.debugger` picker can produce** — a content
+script has computed styles but not the matching *rule* with its stylesheet origin. While attached the
+background worker calls `CSS.getMatchedStylesForNode`, keeps only authored (`origin: "regular"`) rules
+plus any inline style, orders them winning-rule-first, and maps each rule's `styleSheetId` to its
+sheet header's `sourceURL` (+ the header's `startLine`, so inline `<style>` lines are correct). It's
+capped (≤12 rules, ≤24 props each) to keep the prompt sane, and best-effort — same-process iframes
+resolve, an OOPIF that won't simply omits the field. `source` is a dev-server URL (Vite/webpack add
+the origin and a `?t=` cache-buster); the shim's prompt tells `claude` to strip those to a repo path,
+and `sourceMapURL` is carried but **not yet resolved** (a follow-up could walk it shim-side to reach
+the original `.scss` / styled-component). The content-script picker omits `matchedStyles` entirely, so
+everything downstream treats it as optional.
 
 `screenshotDataUrl` is captured on **every** pick: Chrome has no "screenshot this element" API, so the
 background worker grabs the visible tab (`chrome.tabs.captureVisibleTab`) and the content script crops
@@ -691,8 +710,10 @@ options page (per origin, stored as `origins[<origin>].debuggerPicker`). When on
 routes the 🎯 button through `background.js` instead of the page: it sends `sw-picker-start` /
 `sw-picker-stop` to the background worker, which drives the **Chrome DevTools Protocol** via
 `chrome.debugger` — `Overlay.setInspectMode` for the highlight, `DOM.resolveNode` +
-`Runtime.callFunctionOn` to run `swCapture` (`content/capture.js`) in the picked node's own frame, and
-`Page.captureScreenshot` (clip) for the thumbnail. `background.js` is therefore an ES module
+`Runtime.callFunctionOn` to run `swCapture` (`content/capture.js`) in the picked node's own frame,
+`Page.captureScreenshot` (clip) for the thumbnail, and `CSS.getMatchedStylesForNode` (via `DOM.requestNode`,
+with sheet headers tracked from `CSS.styleSheetAdded`) for the [§7](#7-the-element-capture-contract)
+`matchedStyles`. `background.js` is therefore an ES module
 (`"background.type": "module"`) so it can `import` `capture.js`.
 
 Why offer it:
@@ -701,6 +722,10 @@ Why offer it:
   every frame, so you can pick elements the in-page content script can't see.
 - **Device-accurate screenshots.** `Page.captureScreenshot` clips to the node's box model — no
   `devicePixelRatio` / viewport crop math, and it captures beyond the viewport.
+- **Source-located CSS (`matchedStyles`).** Only this backend can hand `claude` the authored rules
+  that actually apply, each with its source file + line — the strongest pointer to *which* file/rule
+  to edit. A content script has computed styles but not the matching rule's stylesheet origin. See
+  [§7](#7-the-element-capture-contract).
 - **Auto-copies the CSS selector on every pick** — the uncapped `fullPath`, same as the
   [§8.3](#83-contentpickerjs--the-element-picker-capture-phase) content-script picker. (The inspect
   event carries no modifier state, so this backend never had a per-modifier variant to begin with.)

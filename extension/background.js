@@ -100,7 +100,8 @@ function dbgDetach(target) {
   });
 }
 
-let picker = null; // { tabId, count } while armed; null otherwise. One picker at a time.
+let picker = null; // { tabId, count, sheets } while armed; null otherwise. One picker at a time.
+                   // sheets: Map<styleSheetId, CSSStyleSheetHeader>, fed by CSS.styleSheetAdded.
 
 function reportState(active) { chrome.runtime.sendMessage({ type: "sw-picker-state", active }).catch(() => {}); }
 function reportError(message) { chrome.runtime.sendMessage({ type: "sw-picker-error", message }).catch(() => {}); }
@@ -154,9 +155,11 @@ async function startPicker(tabId) {
     reportState(false);
     return;
   }
-  picker = { tabId, count: 0 };
+  picker = { tabId, count: 0, sheets: new Map() };
   try {
     await dbgSend(target, "DOM.enable");
+    await dbgSend(target, "CSS.enable");                 // matched/computed styles + styleSheetAdded replay (§8.5 matched-styles)
+    await dbgSend(target, "DOM.getDocument", {});        // prime the frontend node tree so DOM.requestNode can map objectId→nodeId
     await dbgSend(target, "Overlay.enable");
     await dbgSend(target, "Page.enable");
     await dbgSend(target, "Runtime.enable");
@@ -211,6 +214,62 @@ async function captureNodeShot(target, backendNodeId) {
   return { dataUrl: "data:image/png;base64," + res.data, w: Math.round(w), h: Math.round(h) };
 }
 
+// Distill the AUTHORED CSS that actually applies to the picked node into a compact, source-located
+// list (§7 `matchedStyles`) — the strongest "which file/rule do I edit?" signal the contract can
+// carry, and the one thing the content-script picker can't get (it has computed styles, but not the
+// matching RULE + its stylesheet origin). getMatchedStylesForNode returns everything (user-agent,
+// inherited, every property); we keep REGULAR-origin rules + the inline style, map each rule's
+// styleSheetId to the sheet header's sourceURL (tracked from CSS.styleSheetAdded), and add the
+// header's startLine so the line is right for inline <style> blocks too. We reuse the objectId from
+// handlePick's resolveNode (bound to the node's own frame), so same-process iframes work; an OOPIF
+// that won't resolve just yields null. Best-effort throughout — any failure → null, pick still flows.
+const MAX_RULES = 12, MAX_PROPS = 24;
+async function collectMatchedStyles(target, objectId) {
+  const node = await dbgSend(target, "DOM.requestNode", { objectId }).catch(() => null);  // objectId → nodeId
+  const nodeId = node && node.nodeId;
+  if (!nodeId) return null;
+  const m = await dbgSend(target, "CSS.getMatchedStylesForNode", { nodeId }).catch(() => null);
+  if (!m) return null;
+
+  const sheets = picker ? picker.sheets : new Map();
+  const props = (style) => {
+    const out = {};
+    for (const p of (style && style.cssProperties) || []) {
+      if (p.disabled || !p.name || p.value == null) continue;
+      out[p.name] = p.value;
+      if (Object.keys(out).length >= MAX_PROPS) break;
+    }
+    return out;
+  };
+
+  const rules = [];
+  // CDP lists matchedCSSRules low→high specificity; reverse so the winning rule is first.
+  for (const rm of ((m.matchedCSSRules || []).slice().reverse())) {
+    const rule = rm && rm.rule;
+    if (!rule || rule.origin !== "regular") continue;            // drop user-agent / injected
+    const declared = props(rule.style);
+    if (!Object.keys(declared).length) continue;
+    const header = sheets.get(rule.styleSheetId);
+    const range = rule.style && rule.style.range;
+    rules.push({
+      selector: rule.selectorList ? rule.selectorList.text : null,
+      source: header ? (header.sourceURL || "<inline>") : null,
+      line: (range ? range.startLine : 0) + (header ? header.startLine : 0) + 1,  // 1-based
+      ...(header && header.sourceMapURL ? { sourceMapURL: header.sourceMapURL } : {}),
+      props: declared,
+    });
+    if (rules.length >= MAX_RULES) break;
+  }
+
+  const inlineProps = props(m.inlineStyle);
+  const inline = Object.keys(inlineProps).length
+    ? { selector: "element.style", source: "<inline>", props: inlineProps }
+    : null;
+
+  const all = inline ? [inline, ...rules] : rules;
+  return all.length ? all : null;
+}
+
 async function handlePick(backendNodeId) {
   if (!picker) return;
   const target = { tabId: picker.tabId };
@@ -225,6 +284,10 @@ async function handlePick(backendNodeId) {
         objectId, functionDeclaration: SW_CAPTURE_SRC, arguments: [{ value: true }], returnByValue: true,
       });
       ctx = r && r.result && r.result.value;
+      if (ctx) {
+        const styles = await collectMatchedStyles(target, objectId).catch(() => null);
+        if (styles) ctx.matchedStyles = styles;
+      }
     }
   } catch { /* capture failed — skip this pick, stay armed */ }
   if (!ctx) { if (picker) await armInspect(target).catch(() => {}); return; }
@@ -247,6 +310,12 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     handlePick(params.backendNodeId);
   } else if (method === "Runtime.bindingCalled" && params && params.name === CANCEL_BINDING) {
     stopPicker().then(() => reportState(false));   // Escape
+  } else if (method === "CSS.styleSheetAdded") {
+    // Track sheet headers so collectMatchedStyles can map a rule's styleSheetId → its source URL.
+    // CSS.enable replays these for existing sheets; HMR adds more live.
+    picker.sheets.set(params.header.styleSheetId, params.header);
+  } else if (method === "CSS.styleSheetRemoved") {
+    picker.sheets.delete(params.styleSheetId);
   }
 });
 
