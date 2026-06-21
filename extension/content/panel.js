@@ -226,7 +226,23 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, screen, o
   const textarea = el("textarea", {
     class: "dmsg-input", rows: "3",
     placeholder: "Describe what you want to create…",
-    onkeydown: (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); } },
+    // Enter sends; ⌘/Ctrl+Enter (and Shift+Enter) insert a newline. Skip while an IME is composing so
+    // Enter commits the candidate instead of sending. The default textarea newline only happens for
+    // keys we don't preventDefault, so ⌘/Ctrl+Enter must splice the "\n" in by hand.
+    onkeydown: (e) => {
+      if (e.key !== "Enter" || e.isComposing) return;
+      if (e.metaKey || e.ctrlKey) {
+        e.preventDefault();
+        const t = e.target, s = t.selectionStart, end = t.selectionEnd;
+        t.value = t.value.slice(0, s) + "\n" + t.value.slice(end);
+        t.selectionStart = t.selectionEnd = s + 1;
+        t.dispatchEvent(new Event("input", { bubbles: true }));
+        return;
+      }
+      if (e.shiftKey) return;   // Shift+Enter keeps the default newline
+      e.preventDefault();
+      send();
+    },
     // While a run is in flight the send button toggles between Cancel (empty box) and Queue (typed
     // text); keep it in sync as the user types.
     oninput: () => { if (busy) updateSendBtn(); },
@@ -255,7 +271,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, screen, o
 
   const sendIcon = el("span", { class: "dmsg-sendicon", text: "➤" });
   const sendLabel = el("span", { class: "dmsg-sendlabel", text: "Send" });
-  const sendBtn = el("button", { class: "dmsg-send", title: "Send (⌘/Ctrl+Enter)", onclick: () => send() }, [sendIcon, sendLabel]);
+  const sendBtn = el("button", { class: "dmsg-send", title: "Send (Enter)", onclick: () => send() }, [sendIcon, sendLabel]);
 
   // "+" composer menu — toggles per-message modes (currently Image Generation). Opens upward like
   // the model menu. The Image Generation item is a checkbox-style toggle: when on, the next send
@@ -627,7 +643,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, screen, o
     if (!busy) {
       sendLabel.textContent = "Send";
       sendIcon.textContent = "➤";
-      sendBtn.title = "Send (⌘/Ctrl+Enter)";
+      sendBtn.title = "Send (Enter)";
       sendBtn.classList.remove("dmsg-busy");
       return;
     }
@@ -635,7 +651,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, screen, o
     if (textarea.value.trim()) {
       sendLabel.textContent = "Queue";
       sendIcon.textContent = "＋";
-      sendBtn.title = "Queue this message to run when the current one finishes (⌘/Ctrl+Enter)";
+      sendBtn.title = "Queue this message to run when the current one finishes (Enter)";
     } else {
       sendLabel.textContent = "Cancel";
       sendIcon.textContent = "■";
@@ -658,7 +674,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, screen, o
     renderConn();
   }
 
-  // Press Send / ⌘-Enter. Idle → dispatch immediately. Busy → if there's a typed follow-up, queue
+  // Press Send / Enter. Idle → dispatch immediately. Busy → if there's a typed follow-up, queue
   // it (drained when the current run finishes); otherwise cancel the run (and drop any queue).
   function send() {
     if (!cfg.configured) return;

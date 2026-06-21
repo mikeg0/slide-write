@@ -681,7 +681,7 @@ The UI is split across two contexts that talk over runtime messaging:
   context back with `chrome.runtime.sendMessage({ type: "sw-element-picked", … })`.
 - **`content/panel.js`** — transcript + composer, now mounted into the side-panel document. Renders
   each [§6](#6-the-sse-event-contract) event as a row; **coalesce consecutive same-role streaming
-  deltas** into one bubble; tool/result rows break the chain. Footer textarea (⌘/Ctrl+Enter);
+  deltas** into one bubble; tool/result rows break the chain. Footer textarea (Enter sends, ⌘/Ctrl+Enter or Shift+Enter inserts a newline);
   `AbortController` cancels on close. The composer's toolbar row holds a model selector (populated
   from `/meta`, persisted per-origin) and the send button. A 🕘 header button opens a **history
   view**: `GET /history` lists this repo's past sessions; picking one calls `GET /history/<id>` and
