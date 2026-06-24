@@ -473,17 +473,31 @@ description: Save a generated/provided image into this app and reference it. Use
 Generated images go in `public/img/`, kebab-cased; reference them with a root-relative `/img/…` URL.
 ```
 
-**Chat history (read-only).** `claude` writes one `.jsonl` transcript per session under
-`~/.claude/projects/<encoded-cwd>/` (the cwd with every non-alphanumeric char turned into a single
-`-`; matched case-insensitively against the directory listing). Two GET routes, behind the same
-Bearer+CORS gate as `/meta`, expose the **current repo's** sessions:
+**Chat history (read-only).** History is **provider-scoped** — the routes read whichever backend's
+transcript store matches the request's `?provider=` (default `anthropic`), so the 🕘 view always
+shows the conversations from the provider currently selected on the options page:
 
-- `GET /history` → `{ sessions: [{ id, title, firstPrompt, startedAt, endedAt, branch, messageCount }] }`,
-  newest first. `title` is the session's `ai-title` if present, else its first user prompt. Missing
-  project folder → `{ sessions: [] }`.
-- `GET /history/<id>` → `{ id, events: [...] }`, where `events` reuses the §6 shapes above (plus the
-  `user` event) so the panel replays a past session through the same renderer. `id` must be a valid
-  session UUID (regex-validated + path-traversal-guarded); a bad/missing id → 404. Lifecycle events
+- **`anthropic`** — `claude` writes one `.jsonl` transcript per session under
+  `~/.claude/projects/<encoded-cwd>/` (the cwd with every non-alphanumeric char turned into a single
+  `-`; matched case-insensitively against the directory listing).
+- **`openai`** — `codex` writes one rollout transcript per session under
+  `<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` in one global tree (not partitioned by
+  repo), so the shim reads each rollout's `session_meta` line and keeps only those whose `cwd` is
+  this repo. The replayed events come from the rollout's `event_msg`/`response_item` records — a
+  different on-disk shape than `codex exec --json`'s live stream, but mapped onto the same §6 shapes
+  `streamCodex` emits (`tool`/`file_edit`, no `tool_result`, `result` = the last agent message). The
+  PREAMBLE the shim prepends to every codex prompt is stripped from titles and the replayed `user`
+  event so they show the actual request (parity with claude, whose PREAMBLE rides in `systemPrompt`).
+
+Two GET routes, behind the same Bearer+CORS gate as `/meta`, expose the **current repo's** sessions:
+
+- `GET /history[?provider=…]` → `{ sessions: [{ id, title, firstPrompt, startedAt, endedAt, branch, messageCount }] }`,
+  newest first. `title` is the session's `ai-title` if present (claude), else its first user prompt.
+  Missing store / no sessions for this repo → `{ sessions: [] }`.
+- `GET /history/<id>[?provider=…]` → `{ id, events: [...] }`, where `events` reuses the §6 shapes above
+  (plus the `user` event) so the panel replays a past session through the same renderer. `id` must be
+  a valid session UUID (regex-validated; the claude path is path-traversal-guarded, the codex path
+  re-checks the rollout's `cwd` against the repo); a bad/missing/foreign id → 404. Lifecycle events
   (`start`/`commit`/`done`) are not emitted for a replay.
 
 **Auto-commit opt-out (additive).** `/design` and `/generate-image` accept an optional top-level
@@ -700,13 +714,15 @@ export async function streamDesign(shimUrl, token, payload, onEvent, signal, pat
    **`stop()` function `startPicker` returns** — the bridge calls it when the side panel sends
    `sw-disarm-picker` (🎯 toggled off, or the 5-element cap reached). Build `domPath` as an
    `nth-of-type` chain of ≤5 ancestors, stopping at the first `id`.
-5. **Every pick copies the full target path** to the clipboard **in addition to** the normal pick —
+5. **Shift+click copies the full target path** to the clipboard **in addition to** the normal pick —
    the element is still captured into the chat context (parity with the [§8.5](#85-opt-in-chromedebugger-picker)
-   CDP picker, which also copies on every pick). Unlike `domPath`, this path is uncapped and never
-   stops at an `id`: it walks all the way up to `<body>`, keeping every class and an `nth-of-type`
-   disambiguator so the result resolves uniquely via `document.querySelector`. Uses
-   `navigator.clipboard.writeText` (inside the click gesture) with an `execCommand("copy")` fallback,
-   and shows a brief "✓ Path copied" confirmation.
+   CDP picker). The copy is gated on two things: the **global `copyPath` setting** (an options-page
+   checkbox, default ON; threaded through to the picker via the `sw-arm-picker` / `sw-picker-start`
+   messages) and the **Shift modifier** on the click. A plain click just picks for the chat. Unlike
+   `domPath`, this path is uncapped and never stops at an `id`: it walks all the way up to `<body>`,
+   keeping every class and an `nth-of-type` disambiguator so the result resolves uniquely via
+   `document.querySelector`. Uses `navigator.clipboard.writeText` (inside the click gesture) with an
+   `execCommand("copy")` fallback, and shows a brief "✓ Path copied" confirmation.
 
 ### 8.4 The widget, the bridge & remaining files
 
@@ -731,12 +747,14 @@ The UI is split across two contexts that talk over runtime messaging:
   deltas** into one bubble; tool/result rows break the chain. Footer textarea (Enter sends, ⌘/Ctrl+Enter or Shift+Enter inserts a newline);
   `AbortController` cancels on close. The composer's toolbar row holds a model selector (populated
   from `/meta`, persisted per-origin) and the send button. A 🕘 header button opens a **history
-  view**: `GET /history` lists this repo's past sessions; picking one calls `GET /history/<id>` and
+  view**: `GET /history?provider=<selected>` lists this repo's past sessions for the chosen provider;
+  picking one calls `GET /history/<id>?provider=<selected>` and
   **replays it read-only** through the same `onEvent` renderer. A **↻ Resume** action threads
   subsequent sends into that session via the `/design` `resume` field. Page-bound actions are
   injected as callbacks by `sidepanel.js`: `screen` comes from the active tab's URL, auto-reload-on-
   save calls `chrome.tabs.reload`, and ✕ closes the side panel (`window.close`).
-- **`content/sse.js`** — the SSE reader plus `fetchHistory`/`fetchHistoryDetail` JSON GET helpers.
+- **`content/sse.js`** — the SSE reader plus `fetchHistory`/`fetchHistoryDetail` JSON GET helpers
+  (both pass the per-origin provider as `?provider=` so history matches the selected backend).
 - **`background.js`** — owns `chrome.storage` config; serves get/set to side panel, options & popup;
   performs `captureVisibleTab` on request; drives the opt-in `chrome.debugger` picker
   ([§8.5](#85-opt-in-chromedebugger-picker)); opens the side panel from the toolbar action / command.
@@ -773,9 +791,11 @@ Why offer it:
   that actually apply, each with its source file + line — the strongest pointer to *which* file/rule
   to edit. A content script has computed styles but not the matching rule's stylesheet origin. See
   [§7](#7-the-element-capture-contract).
-- **Auto-copies the CSS selector on every pick** — the uncapped `fullPath`, same as the
-  [§8.3](#83-contentpickerjs--the-element-picker-capture-phase) content-script picker. (The inspect
-  event carries no modifier state, so this backend never had a per-modifier variant to begin with.)
+- **Copies the CSS selector on Shift+click** — the uncapped `fullPath`, same as the
+  [§8.3](#83-contentpickerjs--the-element-picker-capture-phase) content-script picker, gated on the
+  global `copyPath` setting. The inspect event (`Overlay.inspectNodeRequested`) carries no modifier
+  state, so the picker mirrors the page's live Shift state into a `window.__swShift` global (set by a
+  capture-phase keydown/keyup listener installed alongside the Escape hook) and reads it at pick time.
 
 Costs / behavior:
 
@@ -838,9 +858,12 @@ The shim runs **arbitrary code edits + shell** in a repo as you. Defenses:
   prompt-injection exfiltration.
 - **Prompt injection.** A malicious string in the repo could steer `claude`; the working-directory
   boundary (`cwd: REPO`) is the main mitigation. For higher assurance, run against a throwaway `git worktree`.
-- **History is read-only and repo-scoped.** `/history*` only read `~/.claude/projects/<this repo>/`;
-  the session `id` is UUID-validated and path-traversal-guarded before any file read, so the route
-  can't be coerced into reading other projects or arbitrary files. Same Bearer+CORS gate as `/meta`.
+- **History is read-only and repo-scoped.** `/history*` only read the selected provider's transcript
+  store for **this repo** — claude's `~/.claude/projects/<this repo>/` (anthropic) or codex's rollout
+  tree filtered to `session_meta.cwd === <this repo>` (openai). The session `id` is UUID-validated
+  before any file read; the claude path is additionally path-traversal-guarded, and the codex path
+  re-checks `cwd` against the repo before replaying so it can't be coerced into reading another
+  project's session. Same Bearer+CORS gate as `/meta`.
 
 Single-developer, trusted-local only. Not multi-tenant or public.
 

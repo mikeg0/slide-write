@@ -5,7 +5,7 @@
 import http from "node:http";
 import os from "node:os";
 import { execFile, spawn } from "node:child_process";
-import { readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { open, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { query } from "@anthropic-ai/claude-agent-sdk";
@@ -372,6 +372,131 @@ async function readHistory(repo, id) {
   return { id, events };
 }
 
+// --- Codex (OpenAI) chat history (read-only) -------------------------------------------------
+// codex writes one rollout transcript per session under <CODEX_HOME>/sessions/YYYY/MM/DD/
+// rollout-<ts>-<uuid>.jsonl. Unlike claude's per-repo folders these all live in one global tree, so
+// we read each file's `session_meta` line to filter by cwd === repo. The replayed events come from
+// the rollout's `event_msg`/`response_item` records (a different shape than `codex exec --json`'s
+// live stream, but mapped onto the same §6 SSE shapes streamCodex emits — `tool`/`file_edit`, no
+// `tool_result`, result = last agent message). So `provider:"openai"` history is the codex parallel
+// to the claude `~/.claude/projects` history above; the route picks one by the request's provider.
+const codexSessionsDir = () => join(codexHome(), "sessions");
+const ROLLOUT_RE = /^rollout-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-([0-9a-fA-F-]{36})\.jsonl$/;
+
+// Strip the generic PREAMBLE we prepend to every codex prompt so titles + the replayed user event
+// show the actual request (matches claude, whose PREAMBLE rides in systemPrompt, not the message).
+function stripPreamble(text) {
+  let t = String(text || "");
+  if (t.startsWith(PREAMBLE)) t = t.slice(PREAMBLE.length);
+  return t.trim();
+}
+
+// Read the first `bytes` of a file as utf8. codex's session_meta line carries the whole system
+// prompt (~19KB), but `cwd` sits in its first few hundred bytes — enough to pre-filter by repo
+// without fully loading the (often multi-hundred-KB) rollouts that belong to other repos.
+async function readHead(file, bytes = 4096) {
+  let fh;
+  try {
+    fh = await open(file, "r");
+    const buf = Buffer.alloc(bytes);
+    const { bytesRead } = await fh.read(buf, 0, bytes, 0);
+    return buf.toString("utf8", 0, bytesRead);
+  } catch { return ""; }
+  finally { try { await fh?.close(); } catch {} }
+}
+
+// Walk the codex sessions tree, newest first by the filename's timestamp, yielding {file,id,startedAt}.
+async function codexRollouts() {
+  let entries;
+  try { entries = await readdir(codexSessionsDir(), { recursive: true, withFileTypes: true }); }
+  catch { return []; }                              // <CODEX_HOME>/sessions missing
+  const out = [];
+  for (const e of entries) {
+    if (!e.isFile()) continue;
+    const m = ROLLOUT_RE.exec(e.name);
+    if (!m) continue;
+    const [, Y, Mo, D, h, mi, s, id] = m;
+    out.push({ file: join(e.parentPath || e.path, e.name), id,
+      startedAt: `${Y}-${Mo}-${D}T${h}:${mi}:${s}` });
+  }
+  out.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+  return out;
+}
+
+// The actual user request out of a codex user_message: drop the PREAMBLE, then keep only the text
+// before the first `\n[…]` context marker buildPrompt appends (screen/element/screenshot lines).
+const codexRequest = (text) => stripPreamble(text).split("\n[")[0].trim() || stripPreamble(text);
+
+// List this repo's codex sessions, newest first (parallel to listHistory for the claude path).
+async function listCodexHistory(repo) {
+  const sessions = [];
+  for (const { file, id, startedAt } of await codexRollouts()) {
+    const head = await readHead(file);
+    const m = /"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(head);   // cwd lives near the start of session_meta
+    if (!m) continue;
+    let cwd; try { cwd = JSON.parse(`"${m[1]}"`); } catch { cwd = m[1]; }
+    if (resolve(cwd) !== repo) continue;                      // global tree → keep only this repo's sessions
+    let lines;
+    try { lines = (await readFile(file, "utf8")).split("\n").filter(Boolean); }
+    catch { continue; }
+    let started = startedAt, endedAt = startedAt, firstPrompt = "", messageCount = 0;
+    for (const line of lines) {
+      let rec; try { rec = JSON.parse(line); } catch { continue; }
+      if (rec.timestamp) { if (rec.type === "session_meta") started = rec.timestamp; endedAt = rec.timestamp; }
+      const p = rec.payload || {};
+      if (rec.type === "event_msg" && p.type === "user_message") {
+        const t = codexRequest(p.message);
+        if (t) firstPrompt ||= t;
+        messageCount++;
+      } else if (rec.type === "event_msg" && p.type === "agent_message") messageCount++;
+    }
+    sessions.push({ id, title: (firstPrompt || "(untitled)").slice(0, 80),
+      firstPrompt: firstPrompt.slice(0, 140), startedAt: started, endedAt, branch: "", messageCount });
+  }
+  return sessions;   // codexRollouts() already ordered newest-first by timestamp
+}
+
+// Parse one codex rollout into render-ready §6 events (parallel to readHistory). Returns null for a
+// bad id, a session that isn't in this repo, or a missing file.
+async function readCodexHistory(repo, id) {
+  if (!validSessionId(id)) return null;
+  const hit = (await codexRollouts()).find((r) => r.id.toLowerCase() === id.toLowerCase());
+  if (!hit) return null;
+  let lines;
+  try { lines = (await readFile(hit.file, "utf8")).split("\n").filter(Boolean); }
+  catch { return null; }
+  let meta; try { meta = JSON.parse(lines[0]); } catch { return null; }
+  const cwd = meta?.payload?.cwd;
+  if (!cwd || resolve(cwd) !== repo) return null;             // don't replay another repo's transcript
+  const events = [];
+  let lastAgent = null, hadError = false;
+  for (const line of lines) {
+    let rec; try { rec = JSON.parse(line); } catch { continue; }
+    const p = rec.payload || {};
+    if (rec.type === "event_msg" && p.type === "user_message") {
+      const t = stripPreamble(p.message);
+      if (t) events.push({ type: "user", text: t });
+    } else if (rec.type === "event_msg" && p.type === "agent_message") {
+      if (p.message) { lastAgent = p.message; events.push({ type: "delta", text: p.message }); }
+    } else if (rec.type === "event_msg" && p.type === "patch_apply_end") {
+      for (const path of Object.keys(p.changes || {}))
+        events.push({ type: "file_edit", tool: "codex", path: relPath(repo, path), id: p.call_id });
+    } else if (rec.type === "event_msg" && (p.type === "error" || p.type === "stream_error")) {
+      hadError = true;
+    } else if (rec.type === "response_item" && p.type === "reasoning") {
+      for (const s of p.summary || []) if (s?.text) events.push({ type: "thinking_delta", text: s.text });
+    } else if (rec.type === "response_item" && p.type === "function_call") {
+      let args = {}; try { args = JSON.parse(p.arguments || "{}"); } catch {}
+      const detail = args.cmd || args.path || (p.arguments && p.arguments !== "{}" ? p.arguments.slice(0, 200) : "");
+      events.push({ type: "tool", tool: p.name === "exec_command" ? "codex_exec" : p.name || "tool",
+        detail, id: p.call_id });
+    }
+  }
+  events.push({ type: "result", isError: hadError, numTurns: null, durationMs: null,
+    totalCostUsd: null, usage: null, result: lastAgent });
+  return { id, events };
+}
+
 // Generate (or edit) an image with Gemini "nano banana" via the Generative Language REST API.
 // Generic — knows nothing about the target repo. The key goes in a header (never the URL, so it
 // can't leak into request logs); `image` (optional, {mimeType,data}) makes it image-to-image.
@@ -674,11 +799,15 @@ function serve() {
         providers: await providers(), defaultProvider: "anthropic",
         geminiModel: GEMINI_MODEL, geminiEnv: !!GEMINI_KEY,  // geminiEnv: shim has a server-side key fallback
       });
+    // History is provider-scoped: the openai provider reads codex's rollout tree, everything else
+    // (anthropic/absent) reads claude's ~/.claude/projects transcripts. The extension sends the
+    // per-origin provider as a `?provider=` query param so the 🕘 view shows the right backend.
+    const histProvider = new URL(req.url, "http://x").searchParams.get("provider") || "anthropic";
     if (path === "/history" && req.method === "GET")
-      return json(res, 200, { sessions: await listHistory(repo) });
+      return json(res, 200, { sessions: histProvider === "openai" ? await listCodexHistory(repo) : await listHistory(repo) });
     if (path.startsWith("/history/") && req.method === "GET") {
       const id = decodeURIComponent(path.slice("/history/".length));
-      const data = await readHistory(repo, id);
+      const data = histProvider === "openai" ? await readCodexHistory(repo, id) : await readHistory(repo, id);
       return data ? json(res, 200, data) : json(res, 404, { error: "not found" });
     }
     if (path === "/design" && req.method === "POST") return streamRun(req, res, runDesign);

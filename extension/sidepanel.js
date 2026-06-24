@@ -21,6 +21,7 @@ function resolve(c, origin) {
     pollInterval: (c && c.pollInterval) || 0,
     imageInstructions: (c && c.imageInstructions) || "",
     debuggerPicker: !!(c && c.debuggerPicker),  // opt-in: route the picker through chrome.debugger
+    copyPath: !(c && c.copyPath === false),     // global, default ON: Shift+click copies the element's selector
   };
 }
 // Same contract as inject.js's probe: { state:"live", meta } · "unauthorized" · "unreachable" · null.
@@ -69,14 +70,15 @@ async function togglePicker() {
   if (activeTabId == null) return;
   const tabId = activeTabId;
   // Debugger-picker mode: the worker owns the picker — no content script, no on-demand injection.
+  const copyPath = !!(liveCfg && liveCfg.copyPath);   // global setting → both picker backends gate Shift+click copy on it
   if (liveCfg && liveCfg.debuggerPicker) {
-    chrome.runtime.sendMessage({ type: pickerArmed ? "sw-picker-stop" : "sw-picker-start", tabId })
+    chrome.runtime.sendMessage({ type: pickerArmed ? "sw-picker-stop" : "sw-picker-start", tabId, copyPath })
       .catch(() => { pickerArmed = false; panel && panel.setMarkupActive(false); });
     return;
   }
   const type = pickerArmed ? "sw-disarm-picker" : "sw-arm-picker";
   try {
-    await chrome.tabs.sendMessage(tabId, { type });
+    await chrome.tabs.sendMessage(tabId, { type, copyPath });
   } catch {
     // No receiving end → the picker bridge isn't in this tab. When DISARMING there's nothing to do,
     // so just clear the button. When ARMING, the tab is likely STALE (loaded before the extension
@@ -84,7 +86,7 @@ async function togglePicker() {
     // bridge on demand, then retry once. The bridge guards against double-injection itself.
     if (pickerArmed) { pickerArmed = false; panel && panel.setMarkupActive(false); return; }
     if (!(await ensurePickerInjected(tabId))) { panel && panel.setMarkupActive(false); return; }
-    try { await chrome.tabs.sendMessage(tabId, { type: "sw-arm-picker" }); }
+    try { await chrome.tabs.sendMessage(tabId, { type: "sw-arm-picker", copyPath }); }
     catch { panel && panel.setMarkupActive(false); }
   }
 }

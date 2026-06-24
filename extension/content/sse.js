@@ -24,15 +24,18 @@ export async function streamDesign(shimUrl, token, payload, onEvent, signal, pat
 }
 
 // Read-only history fetches (same Bearer gate as /design). `fetchHistory` lists the repo's sessions;
-// `fetchHistoryDetail` returns one session's normalized, render-ready event list (§6 shapes).
+// `fetchHistoryDetail` returns one session's normalized, render-ready event list (§6 shapes). Both
+// are provider-scoped: the shim reads the selected provider's transcript store (claude's
+// ~/.claude/projects vs codex's rollout tree), so the chosen provider rides along as `?provider=`.
 async function getJson(shimUrl, token, path) {
   const res = await fetch(`${shimUrl}${path}`, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) throw new Error(`${path} failed: ${res.status}`);
   return res.json();
 }
-export async function fetchHistory(shimUrl, token) {
-  return (await getJson(shimUrl, token, "/history")).sessions || [];
+const provQ = (provider) => (provider ? `?provider=${encodeURIComponent(provider)}` : "");
+export async function fetchHistory(shimUrl, token, provider) {
+  return (await getJson(shimUrl, token, `/history${provQ(provider)}`)).sessions || [];
 }
-export async function fetchHistoryDetail(shimUrl, token, id) {
-  return (await getJson(shimUrl, token, `/history/${encodeURIComponent(id)}`)).events || [];
+export async function fetchHistoryDetail(shimUrl, token, id, provider) {
+  return (await getJson(shimUrl, token, `/history/${encodeURIComponent(id)}${provQ(provider)}`)).events || [];
 }

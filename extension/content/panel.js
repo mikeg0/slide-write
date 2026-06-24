@@ -499,7 +499,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       cfg.conn = { state: p.state, detail: p.detail };
       if (p.meta) {
         cfg.meta = p.meta;
-        if (Array.isArray(p.meta.models) && p.meta.models.length) { models = p.meta.models; renderModels(); }
+        recomputeModels();  // provider-scoped: pulls from cfg.meta.providers for cfg.provider, not the legacy top-level list
       }
       if (historyView.hidden) renderConn();
     } finally { probing = false; }
@@ -892,7 +892,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     const note = el("div", { class: "dmsg-row dmsg-note", text: "Loading…" });
     historyView.append(note);
     try {
-      const sessions = await fetchHistory(cfg.shimUrl, cfg.token);
+      const sessions = await fetchHistory(cfg.shimUrl, cfg.token, cfg.provider);
       note.remove();
       if (!sessions.length) {
         historyView.append(el("div", { class: "dmsg-row dmsg-note", text: "No history for this repo yet." }));
@@ -935,7 +935,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     renderPlaceholder();
     target = body; breakChain();
     try {
-      const events = await fetchHistoryDetail(cfg.shimUrl, cfg.token, s.id);
+      const events = await fetchHistoryDetail(cfg.shimUrl, cfg.token, s.id, cfg.provider);
       note.remove();
       // Replayed `start` events advance resumeId to the session's latest fork.
       try { for (const ev of events) onEvent(ev); } finally { breakChain(); }

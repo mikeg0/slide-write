@@ -40,7 +40,7 @@ function buildDomPath(el) {
   return parts.join(" > ");
 }
 
-// Build the FULL root-to-element selector for the auto-copy-to-clipboard target: unlike buildDomPath
+// Build the FULL root-to-element selector for the Shift+click copy-to-clipboard target: unlike buildDomPath
 // this is uncapped and never stops at an id — it walks all the way up to (and including) <body>,
 // keeping every class and an nth-of-type disambiguator, so the result resolves uniquely via
 // document.querySelector.
@@ -121,7 +121,7 @@ function captureContext(el, captureImage) {
   return ctx;
 }
 
-export function startPicker(onPick, { captureImage = false } = {}) {
+export function startPicker(onPick, { captureImage = false, copyPath = false } = {}) {
   let current = null;
   let paused = false;   // highlight + picking suspended while the consumer handles a pick (screenshot)
   let done = false;
@@ -190,11 +190,15 @@ export function startPicker(onPick, { captureImage = false } = {}) {
     const hit = skipOwnUI(document.elementFromPoint(e.clientX, e.clientY)) || current;
     if (!hit) return;                 // our own UI / nothing pickable — let the click through, stay armed
     suppress(e);
-    copyToClipboard(buildFullPath(hit));   // auto-copy the full selector on EVERY pick (parity with the §8.5 CDP picker)
+    // Copy the full selector to the clipboard only on Shift+click, and only when the global
+    // "copy path" setting is on (parity with the §8.5 CDP picker). A plain click just picks for the
+    // chat. The async Clipboard API works because we're inside the user's click gesture.
+    const copied = copyPath && e.shiftKey;
+    if (copied) copyToClipboard(buildFullPath(hit));
     // STAY ARMED: hide the highlight before handing off (so the consumer's screenshot is clean) and
     // pause until the (possibly async) consumer finishes, then re-arm on the next mousemove.
     paused = true; current = null; hideHighlight();
-    flashCopied(e);   // after hideHighlight() so it isn't immediately re-hidden
+    if (copied) flashCopied(e);   // after hideHighlight() so it isn't immediately re-hidden
     Promise.resolve(onPick(captureContext(hit, captureImage))).finally(() => { paused = false; });
   }
 

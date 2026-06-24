@@ -131,18 +131,32 @@ const inspectConfig = {
 // pick (§7: consecutive picks up to the 5-element cap).
 const armInspect = (target) => dbgSend(target, "Overlay.setInspectMode", inspectConfig);
 
-// Escape-to-cancel without a content script: a CDP Runtime binding (a page global) plus a capture-
-// phase keydown listener installed via Runtime.evaluate. Pressing Esc in the page calls the binding,
-// which surfaces here as Runtime.bindingCalled. Best-effort per top frame; the 🎯 toggle always works.
-async function installEscape(target) {
+// Page-context hooks installed via Runtime.evaluate, both capture-phase keydown listeners on the top
+// frame (best-effort; the 🎯 toggle always works):
+//   • Escape-to-cancel — a CDP Runtime binding (a page global) the listener calls; pressing Esc
+//     surfaces here as Runtime.bindingCalled.
+//   • Shift tracking — the inspect event (Overlay.inspectNodeRequested) carries no modifier state, so
+//     to gate the clipboard copy on Shift+click we mirror the live Shift state into a page global
+//     (window.__swShift) and read it at pick time via shiftHeld().
+async function installPageHooks(target) {
   const expr =
-    "(()=>{if(window.__swEscInstalled)return;window.__swEscInstalled=true;" +
-    "window.addEventListener('keydown',function(e){if(e.key==='Escape'&&typeof " + CANCEL_BINDING +
-    "==='function'){try{" + CANCEL_BINDING + "('')}catch(_){}}},true);})()";
+    "(()=>{if(window.__swEscInstalled)return;window.__swEscInstalled=true;window.__swShift=false;" +
+    "window.addEventListener('keydown',function(e){" +
+    "if(e.key==='Shift')window.__swShift=true;" +
+    "if(e.key==='Escape'&&typeof " + CANCEL_BINDING + "==='function'){try{" + CANCEL_BINDING + "('')}catch(_){}}" +
+    "},true);" +
+    "window.addEventListener('keyup',function(e){if(e.key==='Shift')window.__swShift=false;},true);})()";
   await dbgSend(target, "Runtime.evaluate", { expression: expr }).catch(() => {});
 }
 
-async function startPicker(tabId) {
+// Read the page's live Shift state (window.__swShift, set by installPageHooks). Best-effort: any
+// failure → false, so a missed read just means no copy (a safe default — never clobbers the clipboard).
+async function shiftHeld(target) {
+  const r = await dbgSend(target, "Runtime.evaluate", { expression: "!!window.__swShift", returnByValue: true }).catch(() => null);
+  return !!(r && r.result && r.result.value);
+}
+
+async function startPicker(tabId, copyPath = false) {
   if (tabId == null) { reportState(false); return; }
   if (picker && picker.tabId === tabId) { reportState(true); return; }  // already armed here
   if (picker) await stopPicker();                                       // armed elsewhere → move
@@ -155,7 +169,7 @@ async function startPicker(tabId) {
     reportState(false);
     return;
   }
-  picker = { tabId, count: 0, sheets: new Map() };
+  picker = { tabId, count: 0, sheets: new Map(), copyPath: !!copyPath };
   try {
     await dbgSend(target, "DOM.enable");
     await dbgSend(target, "CSS.enable");                 // matched/computed styles + styleSheetAdded replay (§8.5 matched-styles)
@@ -164,7 +178,7 @@ async function startPicker(tabId) {
     await dbgSend(target, "Page.enable");
     await dbgSend(target, "Runtime.enable");
     await dbgSend(target, "Runtime.addBinding", { name: CANCEL_BINDING });
-    await installEscape(target);
+    await installPageHooks(target);
     await armInspect(target);
     reportState(true);
   } catch (e) {
@@ -182,13 +196,12 @@ async function stopPicker() {
   await dbgDetach(target);
 }
 
-// Auto-copy the picked element's full selector to the clipboard — same "copy full path" affordance
-// the §8.3 content-script picker does (both copy on every pick). The inspect event
-// (Overlay.inspectNodeRequested) carries no modifier state, so there's nothing to gate on anyway.
-// Runs in the page's top frame with userGesture:true to synthesize the
-// transient activation the async Clipboard API requires; the app tab is focused (the user just
-// clicked it), so writeText resolves. Best-effort: a missing clipboard permission / unfocused doc is
-// swallowed (the pick still flows to the panel regardless).
+// Copy the picked element's full selector to the clipboard — same "copy full path" affordance the
+// §8.3 content-script picker does. Gated identically: only on Shift+click (read via shiftHeld) and
+// only when the global "copy path" setting is on (picker.copyPath). Runs in the page's top frame with
+// userGesture:true to synthesize the transient activation the async Clipboard API requires; the app
+// tab is focused (the user just clicked it), so writeText resolves. Best-effort: a missing clipboard
+// permission / unfocused doc is swallowed (the pick still flows to the panel regardless).
 async function copyPathToClipboard(target, text) {
   if (!text) return;
   const expr = "navigator.clipboard.writeText(" + JSON.stringify(text) + ").then(()=>true,()=>false)";
@@ -292,7 +305,7 @@ async function handlePick(backendNodeId) {
   } catch { /* capture failed — skip this pick, stay armed */ }
   if (!ctx) { if (picker) await armInspect(target).catch(() => {}); return; }
 
-  await copyPathToClipboard(target, ctx.fullPath);
+  if (picker.copyPath && await shiftHeld(target)) await copyPathToClipboard(target, ctx.fullPath);
 
   const shot = await captureNodeShot(target, backendNodeId).catch(() => null);
   if (shot) { ctx.screenshotDataUrl = shot.dataUrl; ctx.screenshotW = shot.w; ctx.screenshotH = shot.h; }
@@ -331,8 +344,9 @@ chrome.debugger.onDetach.addListener((source) => {
 // `debuggerPicker` (default false) opts the origin into the chrome.debugger picker instead of the
 // content-script one (the `debugger` permission is declared required in the manifest — see §8.5).
 // `autoCommit` defaults to true when absent (only an explicit false disables the shim's per-run commit).
-// `geminiKey` and `pollInterval` (seconds; liveness-poll cadence while the panel is open) are global;
-// everything else is per-origin.
+// `geminiKey`, `pollInterval` (seconds; liveness-poll cadence while the panel is open) and `copyPath`
+// (default true; Shift+click during a pick copies the element's full selector to the clipboard) are
+// global; everything else is per-origin.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     // Visible-tab capture is the one privileged step the content script can't do itself (chrome.tabs
@@ -348,7 +362,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
     // CDP picker control (from the side panel, debugger-picker mode) — drives the inspector on a tab.
     if (msg && msg.type === "sw-picker-start") {
-      await startPicker(msg.tabId);
+      await startPicker(msg.tabId, msg.copyPath);
       return sendResponse({ ok: true });
     }
     if (msg && msg.type === "sw-picker-stop") {
@@ -365,10 +379,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         // Merge the global settings (Gemini key, poll interval) into the per-origin config the
         // content script consumes.
         return sendResponse(cfg.origins[msg.origin]
-          ? { ...cfg.origins[msg.origin], geminiKey: cfg.geminiKey || "", pollInterval: cfg.pollInterval || 0 }
+          ? { ...cfg.origins[msg.origin], geminiKey: cfg.geminiKey || "", pollInterval: cfg.pollInterval || 0, copyPath: cfg.copyPath !== false }
           : null);
       case "setGemini":
         cfg.geminiKey = msg.value || "";
+        await save(cfg);
+        return sendResponse({ ok: true });
+      case "setCopyPath":
+        cfg.copyPath = !!msg.value;   // global; default ON (absent → true)
         await save(cfg);
         return sendResponse({ ok: true });
       case "setPollInterval":

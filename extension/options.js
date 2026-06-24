@@ -113,6 +113,12 @@ $("poll-save").addEventListener("click", async () => {
   flash($("poll-save"), "Saved");
 });
 
+// Global "copy element path on Shift+click" toggle. Default ON (absent → checked); saves on change.
+async function loadCopyPath() { $("copy-path").checked = (await send({ type: "getAll" })).copyPath !== false; }
+$("copy-path").addEventListener("change", async () => {
+  await send({ type: "setCopyPath", value: $("copy-path").checked });
+});
+
 $("add").addEventListener("click", async () => {
   const origin = normOrigin($("a-origin").value);
   if (!origin) return;
@@ -145,3 +151,4 @@ try {
 render();
 loadGemini();
 loadPoll();
+loadCopyPath();

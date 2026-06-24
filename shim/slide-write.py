@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 
 def arg(k, d=None):
@@ -513,6 +513,170 @@ def read_history(repo, sid):
     return {"id": sid, "events": events}
 
 
+# --- Codex (OpenAI) chat history (read-only) -------------------------------------------------
+# codex writes one rollout transcript per session under <CODEX_HOME>/sessions/YYYY/MM/DD/
+# rollout-<ts>-<uuid>.jsonl. Unlike claude's per-repo folders these all live in one global tree, so
+# we read each file's `session_meta` line to filter by cwd == repo. The replayed events come from
+# the rollout's `event_msg`/`response_item` records (a different shape than `codex exec --json`'s
+# live stream, but mapped onto the same §6 SSE shapes stream_codex emits — tool/file_edit, no
+# tool_result, result = last agent message). Mirrors listCodexHistory/readCodexHistory in .mjs.
+ROLLOUT_RE = re.compile(r"^rollout-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-([0-9a-fA-F-]{36})\.jsonl$")
+CWD_RE = re.compile(r'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def codex_sessions_dir():
+    return os.path.join(codex_home(), "sessions")
+
+
+# Strip the generic PREAMBLE we prepend to every codex prompt so titles + the replayed user event
+# show the actual request (matches claude, whose PREAMBLE rides in systemPrompt, not the message).
+def strip_preamble(text):
+    t = text or ""
+    if t.startswith(PREAMBLE):
+        t = t[len(PREAMBLE):]
+    return t.strip()
+
+
+# The actual user request out of a codex user_message: drop the PREAMBLE, then keep only the text
+# before the first "\n[…]" context marker build_prompt appends (screen/element/screenshot lines).
+def codex_request(text):
+    t = strip_preamble(text)
+    return t.split("\n[")[0].strip() or t
+
+
+# Read the first `n` bytes of a file as utf8. codex's session_meta line carries the whole system
+# prompt (~19KB), but `cwd` sits in its first few hundred bytes — enough to pre-filter by repo
+# without fully loading the (often multi-hundred-KB) rollouts that belong to other repos.
+def read_head(file, n=4096):
+    try:
+        with open(file, "rb") as fh:
+            return fh.read(n).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+# Walk the codex sessions tree, newest first by the filename's timestamp; yields (file, id, startedAt).
+def codex_rollouts():
+    out = []
+    for root, _dirs, files in os.walk(codex_sessions_dir()):
+        for name in files:
+            m = ROLLOUT_RE.match(name)
+            if not m:
+                continue
+            y, mo, d, h, mi, s, sid = m.groups()
+            out.append((os.path.join(root, name), sid, f"{y}-{mo}-{d}T{h}:{mi}:{s}"))
+    out.sort(key=lambda r: r[2], reverse=True)
+    return out
+
+
+# List this repo's codex sessions, newest first (parallel to list_history for the claude path).
+def list_codex_history(repo):
+    sessions = []
+    for file, sid, started_at in codex_rollouts():
+        m = CWD_RE.search(read_head(file))  # cwd lives near the start of session_meta
+        if not m:
+            continue
+        try:
+            cwd = json.loads(f'"{m.group(1)}"')
+        except ValueError:
+            cwd = m.group(1)
+        if os.path.realpath(cwd) != repo:  # global tree → keep only this repo's sessions
+            continue
+        try:
+            with open(file, encoding="utf-8") as fh:
+                lines = [ln for ln in fh.read().split("\n") if ln]
+        except OSError:
+            continue
+        started = ended_at = started_at
+        first_prompt = ""
+        message_count = 0
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("timestamp"):
+                if rec.get("type") == "session_meta":
+                    started = rec["timestamp"]
+                ended_at = rec["timestamp"]
+            p = rec.get("payload") or {}
+            if rec.get("type") == "event_msg" and p.get("type") == "user_message":
+                t = codex_request(p.get("message"))
+                if t and not first_prompt:
+                    first_prompt = t
+                message_count += 1
+            elif rec.get("type") == "event_msg" and p.get("type") == "agent_message":
+                message_count += 1
+        sessions.append({
+            "id": sid, "title": (first_prompt or "(untitled)")[:80],
+            "firstPrompt": first_prompt[:140], "startedAt": started, "endedAt": ended_at,
+            "branch": "", "messageCount": message_count,
+        })
+    return sessions  # codex_rollouts() already ordered newest-first by timestamp
+
+
+# Parse one codex rollout into render-ready §6 events (parallel to read_history). Returns None for a
+# bad id, a session that isn't in this repo, or a missing file.
+def read_codex_history(repo, sid):
+    if not valid_session_id(sid):
+        return None
+    hit = next((r for r in codex_rollouts() if r[1].lower() == sid.lower()), None)
+    if not hit:
+        return None
+    try:
+        with open(hit[0], encoding="utf-8") as fh:
+            lines = [ln for ln in fh.read().split("\n") if ln]
+    except OSError:
+        return None
+    try:
+        cwd = (json.loads(lines[0]).get("payload") or {}).get("cwd")
+    except (ValueError, IndexError):
+        return None
+    if not cwd or os.path.realpath(cwd) != repo:  # don't replay another repo's transcript
+        return None
+    events = []
+    last_agent = None
+    had_error = False
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        p = rec.get("payload") or {}
+        t, pt = rec.get("type"), p.get("type")
+        if t == "event_msg" and pt == "user_message":
+            txt = strip_preamble(p.get("message"))
+            if txt:
+                events.append({"type": "user", "text": txt})
+        elif t == "event_msg" and pt == "agent_message":
+            if p.get("message"):
+                last_agent = p["message"]
+                events.append({"type": "delta", "text": p["message"]})
+        elif t == "event_msg" and pt == "patch_apply_end":
+            for path in (p.get("changes") or {}):
+                events.append({"type": "file_edit", "tool": "codex",
+                               "path": rel_path(repo, path), "id": p.get("call_id")})
+        elif t == "event_msg" and pt in ("error", "stream_error"):
+            had_error = True
+        elif t == "response_item" and pt == "reasoning":
+            for s in p.get("summary") or []:
+                if isinstance(s, dict) and s.get("text"):
+                    events.append({"type": "thinking_delta", "text": s["text"]})
+        elif t == "response_item" and pt == "function_call":
+            raw = p.get("arguments") or "{}"
+            try:
+                args = json.loads(raw)
+            except ValueError:
+                args = {}
+            detail = args.get("cmd") or args.get("path") or (raw[:200] if raw != "{}" else "")
+            events.append({"type": "tool",
+                           "tool": "codex_exec" if p.get("name") == "exec_command" else (p.get("name") or "tool"),
+                           "detail": detail, "id": p.get("call_id")})
+    events.append({"type": "result", "isError": had_error, "numTurns": None, "durationMs": None,
+                   "totalCostUsd": None, "usage": None, "result": last_agent})
+    return {"id": sid, "events": events}
+
+
 # Generate (or edit) an image with Gemini "nano banana" via the Generative Language REST API.
 # Generic — knows nothing about the target repo. The key goes in a header (never the URL, so it
 # can't leak into request logs); `image` (optional, {mimeType,data}) makes it image-to-image.
@@ -951,10 +1115,16 @@ class Handler(BaseHTTPRequestHandler):
                 "providers": providers(), "defaultProvider": "anthropic",
                 "geminiModel": GEMINI_MODEL, "geminiEnv": bool(GEMINI_KEY),  # geminiEnv: server-side key fallback
             })
+        # History is provider-scoped: the openai provider reads codex's rollout tree, everything else
+        # (anthropic/absent) reads claude's ~/.claude/projects transcripts. The extension sends the
+        # per-origin provider as a `?provider=` query param so the 🕘 view shows the right backend.
+        hist_provider = (parse_qs(urlsplit(self.path).query).get("provider") or ["anthropic"])[0]
         if path == "/history":
-            return self._json(200, {"sessions": list_history(repo)})
+            sessions = list_codex_history(repo) if hist_provider == "openai" else list_history(repo)
+            return self._json(200, {"sessions": sessions})
         if path.startswith("/history/"):
-            data = read_history(repo, unquote(path[len("/history/"):]))
+            sid = unquote(path[len("/history/"):])
+            data = read_codex_history(repo, sid) if hist_provider == "openai" else read_history(repo, sid)
             return self._json(200, data) if data else self._json(404, {"error": "not found"})
         self._json(404, {"error": "not found"})
 

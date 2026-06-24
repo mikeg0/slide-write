@@ -23,7 +23,7 @@
     chrome.runtime.sendMessage({ type: "sw-picker-state", active }).catch(() => {});
   }
 
-  async function armPicker() {
+  async function armPicker(copyPath) {
     if (armed) { reportState(true); return; }   // already armed — re-echo so a drifted panel re-syncs
     armed = true;
     reportState(true);
@@ -38,7 +38,7 @@
         const shot = await captureElementShot(ctx.rect);
         if (shot) { ctx.screenshotDataUrl = shot.dataUrl; ctx.screenshotW = shot.w; ctx.screenshotH = shot.h; }
         chrome.runtime.sendMessage({ type: "sw-element-picked", ctx }).catch(() => {});
-      }, { captureImage: true });
+      }, { captureImage: true, copyPath: !!copyPath });
     } catch (e) {
       armed = false; stopPicker = null; reportState(false);
       console.warn("[slide-write] picker unavailable:", e);
@@ -54,7 +54,7 @@
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg) return;
-    if (msg.type === "sw-arm-picker") armPicker();
+    if (msg.type === "sw-arm-picker") armPicker(msg.copyPath);
     else if (msg.type === "sw-disarm-picker") disarmPicker();
     else if (msg.type === "sw-query-picker") reportState(armed);   // panel asks for the authoritative state
   });
