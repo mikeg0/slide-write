@@ -52,8 +52,14 @@ async function render() {
         <label>Name</label><input type="text" class="name" value="${esc(c.name || "")}" placeholder="optional label"/>
         <label>Token</label><input type="password" class="tok" value="${esc(c.token || "")}"/>
         <label>Shim URL</label><input type="text" class="url" value="${esc(c.shimUrl || "")}" placeholder="http://localhost:4040"/>
+        <label>Provider</label><select class="prov">
+          <option value="anthropic">Anthropic (Claude)</option>
+          <option value="openai">OpenAI (Codex)</option>
+          <option value="google" disabled>Google (not yet wired)</option>
+        </select>
         <label>Image steps (override)</label><textarea class="imgsteps" placeholder="Optional override — prefer the repo's CLAUDE.md / a skill. Layered on top (path, naming, DB write, resize…)">${esc(c.imageInstructions || "")}</textarea>
       </div>`;
+    row.querySelector(".prov").value = c.provider || "anthropic";
     row.querySelector(".save").addEventListener("click", async () => {
       const enabled = row.querySelector(".en").checked;
       const dbg = row.querySelector(".dbg").checked;
@@ -67,6 +73,7 @@ async function render() {
         debuggerPicker: dbg,
         token: row.querySelector(".tok").value.trim(),
         shimUrl: row.querySelector(".url").value.trim() || undefined,
+        provider: row.querySelector(".prov").value,
         imageInstructions: row.querySelector(".imgsteps").value.trim(),
       }});
       flash(row.querySelector(".save"), "Saved");
@@ -121,9 +128,11 @@ $("add").addEventListener("click", async () => {
     debuggerPicker: dbg,
     token: $("a-token").value.trim(),
     shimUrl: $("a-url").value.trim() || undefined,
+    provider: $("a-provider").value,
     imageInstructions: $("a-imgsteps").value.trim(),
   }});
   $("a-name").value = $("a-origin").value = $("a-token").value = $("a-url").value = $("a-imgsteps").value = "";
+  $("a-provider").value = "anthropic";
   render();
 });
 

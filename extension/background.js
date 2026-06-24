@@ -325,7 +325,9 @@ chrome.debugger.onDetach.addListener((source) => {
 });
 
 // Message API. Config shape:
-//   { geminiKey?, pollInterval?, origins: { "<origin>": { enabled, token, shimUrl?, autoReload?, autoCommit?, model?, imageInstructions?, debuggerPicker? } } }
+//   { geminiKey?, pollInterval?, origins: { "<origin>": { enabled, token, shimUrl?, autoReload?, autoCommit?, provider?, model?, imageInstructions?, debuggerPicker? } } }
+// `provider` (default "anthropic") picks the run backend — "anthropic" (claude) or "openai" (codex);
+// it scopes the side-panel model dropdown to that provider's /meta models. "google" is reserved/disabled.
 // `debuggerPicker` (default false) opts the origin into the chrome.debugger picker instead of the
 // content-script one (the `debugger` permission is declared required in the manifest — see §8.5).
 // `autoCommit` defaults to true when absent (only an explicit false disables the shim's per-run commit).

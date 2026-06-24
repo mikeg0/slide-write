@@ -4,7 +4,7 @@
 // `--bind <addr>` overrides for the §13 reverse-proxy fallback (e.g. the docker bridge gateway).
 import http from "node:http";
 import os from "node:os";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,6 +46,64 @@ const MODELS = [
 ];
 const DEFAULT_MODEL = arg("model", process.env.SLIDEWRITE_MODEL ?? ""); // "" = let the SDK decide
 const modelAllowed  = (m) => MODELS.some((x) => x.id === m);
+
+// --- Provider selection (Anthropic / OpenAI / Google) ---------------------------------------
+// Anthropic is the default path (the claude Agent SDK above). OpenAI is driven by the `codex` CLI
+// (`codex exec --json`) — the agentic parallel to claude — which natively authenticates from
+// CODEX_HOME/auth.json (ChatGPT oauth). Google is a not-yet-wired placeholder advertised as disabled.
+const CODEX_BIN  = arg("codex-bin",  process.env.SLIDEWRITE_CODEX_BIN  ?? "codex"); // `codex` on PATH, or a full path
+const CODEX_HOME = arg("codex-home", process.env.SLIDEWRITE_CODEX_HOME ?? "");       // "" → codex's own default (~/.codex)
+const codexHome  = () => CODEX_HOME || join(os.homedir(), ".codex");
+const CODEX_VERSION_FALLBACK = "0.142.0"; // used only if `codex --version` can't be parsed
+let _codexVer;
+function codexClientVersion() {                                  // the /models endpoint requires client_version
+  if (_codexVer) return _codexVer;
+  _codexVer = new Promise((r) => execFile(CODEX_BIN, ["--version"], (_e, out) => {
+    const m = /(\d+\.\d+\.\d+)/.exec(out || "");
+    r(m ? m[1] : CODEX_VERSION_FALLBACK);
+  }));
+  return _codexVer;
+}
+
+// Fetch the OpenAI model list the way codex does: the ChatGPT-account-scoped /models endpoint, using
+// the oauth access_token from CODEX_HOME/auth.json. (api.openai.com/v1/models 403s with this token —
+// this is the only working source.) Returns {id:slug,label:display_name}[] of the *listable*,
+// api-supported models. Cached ~60s so /meta polling doesn't hammer it; any failure → [] (never throws).
+let _openAiCache = { at: 0, models: [] };
+async function openAiModels() {
+  const now = Date.now();
+  if (now - _openAiCache.at < 60_000) return _openAiCache.models;
+  let models = [];
+  try {
+    const auth = JSON.parse(await readFile(join(codexHome(), "auth.json"), "utf8"));
+    const token = auth?.tokens?.access_token, account = auth?.tokens?.account_id;
+    if (token) {
+      const ver = await codexClientVersion();
+      const res = await fetch(`https://chatgpt.com/backend-api/codex/models?client_version=${encodeURIComponent(ver)}`,
+        { headers: { authorization: `Bearer ${token}`, "chatgpt-account-id": account || "",
+                     originator: "codex_cli_rs", "user-agent": "codex_cli_rs" } });
+      if (res.ok) {
+        const data = await res.json();
+        models = (data.models || [])
+          .filter((m) => m.visibility === "list" && m.supported_in_api !== false)
+          .map((m) => ({ id: m.slug, label: m.display_name || m.slug }));
+      } else if (DEBUG) console.error("openAiModels: HTTP", res.status);
+    }
+  } catch (e) { if (DEBUG) console.error("openAiModels:", e?.message || e); }
+  _openAiCache = { at: now, models };
+  return models;
+}
+
+// Provider list for /meta — the client picks a provider on the options page, then the dropdown shows
+// that provider's `models`. `enabled:false` advertises a provider the UI should show but not allow.
+async function providers() {
+  const openai = await openAiModels();
+  return [
+    { id: "anthropic", label: "Anthropic", enabled: true, models: MODELS, defaultModel: DEFAULT_MODEL || MODELS[0].id },
+    { id: "openai",    label: "OpenAI",    enabled: true, models: openai, defaultModel: openai[0]?.id || "gpt-5.5" },
+    { id: "google",    label: "Google",    enabled: false, models: [] },
+  ];
+}
 
 // Gemini "nano banana" image generation. Model id is overridable so a rename doesn't need a code
 // edit. The key is a shim-level fallback used only when a /generate-image request omits one (the
@@ -423,6 +481,83 @@ async function streamQuery(repo, prompt, body, emit, aborted) {
   return hadError;
 }
 
+// Drive one `codex exec --json` run (the OpenAI provider), mapping codex's JSONL events onto the same
+// §6 SSE contract streamQuery emits. Spawns the codex CLI, which reuses CODEX_HOME/auth.json for its
+// ChatGPT-oauth login (no API key here). Returns whether the run errored. The generic PREAMBLE is
+// prepended to the prompt (codex exec has no separate system-prompt flag).
+async function streamCodex(repo, prompt, body, emit, aborted) {
+  const allowed = await openAiModels();
+  const model = allowed.some((m) => m.id === body.model) ? body.model : undefined;  // unknown id → codex default
+  const args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repo];
+  if (model) args.push("-m", model);
+  // Resume a prior codex thread (thread_id is a UUID, so it passes validSessionId). `-` makes codex
+  // read the continuation prompt from stdin, same as a fresh run.
+  if (validSessionId(body.resume)) args.push("resume", body.resume, "-");
+  const env = { ...process.env };
+  if (CODEX_HOME) env.CODEX_HOME = CODEX_HOME;
+  return new Promise((done) => {
+    let child;
+    try { child = spawn(CODEX_BIN, args, { cwd: repo, env, stdio: ["pipe", "pipe", "pipe"] }); }
+    catch (e) { emit("error", { message: `codex spawn failed: ${e?.message || e}` }); return done(true); }
+    let hadError = false, lastText = "", started = false, buf = "", stderr = "", finished = false;
+    child.stdin.write(PREAMBLE + "\n\n" + prompt); child.stdin.end();
+    child.stdout.setEncoding("utf8");
+
+    const handle = (ev) => {
+      if (ev.type === "thread.started") { started = true; emit("start", { sessionId: ev.thread_id, model: model || body.model || "" }); }
+      else if (ev.type === "item.completed") {
+        const it = ev.item || {};
+        if (it.type === "file_change") for (const c of it.changes || []) emit("file_edit", { tool: "codex", path: relPath(repo, c.path || ""), id: it.id });
+        else if (it.type === "agent_message") { if (it.text) { lastText = it.text; emit("delta", { text: it.text }); } }
+        else if (it.type === "reasoning") { if (it.text) emit("thinking_delta", { text: it.text }); }
+        else if (it.type === "command_execution") emit("tool", { tool: "codex_exec", detail: it.command || it.aggregated_output || "", id: it.id });
+        else if (it.type === "error") { hadError = true; emit("delta", { text: `\n[error] ${it.message || ""}` }); }
+      }
+      else if (ev.type === "turn.completed") {
+        const u = ev.usage || {};
+        emit("usage", { inputTokens: u.input_tokens || 0, outputTokens: u.output_tokens || 0,
+          cacheReadTokens: u.cached_input_tokens || 0, cacheCreationTokens: 0, thinkingTokens: u.reasoning_output_tokens || 0 });
+      }
+      else if (ev.type === "error" || ev.type === "turn.failed") {
+        hadError = true; emit("delta", { text: `\n[error] ${ev.message || ev.error?.message || "codex run failed"}` });
+      }
+    };
+
+    child.stdout.on("data", (chunk) => {
+      if (aborted()) { try { child.kill("SIGTERM"); } catch {} return; }
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        let ev; try { ev = JSON.parse(line); } catch { continue; }
+        handle(ev);
+      }
+    });
+    child.stderr.on("data", (c) => { stderr += c; if (DEBUG) console.error("codex stderr:", String(c)); });
+
+    const finish = () => {
+      if (finished) return; finished = true;
+      if (buf.trim()) { try { handle(JSON.parse(buf)); } catch { /* partial */ } }
+      if (aborted()) return done(hadError);            // client gone — match the claude path (no trailing emits)
+      if (!started) { hadError = true; emit("error", { message: stderr.trim().slice(0, 500) || "codex did not start" }); }
+      emit("result", { isError: hadError, result: lastText || null });
+      done(hadError);
+    };
+    child.on("error", (e) => { if (!started) emit("error", { message: `codex error: ${e?.message || e}` }); hadError = true; finish(); });
+    child.on("close", finish);
+  });
+}
+
+// Provider dispatch for the agent step. Anthropic (default/absent) → the claude SDK; OpenAI → codex;
+// Google → a clean not-yet-supported error. Shared by runDesign and runImage.
+function runAgent(repo, prompt, body, emit, aborted) {
+  const provider = body.provider || "anthropic";
+  if (provider === "openai") return streamCodex(repo, prompt, body, emit, aborted);
+  if (provider === "google") { emit("error", { message: "Google provider is not yet supported" }); return Promise.resolve(true); }
+  return streamQuery(repo, prompt, body, emit, aborted);
+}
+
 // Commit only what THIS run changed (diff of porcelain before/after); no push.
 async function commitChanged(repo, dirty0, subj, emit) {
   const changed = (await porcelainPaths(repo)).filter(p => !dirty0.has(p));
@@ -456,7 +591,7 @@ export async function runDesign(body, emit, aborted = () => false, _signal, repo
   const dirty0 = new Set(await porcelainPaths(repo));
   const elements = elementsOf(body);
   const shotPaths = await Promise.all(elements.map((el, i) => saveScreenshot(el, i)));
-  const hadError = await streamQuery(repo, buildPrompt(body, elements, shotPaths), body, emit, aborted);
+  const hadError = await runAgent(repo, buildPrompt(body, elements, shotPaths), body, emit, aborted);
   if (aborted()) return;
   // `autoCommit: false` (extension per-origin option) leaves the edits uncommitted in the working
   // tree; absent/anything-else keeps the original auto-commit behavior.
@@ -489,7 +624,7 @@ export async function runImage(body, emit, aborted = () => false, signal, repo =
   if (aborted()) return;
   const dirty0 = new Set(await porcelainPaths(repo));
   const prompt = buildImagePrompt({ ...body, imageInstructions: body.imageInstructions || IMAGE_INSTRUCTIONS }, elements, tmpPath, !!image);
-  const hadError = await streamQuery(repo, prompt, body, emit, aborted);
+  const hadError = await runAgent(repo, prompt, body, emit, aborted);
   if (aborted()) return;
   if (!hadError && body.autoCommit !== false)
     await commitChanged(repo, dirty0, `add image — ${(body.imagePrompt || "add image").split("\n")[0].slice(0, 72)}`, emit);
@@ -535,7 +670,8 @@ function serve() {
         project: basename(repo), repoDir: repo, version: VERSION,
         branch: await git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
         dirty: !!(await git(repo, "status", "--porcelain")),
-        models: MODELS, defaultModel: DEFAULT_MODEL || MODELS[0].id,
+        models: MODELS, defaultModel: DEFAULT_MODEL || MODELS[0].id,  // legacy top-level = Anthropic (back-compat)
+        providers: await providers(), defaultProvider: "anthropic",
         geminiModel: GEMINI_MODEL, geminiEnv: !!GEMINI_KEY,  // geminiEnv: shim has a server-side key fallback
       });
     if (path === "/history" && req.method === "GET")

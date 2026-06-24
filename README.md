@@ -199,8 +199,9 @@ its JSONL as SSE — same event mapping. The SDK is used here for typed messages
 
 A single `.mjs` file. CLI flags / env
 (`--port`/`--repo`/`--token`/`--origin`/`--bind`/`--model`/`--debug`/`--use-skills`, the multi-host
-flags `--repo-root`/`--repos`, plus the image flags
-`--gemini-key`/`--gemini-model`/`--image-instructions`) configure it; it stands up an
+flags `--repo-root`/`--repos`, the image flags
+`--gemini-key`/`--gemini-model`/`--image-instructions`, plus the OpenAI-provider flags
+`--codex-bin`/`--codex-home` — see [§5.4](#54-provider-selection-anthropic--openai)) configure it; it stands up an
 `http.createServer` on `127.0.0.1` (overridable via `--bind` for §13 only), and the run logic lives
 in exported `runDesign(body, emit, aborted, signal, repo)` / `runImage(body, emit, aborted, signal,
 repo)` so the HTTP handler and tests share one implementation (the server only starts when the file
@@ -325,6 +326,42 @@ Validated against `claude` CLI 2.1.173 — same drift caveat as the SDK: re-veri
 shapes on upgrade. Keep this file in lockstep with `slide-write.mjs` (the `.mjs` is the reference
 implementation; both must change together with the contracts).
 
+### 5.4 Provider selection (Anthropic / OpenAI)
+
+The shim can drive a second agentic backend for the **OpenAI** provider: the `codex` CLI, the
+parallel to `claude`. When a request carries `provider: "openai"`, the agent step runs
+`codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <repo> [-m <model>]`
+instead of the SDK/CLI. The prompt (PREAMBLE + the built §7 context) is fed on stdin; codex's JSONL
+event stream is mapped onto the **same** §6 SSE events the claude path emits, so nothing downstream
+changes — `streamCodex` (in `slide-write.mjs`) / `stream_codex` (in `slide-write.py`) is just another
+producer of the contract, dispatched by `runAgent`/`run_agent` on `body.provider`:
+
+- `thread.started` → `start` (its `thread_id` is the session id, used for resume)
+- `item.completed` with `file_change` → `file_edit` (one per changed path) · `agent_message` →
+  `delta` · `reasoning` → `thinking_delta` · `command_execution` → `tool`
+- `turn.completed.usage` → the cumulative `usage` event (`input_tokens`, `cached_input_tokens` →
+  `cacheReadTokens`, `reasoning_output_tokens` → `thinkingTokens`)
+- `error` / `turn.failed` → marks the run errored; stream end emits `result`.
+
+**Auth reuses codex's own login — no API key here.** codex reads `CODEX_HOME/auth.json` (default
+`~/.codex`), the same ChatGPT-oauth credentials the `codex` CLI logs in with. The shim never handles
+the token for *running* a design; it only reads it to **list models** (below).
+
+**Dynamic model list.** Unlike the hardcoded Anthropic list, the OpenAI models in `/meta` are fetched
+live: `GET https://chatgpt.com/backend-api/codex/models?client_version=<v>` with headers
+`Authorization: Bearer <access_token>` (from `CODEX_HOME/auth.json`), `chatgpt-account-id`, and
+`originator: codex_cli_rs`; `<v>` comes from `codex --version`. The listable, api-supported entries
+become `{id: slug, label: display_name}`. (`api.openai.com/v1/models` 403s with a ChatGPT-oauth token,
+so this codex endpoint is the only working source.) The result is cached ~60s so `/meta` polling
+doesn't hammer it; any failure (missing/expired token, offline) yields an empty list rather than an
+error — the dropdown just shows no OpenAI models until it recovers.
+
+Extra flags (both shims): **`--codex-bin <path>`/`SLIDEWRITE_CODEX_BIN`** (default `codex`) and
+**`--codex-home <dir>`/`SLIDEWRITE_CODEX_HOME`** (default unset → codex's own `~/.codex`). Validated
+against `codex` CLI 0.142.0; `codex exec --json` is the headless equivalent of
+`claude -p --output-format stream-json`. Resume threads a prior codex session via
+`codex exec … resume <thread_id> -` (the `-` reads the continuation prompt from stdin).
+
 ---
 
 ## 6. The SSE event contract
@@ -373,6 +410,16 @@ shim validates it against an allowlist advertised by `/meta` (`{ models: [{id,la
 an unknown/absent id falls back to the shim's `--model`/`SLIDEWRITE_MODEL` default, or the SDK's own
 default when that's unset. The model the SDK actually runs is echoed back in the `start` event. The
 extension renders the `/meta` list in a composer dropdown and persists the choice per-origin.
+
+**Provider selection (additive).** `/design` and `/generate-image` also accept an optional top-level
+`provider` — `"anthropic"` (default/absent), `"openai"`, or `"google"`. `/meta` advertises the choices
+as `providers: [{ id, label, enabled, models: [{id,label}], defaultModel }]` plus `defaultProvider`,
+and the top-level `models`/`defaultModel` stay as the Anthropic list for backward compatibility. The
+extension's options page picks the provider per-origin; the side-panel model dropdown then shows that
+provider's `models`. `anthropic` runs the claude path above; `openai` runs the codex path
+([§5.4](#54-provider-selection-anthropic--openai)); `google` is a reserved placeholder advertised
+`enabled:false` that returns an `error` event if invoked. Everything downstream of the agent step
+(SSE contract, the porcelain-diff auto-commit, `done`) is provider-agnostic.
 
 **Image generation (additive — Gemini "nano banana").** `POST /generate-image` is an SSE route
 (same Bearer+CORS gate, same `busy` lock and per-run auto-commit as `/design`). It takes

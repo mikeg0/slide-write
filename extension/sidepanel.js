@@ -15,6 +15,7 @@ function resolve(c, origin) {
     token: (c && c.token) || "",
     autoReload: !!(c && c.autoReload),
     autoCommit: !(c && c.autoCommit === false),  // default ON — only an explicit false opts out
+    provider: (c && c.provider) || "anthropic",  // chosen on the options page; scopes the model dropdown
     model: (c && c.model) || "",
     geminiKey: (c && c.geminiKey) || "",
     pollInterval: (c && c.pollInterval) || 0,
@@ -157,7 +158,7 @@ async function mount() {
     shimUrl: init.shimUrl, token: init.token, meta: conn.meta || null,
     conn: { state: conn.state, detail: conn.detail }, screen, origin: currentOrigin || "",
     configured: init.configured, autoReload: init.autoReload, autoCommit: init.autoCommit,
-    model: init.model, geminiKey: init.geminiKey, pollInterval: init.pollInterval,
+    provider: init.provider, model: init.model, geminiKey: init.geminiKey, pollInterval: init.pollInterval,
     imageInstructions: init.imageInstructions,
     onProbe: probe,
     onMarkup: togglePicker,
@@ -203,7 +204,7 @@ async function syncActiveTab() {
       shimUrl: next.shimUrl, token: next.token, meta: conn.meta || null,
       conn: { state: conn.state, detail: conn.detail }, screen: newScreen, origin: newOrigin || "",
       configured: next.configured, autoReload: next.autoReload, autoCommit: next.autoCommit,
-      model: next.model, geminiKey: next.geminiKey, pollInterval: next.pollInterval,
+      provider: next.provider, model: next.model, geminiKey: next.geminiKey, pollInterval: next.pollInterval,
       imageInstructions: next.imageInstructions,
     });
   } finally { syncing = false; }
@@ -223,7 +224,8 @@ chrome.storage.onChanged.addListener(async (changes, area) => {
   const m = c.meta || (connChanged ? null : lastMeta);
   liveCfg = next; lastMeta = m; lastConn = c;
   panel.setConfig({ shimUrl: next.shimUrl, token: next.token, meta: m, conn: { state: c.state, detail: c.detail },
-    autoReload: next.autoReload, autoCommit: next.autoCommit, configured: next.configured, model: next.model,
+    autoReload: next.autoReload, autoCommit: next.autoCommit, configured: next.configured,
+    provider: next.provider, model: next.model,
     geminiKey: next.geminiKey, pollInterval: next.pollInterval, imageInstructions: next.imageInstructions });
 });
 

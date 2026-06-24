@@ -62,6 +62,11 @@
       <label for="a-token">Token</label>
       <span style="display:flex;gap:6px"><input id="a-token" type="password" placeholder="SLIDEWRITE_TOKEN" /><button id="a-gen" type="button">Generate</button></span>
       <label for="a-url">Shim URL</label><input id="a-url" type="text" placeholder="http://localhost:4040" />
+      <label for="a-provider">Provider</label><select id="a-provider">
+        <option value="anthropic">Anthropic (Claude)</option>
+        <option value="openai">OpenAI (Codex)</option>
+        <option value="google" disabled>Google (not yet wired)</option>
+      </select>
       <label for="a-imgsteps">Image steps (override)</label><textarea id="a-imgsteps" placeholder="Optional override — prefer putting image conventions in the repo's CLAUDE.md / a skill. Layered on top, e.g. save to src/assets/generated/, kebab-case, max width 800px, insert a media row…"></textarea>
     </div>
     <p class="controls">

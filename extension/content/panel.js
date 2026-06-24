@@ -139,17 +139,36 @@ const FALLBACK_MODELS = [
   { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
 ];
 
-export function createPanel({ root, shimUrl, token, meta, conn, model, screen, origin, onMarkup, onOpenOptions, onProbe, onSelectModel, onReload, onClose, autoReload, autoCommit, configured, geminiKey, pollInterval, imageInstructions }) {
+// Resolve which models the dropdown offers for the chosen provider. /meta advertises a per-provider
+// `providers:[{id,models,defaultModel}]` array; when the selected provider is listed we use its
+// models (even when empty — e.g. a disabled provider, or an OpenAI list the shim couldn't fetch).
+// Pre-/meta or against an old shim with no `providers`, fall back to the legacy top-level `models`,
+// then the built-in Anthropic list.
+function modelsFor(meta, provider) {
+  const p = meta && Array.isArray(meta.providers) ? meta.providers.find((x) => x.id === provider) : null;
+  if (p && Array.isArray(p.models))
+    return { models: p.models, defaultModel: p.defaultModel || (p.models[0] && p.models[0].id) || "" };
+  if (meta && Array.isArray(meta.models) && meta.models.length)
+    return { models: meta.models, defaultModel: meta.defaultModel || meta.models[0].id };
+  return { models: FALLBACK_MODELS, defaultModel: FALLBACK_MODELS[0].id };
+}
+
+export function createPanel({ root, shimUrl, token, meta, conn, provider, model, screen, origin, onMarkup, onOpenOptions, onProbe, onSelectModel, onReload, onClose, autoReload, autoCommit, configured, geminiKey, pollInterval, imageInstructions }) {
   // Live config — reassignable via api.setConfig so enabling the origin in Options flips the panel
   // from its disabled "set up" state to live, with no reload. `screen` is the active tab's route
-  // (sidepanel.js keeps it current as the tab navigates/switches), sent with each run.
+  // (sidepanel.js keeps it current as the tab navigates/switches), sent with each run. `provider`
+  // is chosen on the options page and scopes which models the dropdown offers + the run backend.
   let cfg = { shimUrl, token, meta, conn: conn || { state: null }, autoReload: !!autoReload,
     autoCommit: autoCommit !== false, configured: !!configured, screen: screen || "", origin: origin || "",
+    provider: provider || "anthropic",
     geminiKey: geminiKey || "", pollInterval: pollInterval || 0, imageInstructions: imageInstructions || "" };
-  // Model selection state. `models` is the menu list (server-driven via /meta, else fallback);
-  // `selectedModel` is the chosen id sent with each /design request and persisted by inject.js.
-  let models = (meta && Array.isArray(meta.models) && meta.models.length) ? meta.models : FALLBACK_MODELS;
-  let selectedModel = model || (meta && meta.defaultModel) || models[0].id;
+  // Model selection state. `models` is the menu list (server-driven via /meta for the active
+  // provider, else fallback); `selectedModel` is the chosen id sent with each /design request and
+  // persisted per-origin. recomputeModels() rebuilds both when the provider or /meta changes.
+  const _init = modelsFor(meta, cfg.provider);
+  let models = _init.models;
+  let selectedModel = (model && _init.models.some((m) => m.id === model)) ? model
+    : (_init.defaultModel || (_init.models[0] && _init.models[0].id) || "");
   let busy = false;
   let controller = null;
   let filesChangedThisRun = false;  // any file_edit this run → auto-reload-on-save reloads at `done`
@@ -314,6 +333,18 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, screen, o
     const open = force != null ? force : modelMenu.hidden;
     modelMenu.hidden = !open;
     modelBtn.classList.toggle("dmsg-model-open", open);
+  }
+  // Rebuild `models` for the active provider (cfg.provider + cfg.meta) and keep a valid selection:
+  // prefer an explicitly requested id, else the current pick if still offered, else the persisted
+  // cfg.model, else the provider's default. Called whenever the provider or /meta changes.
+  function recomputeModels(preferModel) {
+    const { models: ms, defaultModel } = modelsFor(cfg.meta, cfg.provider);
+    models = ms;
+    const want = preferModel
+      || (models.some((m) => m.id === selectedModel) ? selectedModel : null)
+      || cfg.model || defaultModel;
+    selectedModel = (models.some((m) => m.id === want) ? want : defaultModel) || (models[0] && models[0].id) || "";
+    renderModels();
   }
 
   // Render the "+" menu items, reflecting current toggle state (Image Generation = imageMode).
@@ -706,7 +737,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, screen, o
     const { prompt, image, elements, model } = intent;
     let payload, path;
     if (image) {
-      payload = { imagePrompt: prompt, screen: cfg.screen || "", model,
+      payload = { imagePrompt: prompt, screen: cfg.screen || "", model, provider: cfg.provider,
         geminiKey: cfg.geminiKey, imageInstructions: cfg.imageInstructions, autoCommit: cfg.autoCommit };
       // Strip the element screenshots — /generate-image uses imageDataUrl (the canvas-read source
       // pixels) for image-to-image; the screenshots would just bloat the payload.
@@ -714,7 +745,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, screen, o
         payload.elements = elements.map(({ screenshotDataUrl, screenshotW, screenshotH, ...rest }) => rest);
       path = "/generate-image";
     } else {
-      payload = { prompt, screen: cfg.screen || "", model, autoCommit: cfg.autoCommit };
+      payload = { prompt, screen: cfg.screen || "", model, provider: cfg.provider, autoCommit: cfg.autoCommit };
       // Drop imageDataUrl (only meaningful to /generate-image) and the UI-only screenshot dimensions,
       // but KEEP screenshotDataUrl — the shim writes each to a temp file for claude to Read.
       if (elements.length)
@@ -978,10 +1009,10 @@ export function createPanel({ root, shimUrl, token, meta, conn, model, screen, o
       // Only flip `configured` when the caller actually supplied it — a screen-only update
       // (same-origin navigation) must not knock a live panel back into its "set up" state.
       cfg = { ...cfg, ...next, configured: next.configured != null ? !!next.configured : cfg.configured };
-      if (next.meta && Array.isArray(next.meta.models) && next.meta.models.length) models = next.meta.models;
-      if (next.model && models.some((m) => m.id === next.model)) selectedModel = next.model;
-      if (!models.some((m) => m.id === selectedModel)) selectedModel = (next.meta && next.meta.defaultModel) || models[0].id;
-      renderModels();
+      // A fresh /meta, a provider switch (options page), or an explicit model all change which models
+      // are offered / selected — rebuild from the active provider and keep the selection valid.
+      if (next.meta !== undefined || next.provider !== undefined || next.model !== undefined)
+        recomputeModels(next.model);
       if (!historyView.hidden) showLive();  // don't strand the user in a stale history pane
       applyConfigured();
       // A just-enabled origin starts polling now; a changed cadence restarts the timer at the new rate.

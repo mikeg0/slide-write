@@ -72,6 +72,81 @@ def model_allowed(m):
     return any(x["id"] == m for x in MODELS)
 
 
+# --- Provider selection (Anthropic / OpenAI / Google) ---------------------------------------
+# Anthropic is the default path (the `claude` CLI above). OpenAI is driven by the `codex` CLI
+# (`codex exec --json`) — the agentic parallel to claude — which natively authenticates from
+# CODEX_HOME/auth.json (ChatGPT oauth). Google is a not-yet-wired placeholder advertised as disabled.
+CODEX_BIN = arg("codex-bin", os.environ.get("SLIDEWRITE_CODEX_BIN", "codex"))  # `codex` on PATH, or a full path
+CODEX_HOME = arg("codex-home", os.environ.get("SLIDEWRITE_CODEX_HOME", ""))  # "" → codex's own default (~/.codex)
+CODEX_VERSION_FALLBACK = "0.142.0"  # used only if `codex --version` can't be parsed
+_codex_ver = None
+
+
+def codex_home():
+    return CODEX_HOME or os.path.join(os.path.expanduser("~"), ".codex")
+
+
+def codex_client_version():  # the /models endpoint requires client_version
+    global _codex_ver
+    if _codex_ver:
+        return _codex_ver
+    try:
+        out = subprocess.run([CODEX_BIN, "--version"], capture_output=True, text=True, timeout=10).stdout
+        m = re.search(r"(\d+\.\d+\.\d+)", out or "")
+        _codex_ver = m.group(1) if m else CODEX_VERSION_FALLBACK
+    except (OSError, subprocess.SubprocessError):
+        _codex_ver = CODEX_VERSION_FALLBACK
+    return _codex_ver
+
+
+# Fetch the OpenAI model list the way codex does: the ChatGPT-account-scoped /models endpoint, using
+# the oauth access_token from CODEX_HOME/auth.json. (api.openai.com/v1/models 403s with this token —
+# this is the only working source.) Returns [{"id":slug,"label":display_name}] of the *listable*,
+# api-supported models. Cached ~60s so /meta polling doesn't hammer it; any failure → [] (never raises).
+_openai_cache = {"at": 0.0, "models": []}
+
+
+def openai_models():
+    now = time.monotonic()
+    if now - _openai_cache["at"] < 60:
+        return _openai_cache["models"]
+    models = []
+    try:
+        with open(os.path.join(codex_home(), "auth.json"), encoding="utf-8") as fh:
+            auth = json.load(fh)
+        tokens = auth.get("tokens") or {}
+        token, account = tokens.get("access_token"), tokens.get("account_id")
+        if token:
+            ver = codex_client_version()
+            req = urllib.request.Request(
+                f"https://chatgpt.com/backend-api/codex/models?client_version={quote(ver)}",
+                headers={"Authorization": f"Bearer {token}", "chatgpt-account-id": account or "",
+                         "originator": "codex_cli_rs", "User-Agent": "codex_cli_rs"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            models = [{"id": m["slug"], "label": m.get("display_name") or m["slug"]}
+                      for m in (data.get("models") or [])
+                      if m.get("visibility") == "list" and m.get("supported_in_api") is not False]
+    except (OSError, ValueError, urllib.error.URLError) as e:
+        if DEBUG:
+            print("openai_models:", e, file=sys.stderr)
+    _openai_cache["at"], _openai_cache["models"] = now, models
+    return models
+
+
+# Provider list for /meta — the client picks a provider on the options page, then the dropdown shows
+# that provider's `models`. `enabled: False` advertises a provider the UI should show but not allow.
+def providers():
+    openai = openai_models()
+    return [
+        {"id": "anthropic", "label": "Anthropic", "enabled": True, "models": MODELS,
+         "defaultModel": DEFAULT_MODEL or MODELS[0]["id"]},
+        {"id": "openai", "label": "OpenAI", "enabled": True, "models": openai,
+         "defaultModel": (openai[0]["id"] if openai else "gpt-5.5")},
+        {"id": "google", "label": "Google", "enabled": False, "models": []},
+    ]
+
+
 # Gemini "nano banana" image generation. Model id is overridable so a rename doesn't need a code
 # edit. The key is a shim-level fallback used only when a /generate-image request omits one (the
 # extension normally sends it). IMAGE_INSTRUCTIONS is a fallback for the per-project integration
@@ -619,6 +694,121 @@ def stream_query(repo, prompt, body, emit, aborted):
     return had_error
 
 
+# Drive one `codex exec --json` run (the OpenAI provider), mapping codex's JSONL events onto the same
+# §6 SSE contract stream_query emits. Spawns the codex CLI, which reuses CODEX_HOME/auth.json for its
+# ChatGPT-oauth login (no API key here). Returns whether the run errored. The generic PREAMBLE is
+# prepended to the prompt (codex exec has no separate system-prompt flag). Mirrors streamCodex in .mjs.
+def stream_codex(repo, prompt, body, emit, aborted):
+    allowed = openai_models()
+    model = body.get("model") if any(m["id"] == body.get("model") for m in allowed) else None
+    cmd = [CODEX_BIN, "exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
+           "--skip-git-repo-check", "-C", repo]
+    if model:
+        cmd += ["-m", model]
+    # Resume a prior codex thread (thread_id is a UUID, so it passes valid_session_id). `-` makes codex
+    # read the continuation prompt from stdin, same as a fresh run.
+    if valid_session_id(body.get("resume")):
+        cmd += ["resume", body["resume"], "-"]
+    env = dict(os.environ)
+    if CODEX_HOME:
+        env["CODEX_HOME"] = CODEX_HOME
+    try:
+        proc = subprocess.Popen(cmd, cwd=repo, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, encoding="utf-8")
+    except OSError as e:
+        emit("error", {"message": f"could not start `{CODEX_BIN}`: {e}"})
+        return True
+
+    state = {"had_error": False, "last_text": "", "started": False}
+    err_tail = deque(maxlen=40)
+
+    def feed():
+        try:
+            proc.stdin.write(PREAMBLE + "\n\n" + prompt)
+            proc.stdin.close()
+        except OSError:
+            pass
+
+    def drain():
+        for line in proc.stderr:
+            err_tail.append(line)
+            if DEBUG:
+                print("codex stderr:", line, end="", file=sys.stderr)
+
+    def handle(ev):
+        t = ev.get("type")
+        if t == "thread.started":
+            state["started"] = True
+            emit("start", {"sessionId": ev.get("thread_id"), "model": model or body.get("model") or ""})
+        elif t == "item.completed":
+            it = ev.get("item") or {}
+            kind = it.get("type")
+            if kind == "file_change":
+                for c in it.get("changes") or []:
+                    emit("file_edit", {"tool": "codex", "path": rel_path(repo, c.get("path", "")), "id": it.get("id")})
+            elif kind == "agent_message":
+                if it.get("text"):
+                    state["last_text"] = it["text"]
+                    emit("delta", {"text": it["text"]})
+            elif kind == "reasoning":
+                if it.get("text"):
+                    emit("thinking_delta", {"text": it["text"]})
+            elif kind == "command_execution":
+                emit("tool", {"tool": "codex_exec", "detail": it.get("command") or it.get("aggregated_output") or "",
+                              "id": it.get("id")})
+            elif kind == "error":
+                state["had_error"] = True
+                emit("delta", {"text": f"\n[error] {it.get('message', '')}"})
+        elif t == "turn.completed":
+            u = ev.get("usage") or {}
+            emit("usage", {"inputTokens": u.get("input_tokens") or 0, "outputTokens": u.get("output_tokens") or 0,
+                           "cacheReadTokens": u.get("cached_input_tokens") or 0, "cacheCreationTokens": 0,
+                           "thinkingTokens": u.get("reasoning_output_tokens") or 0})
+        elif t in ("error", "turn.failed"):
+            state["had_error"] = True
+            msg = ev.get("message") or (ev.get("error") or {}).get("message") or "codex run failed"
+            emit("delta", {"text": f"\n[error] {msg}"})
+
+    threading.Thread(target=feed, daemon=True).start()
+    threading.Thread(target=drain, daemon=True).start()
+    try:
+        for line in proc.stdout:
+            if aborted():
+                proc.kill()
+                return state["had_error"]
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            handle(ev)
+        proc.wait()
+        if aborted():
+            return state["had_error"]
+        if not state["started"]:
+            state["had_error"] = True
+            emit("error", {"message": "".join(err_tail)[-500:].strip() or "codex did not start"})
+        emit("result", {"isError": state["had_error"], "result": state["last_text"] or None})
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    return state["had_error"]
+
+
+# Provider dispatch for the agent step. Anthropic (default/absent) → the claude CLI; OpenAI → codex;
+# Google → a clean not-yet-supported error. Shared by run_design and run_image.
+def run_agent(repo, prompt, body, emit, aborted):
+    provider = body.get("provider") or "anthropic"
+    if provider == "openai":
+        return stream_codex(repo, prompt, body, emit, aborted)
+    if provider == "google":
+        emit("error", {"message": "Google provider is not yet supported"})
+        return True
+    return stream_query(repo, prompt, body, emit, aborted)
+
+
 # Commit only what THIS run changed (diff of porcelain before/after); no push.
 def commit_changed(repo, dirty0, subj, emit):
     changed = [p for p in porcelain_paths(repo) if p not in dirty0]
@@ -662,7 +852,7 @@ def run_design(body, emit, aborted=lambda: False, repo=None):
     dirty0 = set(porcelain_paths(repo))
     elements = elements_of(body)
     shot_paths = [save_screenshot(el, i) for i, el in enumerate(elements)]
-    had_error = stream_query(repo, build_prompt(body, elements, shot_paths), body, emit, aborted)
+    had_error = run_agent(repo, build_prompt(body, elements, shot_paths), body, emit, aborted)
     if aborted():
         return
     # `autoCommit: false` (extension per-origin option) leaves the edits uncommitted in the working
@@ -704,7 +894,7 @@ def run_image(body, emit, aborted=lambda: False, repo=None):
     prompt = build_image_prompt(
         {**body, "imageInstructions": body.get("imageInstructions") or IMAGE_INSTRUCTIONS},
         elements, tmp_path, bool(image))
-    had_error = stream_query(repo, prompt, body, emit, aborted)
+    had_error = run_agent(repo, prompt, body, emit, aborted)
     if aborted():
         return
     if not had_error and body.get("autoCommit") is not False:
@@ -757,7 +947,8 @@ class Handler(BaseHTTPRequestHandler):
                 "project": os.path.basename(repo), "repoDir": repo, "version": VERSION,
                 "branch": git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
                 "dirty": bool(git(repo, "status", "--porcelain")),
-                "models": MODELS, "defaultModel": DEFAULT_MODEL or MODELS[0]["id"],
+                "models": MODELS, "defaultModel": DEFAULT_MODEL or MODELS[0]["id"],  # legacy top-level = Anthropic
+                "providers": providers(), "defaultProvider": "anthropic",
                 "geminiModel": GEMINI_MODEL, "geminiEnv": bool(GEMINI_KEY),  # geminiEnv: server-side key fallback
             })
         if path == "/history":
