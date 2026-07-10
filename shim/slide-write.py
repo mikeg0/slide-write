@@ -55,21 +55,22 @@ USE_SKILLS = "--use-skills" in sys.argv or bool(os.environ.get("SLIDEWRITE_USE_S
 CLAUDE_BIN = arg("claude-bin", os.environ.get("SLIDEWRITE_CLAUDE_BIN", "claude"))
 VERSION = "0.1.0"
 
-# Models the UI may pick from. Advertised via /meta so the client dropdown stays server-driven; a
-# `/design` request's `model` is validated against this allowlist before reaching the CLI (an
-# unknown id falls back to DEFAULT_MODEL, or the CLI's own default when that's unset). Keep ids in
-# sync with the installed `claude` CLI.
-MODELS = [
-    {"id": "claude-fable-5", "label": "Claude Fable 5"},
-    {"id": "claude-opus-4-8", "label": "Claude Opus 4.8"},
-    {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6"},
-    {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5"},
-]
 DEFAULT_MODEL = arg("model", os.environ.get("SLIDEWRITE_MODEL", ""))  # "" = let the CLI decide
 
 
-def model_allowed(m):
-    return any(x["id"] == m for x in MODELS)
+def effort_label(effort):
+    return "Extra high" if effort == "xhigh" else effort.capitalize()
+
+
+def requested_model(body):
+    model = body.get("model")
+    return model.strip() if isinstance(model, str) and model.strip() else None
+
+
+def requested_effort(body):
+    effort = body.get("effort")
+    return effort if (isinstance(effort, str) and effort != "default"
+                      and re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", effort)) else None
 
 
 # --- Provider selection (Anthropic / OpenAI / Google) ---------------------------------------
@@ -78,7 +79,7 @@ def model_allowed(m):
 # CODEX_HOME/auth.json (ChatGPT oauth). Google is a not-yet-wired placeholder advertised as disabled.
 CODEX_BIN = arg("codex-bin", os.environ.get("SLIDEWRITE_CODEX_BIN", "codex"))  # `codex` on PATH, or a full path
 CODEX_HOME = arg("codex-home", os.environ.get("SLIDEWRITE_CODEX_HOME", ""))  # "" → codex's own default (~/.codex)
-CODEX_VERSION_FALLBACK = "0.142.0"  # used only if `codex --version` can't be parsed
+CODEX_VERSION_FALLBACK = "0.144.1"  # used only if `codex --version` can't be parsed
 _codex_ver = None
 
 
@@ -99,17 +100,59 @@ def codex_client_version():  # the /models endpoint requires client_version
     return _codex_ver
 
 
+# Ask the authenticated Claude CLI for the models available to this repo/account. The initialize
+# control request completes before any user prompt, so discovery consumes no model turn.
+def anthropic_models(repo):
+    cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose",
+           "--input-format", "stream-json", "--setting-sources", "project",
+           "--disable-slash-commands", "--tools", ""]
+    env = dict(os.environ, CLAUDE_CODE_ENTRYPOINT="sdk-py")
+    request = {"request_id": "slidewrite-models", "type": "control_request",
+               "request": {"subtype": "initialize"}}
+    try:
+        proc = subprocess.run(cmd, cwd=repo, env=env, input=json.dumps(request) + "\n",
+                              capture_output=True, text=True, timeout=20)
+        for line in proc.stdout.splitlines():
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            response = message.get("response") or {}
+            if (message.get("type") != "control_response"
+                    or response.get("request_id") != "slidewrite-models"
+                    or response.get("subtype") != "success"):
+                continue
+            raw_models = (response.get("response") or {}).get("models") or []
+            models = []
+            for model in raw_models:
+                value = model.get("value")
+                if not isinstance(value, str) or not value:
+                    continue
+                levels = [level for level in (model.get("supportedEffortLevels") or [])
+                          if isinstance(level, str) and level]
+                efforts = ([{"id": "default", "label": "Default",
+                             "description": "Use Claude Code's configured effort"}]
+                           + [{"id": level, "label": effort_label(level), "description": ""}
+                              for level in levels]) if levels else []
+                models.append({"id": value,
+                               "label": model.get("displayName") or value,
+                               "description": model.get("description") or "",
+                               "efforts": efforts,
+                               "defaultEffort": "default" if levels else ""})
+            return models
+        if DEBUG and proc.returncode:
+            print("anthropic_models: claude exited", proc.returncode, proc.stderr[-1000:], file=sys.stderr)
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        if DEBUG:
+            print("anthropic_models:", e, file=sys.stderr)
+    return []
+
+
 # Fetch the OpenAI model list the way codex does: the ChatGPT-account-scoped /models endpoint, using
 # the oauth access_token from CODEX_HOME/auth.json. (api.openai.com/v1/models 403s with this token —
-# this is the only working source.) Returns [{"id":slug,"label":display_name}] of the *listable*,
-# api-supported models. Cached ~60s so /meta polling doesn't hammer it; any failure → [] (never raises).
-_openai_cache = {"at": 0.0, "models": []}
-
-
+# this is the only working source.) Returns model/effort metadata for the *listable*,
+# api-supported models. Called when the panel opens; any failure → [] (never raises).
 def openai_models():
-    now = time.monotonic()
-    if now - _openai_cache["at"] < 60:
-        return _openai_cache["models"]
     models = []
     try:
         with open(os.path.join(codex_home(), "auth.json"), encoding="utf-8") as fh:
@@ -124,27 +167,44 @@ def openai_models():
                          "originator": "codex_cli_rs", "User-Agent": "codex_cli_rs"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            models = [{"id": m["slug"], "label": m.get("display_name") or m["slug"]}
-                      for m in (data.get("models") or [])
-                      if m.get("visibility") == "list" and m.get("supported_in_api") is not False]
+            models = [{
+                "id": m["slug"],
+                "label": m.get("display_name") or m["slug"],
+                "efforts": [{
+                    "id": level["effort"],
+                    "label": effort_label(level["effort"]),
+                    "description": level.get("description") or "",
+                } for level in (m.get("supported_reasoning_levels") or [])
+                  if isinstance(level.get("effort"), str) and level["effort"]],
+                "defaultEffort": m.get("default_reasoning_level") or "",
+            } for m in (data.get("models") or [])
+              if m.get("visibility") == "list" and m.get("supported_in_api") is not False]
     except (OSError, ValueError, urllib.error.URLError) as e:
         if DEBUG:
             print("openai_models:", e, file=sys.stderr)
-    _openai_cache["at"], _openai_cache["models"] = now, models
     return models
 
 
 # Provider list for /meta — the client picks a provider on the options page, then the dropdown shows
 # that provider's `models`. `enabled: False` advertises a provider the UI should show but not allow.
-def providers():
-    openai = openai_models()
-    return [
-        {"id": "anthropic", "label": "Anthropic", "enabled": True, "models": MODELS,
-         "defaultModel": DEFAULT_MODEL or MODELS[0]["id"]},
-        {"id": "openai", "label": "OpenAI", "enabled": True, "models": openai,
-         "defaultModel": (openai[0]["id"] if openai else "gpt-5.5")},
-        {"id": "google", "label": "Google", "enabled": False, "models": []},
-    ]
+def provider_meta(repo):
+    anthropic, openai = anthropic_models(repo), openai_models()
+    anthropic_default = (DEFAULT_MODEL if DEFAULT_MODEL
+                          and any(m["id"] == DEFAULT_MODEL for m in anthropic)
+                          else (anthropic[0]["id"] if anthropic else ""))
+    return {
+        "models": anthropic,
+        "defaultModel": anthropic_default,
+        "providers": [
+            {"id": "anthropic", "label": "Anthropic", "enabled": True,
+             "models": anthropic, "defaultModel": anthropic_default},
+            {"id": "openai", "label": "OpenAI", "enabled": True,
+             "models": openai, "defaultModel": (openai[0]["id"] if openai else "")},
+            {"id": "google", "label": "Google", "enabled": False,
+             "models": [], "defaultModel": ""},
+        ],
+        "defaultProvider": "anthropic",
+    }
 
 
 # Gemini "nano banana" image generation. Model id is overridable so a rename doesn't need a code
@@ -746,10 +806,9 @@ def stream_query(repo, prompt, body, emit, aborted):
         emit("usage", {"inputTokens": inp, "outputTokens": out, "cacheReadTokens": cr,
                        "cacheCreationTokens": cc, "thinkingTokens": thinking_tokens})
 
-    # Resolve the requested model against the allowlist; fall back to DEFAULT_MODEL (or, if that's
-    # unset, omit `--model` entirely so the CLI uses its own default). The actual model the CLI runs
-    # is echoed back to the client in the `start` event from system/init.
-    model = body.get("model") if model_allowed(body.get("model")) else (DEFAULT_MODEL or None)
+    # The panel selects from the models discovered during /meta. Omitting either override lets Claude
+    # Code apply its own configured default. The actual model is echoed in system/init.
+    model, effort = requested_model(body) or DEFAULT_MODEL or None, requested_effort(body)
     cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
            "--dangerously-skip-permissions",       # runs as you (non-root) → allowed, no callback
            "--setting-sources", "project",         # project CLAUDE.md only, like the SDK shim
@@ -758,6 +817,8 @@ def stream_query(repo, prompt, body, emit, aborted):
         cmd.append("--disable-slash-commands")     # CLI loads skills by default; mirror the SDK's opt-in
     if model:
         cmd += ["--model", model]
+    if effort:
+        cmd += ["--effort", effort]
     if valid_session_id(body.get("resume")):       # continue a prior session if asked
         cmd += ["--resume", body["resume"]]
     try:
@@ -863,12 +924,13 @@ def stream_query(repo, prompt, body, emit, aborted):
 # ChatGPT-oauth login (no API key here). Returns whether the run errored. The generic PREAMBLE is
 # prepended to the prompt (codex exec has no separate system-prompt flag). Mirrors streamCodex in .mjs.
 def stream_codex(repo, prompt, body, emit, aborted):
-    allowed = openai_models()
-    model = body.get("model") if any(m["id"] == body.get("model") for m in allowed) else None
+    model, effort = requested_model(body), requested_effort(body)
     cmd = [CODEX_BIN, "exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
            "--skip-git-repo-check", "-C", repo]
     if model:
         cmd += ["-m", model]
+    if effort:
+        cmd += ["-c", f'model_reasoning_effort="{effort}"']
     # Resume a prior codex thread (thread_id is a UUID, so it passes valid_session_id). `-` makes codex
     # read the continuation prompt from stdin, same as a fresh run.
     if valid_session_id(body.get("resume")):
@@ -1107,12 +1169,12 @@ class Handler(BaseHTTPRequestHandler):
         if not repo:
             return self._json(404, {"error": "no repo mapped for this host"})
         if path == "/meta":
+            model_meta = provider_meta(repo)
             return self._json(200, {
                 "project": os.path.basename(repo), "repoDir": repo, "version": VERSION,
                 "branch": git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
                 "dirty": bool(git(repo, "status", "--porcelain")),
-                "models": MODELS, "defaultModel": DEFAULT_MODEL or MODELS[0]["id"],  # legacy top-level = Anthropic
-                "providers": providers(), "defaultProvider": "anthropic",
+                **model_meta,  # legacy top-level models/defaultModel = discovered Anthropic list
                 "geminiModel": GEMINI_MODEL, "geminiEnv": bool(GEMINI_KEY),  # geminiEnv: server-side key fallback
             })
         # History is provider-scoped: the openai provider reads codex's rollout tree, everything else

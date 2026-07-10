@@ -130,45 +130,40 @@ function relTime(iso) {
   return new Date(iso).toLocaleDateString();
 }
 
-// Built-in fallback model list — used until /meta (which advertises the shim's allowlist) arrives,
-// or when the shim is unreachable. Kept in sync with the shim's MODELS.
-const FALLBACK_MODELS = [
-  { id: "claude-fable-5",            label: "Claude Fable 5" },
-  { id: "claude-opus-4-8",           label: "Claude Opus 4.8" },
-  { id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6" },
-  { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
-];
-
 // Resolve which models the dropdown offers for the chosen provider. /meta advertises a per-provider
 // `providers:[{id,models,defaultModel}]` array; when the selected provider is listed we use its
 // models (even when empty — e.g. a disabled provider, or an OpenAI list the shim couldn't fetch).
-// Pre-/meta or against an old shim with no `providers`, fall back to the legacy top-level `models`,
-// then the built-in Anthropic list.
+// Against an old shim with no `providers`, use the legacy top-level `models`; without server
+// metadata the selector stays empty rather than advertising a stale client-side model list.
 function modelsFor(meta, provider) {
   const p = meta && Array.isArray(meta.providers) ? meta.providers.find((x) => x.id === provider) : null;
   if (p && Array.isArray(p.models))
     return { models: p.models, defaultModel: p.defaultModel || (p.models[0] && p.models[0].id) || "" };
   if (meta && Array.isArray(meta.models) && meta.models.length)
     return { models: meta.models, defaultModel: meta.defaultModel || meta.models[0].id };
-  return { models: FALLBACK_MODELS, defaultModel: FALLBACK_MODELS[0].id };
+  return { models: [], defaultModel: "" };
 }
 
-export function createPanel({ root, shimUrl, token, meta, conn, provider, model, screen, origin, onMarkup, onOpenOptions, onProbe, onSelectModel, onReload, onClose, autoReload, autoCommit, configured, geminiKey, pollInterval, imageInstructions }) {
+export function createPanel({ root, shimUrl, token, meta, conn, provider, model, effort, screen, origin, onMarkup, onOpenOptions, onProbe, onSelectModel, onSelectEffort, onReload, onClose, autoReload, autoCommit, configured, geminiKey, pollInterval, imageInstructions }) {
   // Live config — reassignable via api.setConfig so enabling the origin in Options flips the panel
   // from its disabled "set up" state to live, with no reload. `screen` is the active tab's route
   // (sidepanel.js keeps it current as the tab navigates/switches), sent with each run. `provider`
   // is chosen on the options page and scopes which models the dropdown offers + the run backend.
   let cfg = { shimUrl, token, meta, conn: conn || { state: null }, autoReload: !!autoReload,
     autoCommit: autoCommit !== false, configured: !!configured, screen: screen || "", origin: origin || "",
-    provider: provider || "anthropic",
+    provider: provider || "anthropic", effort: effort || "",
     geminiKey: geminiKey || "", pollInterval: pollInterval || 0, imageInstructions: imageInstructions || "" };
   // Model selection state. `models` is the menu list (server-driven via /meta for the active
-  // provider, else fallback); `selectedModel` is the chosen id sent with each /design request and
+  // provider); `selectedModel` is the chosen id sent with each /design request and
   // persisted per-origin. recomputeModels() rebuilds both when the provider or /meta changes.
   const _init = modelsFor(meta, cfg.provider);
   let models = _init.models;
   let selectedModel = (model && _init.models.some((m) => m.id === model)) ? model
     : (_init.defaultModel || (_init.models[0] && _init.models[0].id) || "");
+  const _initModel = models.find((m) => m.id === selectedModel);
+  let efforts = _initModel && Array.isArray(_initModel.efforts) ? _initModel.efforts : [];
+  let selectedEffort = (effort && efforts.some((e) => e.id === effort)) ? effort
+    : ((_initModel && _initModel.defaultEffort) || (efforts[0] && efforts[0].id) || "");
   let busy = false;
   let controller = null;
   let filesChangedThisRun = false;  // any file_edit this run → auto-reload-on-save reloads at `done`
@@ -288,6 +283,16 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   modelBtn.addEventListener("click", (e) => { e.stopPropagation(); toggleModelMenu(); });
   const modelMenu = el("div", { class: "dmsg-modelmenu", hidden: "" });
 
+  // Reasoning-effort selector — populated from the selected model's /meta effort metadata. It sits
+  // immediately to the right of the model and disappears for providers/models with no effort levels.
+  const effortLabel = el("span", { class: "dmsg-effortlabel" });
+  const effortBtn = el("button", { class: "dmsg-model dmsg-effort", title: "Choose reasoning effort" }, [
+    effortLabel, el("span", { class: "dmsg-chevron", text: "▾" }),
+  ]);
+  effortBtn.addEventListener("click", (e) => { e.stopPropagation(); toggleEffortMenu(); });
+  const effortMenu = el("div", { class: "dmsg-modelmenu dmsg-effortmenu", hidden: "" });
+  const effortWrap = el("div", { class: "dmsg-modelwrap dmsg-effortwrap" }, [effortMenu, effortBtn]);
+
   const sendIcon = el("span", { class: "dmsg-sendicon", text: "➤" });
   const sendLabel = el("span", { class: "dmsg-sendlabel", text: "Send" });
   const sendBtn = el("button", { class: "dmsg-send", title: "Send (Enter)", onclick: () => send() }, [sendIcon, sendLabel]);
@@ -304,6 +309,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     el("div", { class: "dmsg-toolbar-left" }, [
       el("div", { class: "dmsg-pluswrap" }, [plusMenu, plusBtn]),
       el("div", { class: "dmsg-modelwrap" }, [modelMenu, modelBtn]),
+      effortWrap,
     ]),
     sendBtn,
   ]);
@@ -317,11 +323,13 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   function renderModels() {
     const cur = models.find((m) => m.id === selectedModel);
     modelLabel.textContent = cur ? cur.label : (selectedModel || "Model");
+    modelBtn.disabled = !cfg.configured || models.length < 2;
     modelMenu.textContent = "";
     for (const m of models) {
       const active = m.id === selectedModel;
       modelMenu.append(el("button", {
         class: `dmsg-modelitem${active ? " dmsg-modelitem-active" : ""}`,
+        title: m.description || "",
         onclick: (e) => { e.stopPropagation(); selectModel(m.id); },
       }, [
         el("span", { class: "dmsg-modelitem-label", text: m.label }),
@@ -331,13 +339,50 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   }
   function toggleModelMenu(force) {
     const open = force != null ? force : modelMenu.hidden;
+    if (open) { toggleEffortMenu(false); togglePlusMenu(false); }
     modelMenu.hidden = !open;
     modelBtn.classList.toggle("dmsg-model-open", open);
+  }
+  function renderEfforts() {
+    const cur = efforts.find((e) => e.id === selectedEffort);
+    effortLabel.textContent = cur ? cur.label : "Effort";
+    effortWrap.hidden = efforts.length === 0;
+    effortBtn.disabled = !cfg.configured || efforts.length < 2;
+    effortMenu.textContent = "";
+    for (const e of efforts) {
+      const active = e.id === selectedEffort;
+      effortMenu.append(el("button", {
+        class: `dmsg-modelitem${active ? " dmsg-modelitem-active" : ""}`,
+        title: e.description || "",
+        onclick: (ev) => { ev.stopPropagation(); selectEffort(e.id); },
+      }, [
+        el("span", { class: "dmsg-modelitem-label", text: e.label }),
+        active ? el("span", { class: "dmsg-modelitem-check", text: "✓" }) : null,
+      ]));
+    }
+  }
+  function toggleEffortMenu(force) {
+    const open = !effortBtn.disabled && (force != null ? force : effortMenu.hidden);
+    if (open) { toggleModelMenu(false); togglePlusMenu(false); }
+    effortMenu.hidden = !open;
+    effortBtn.classList.toggle("dmsg-model-open", open);
+  }
+  function recomputeEfforts(preferEffort) {
+    const selected = models.find((m) => m.id === selectedModel);
+    efforts = selected && Array.isArray(selected.efforts) ? selected.efforts : [];
+    const advertisedDefault = selected && selected.defaultEffort;
+    const defaultEffort = (efforts.some((e) => e.id === advertisedDefault) && advertisedDefault)
+      || (efforts[0] && efforts[0].id) || "";
+    const want = preferEffort
+      || (efforts.some((e) => e.id === selectedEffort) ? selectedEffort : null)
+      || cfg.effort || defaultEffort;
+    selectedEffort = (efforts.some((e) => e.id === want) ? want : defaultEffort) || "";
+    renderEfforts();
   }
   // Rebuild `models` for the active provider (cfg.provider + cfg.meta) and keep a valid selection:
   // prefer an explicitly requested id, else the current pick if still offered, else the persisted
   // cfg.model, else the provider's default. Called whenever the provider or /meta changes.
-  function recomputeModels(preferModel) {
+  function recomputeModels(preferModel, preferEffort) {
     const { models: ms, defaultModel } = modelsFor(cfg.meta, cfg.provider);
     models = ms;
     const want = preferModel
@@ -345,6 +390,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       || cfg.model || defaultModel;
     selectedModel = (models.some((m) => m.id === want) ? want : defaultModel) || (models[0] && models[0].id) || "";
     renderModels();
+    recomputeEfforts(preferEffort);
   }
 
   // Render the "+" menu items, reflecting current toggle state (Image Generation = imageMode).
@@ -360,7 +406,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   }
   function togglePlusMenu(force) {
     const open = force != null ? force : plusMenu.hidden;
-    if (open) renderPlusMenu();
+    if (open) { renderPlusMenu(); toggleModelMenu(false); toggleEffortMenu(false); }
     plusMenu.hidden = !open;
     plusBtn.classList.toggle("dmsg-plus-open", open);
   }
@@ -381,19 +427,28 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   function selectModel(id) {
     selectedModel = id;
     renderModels();
+    recomputeEfforts();
     toggleModelMenu(false);
     onSelectModel && onSelectModel(id);   // persist per-origin (inject.js → background store)
+  }
+  function selectEffort(id) {
+    selectedEffort = id;
+    renderEfforts();
+    toggleEffortMenu(false);
+    onSelectEffort && onSelectEffort(id);
   }
   // Close the menu on any click elsewhere (composed clicks from inside the shadow root that should
   // keep it open call stopPropagation, so they never reach here) and on Esc before it closes the
   // whole panel.
-  document.addEventListener("click", () => { toggleModelMenu(false); togglePlusMenu(false); });
+  document.addEventListener("click", () => { toggleModelMenu(false); toggleEffortMenu(false); togglePlusMenu(false); });
   composer.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     if (!modelMenu.hidden) { e.stopPropagation(); toggleModelMenu(false); }
+    else if (!effortMenu.hidden) { e.stopPropagation(); toggleEffortMenu(false); }
     else if (!plusMenu.hidden) { e.stopPropagation(); togglePlusMenu(false); }
   });
   renderModels();
+  renderEfforts();
   renderPlusMenu();
 
   // First-run / unconfigured state: the panel still slides out, but instead of a live composer it
@@ -423,7 +478,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       diagCodePy,
     ]),
   ]);
-  const diagRetry = el("button", { class: "dmsg-diag-btn", text: "↻ Retry", onclick: () => reprobe() });
+  const diagRetry = el("button", { class: "dmsg-diag-btn", text: "↻ Retry", onclick: () => reprobe(true) });
   const diagSettings = el("button", { class: "dmsg-diag-btn dmsg-diag-btn-ghost", text: "⚙️ Options", onclick: () => onOpenOptions && onOpenOptions() });
   const diag = el("div", { class: "dmsg-diag", hidden: "" }, [
     diagTitle, diagText, diagCodes,
@@ -490,11 +545,11 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   }
   // Re-check the connection on demand (panel open, poll tick, after a failed send) and update the UI.
   let probing = false;
-  async function reprobe() {
+  async function reprobe(includeMeta = false) {
     if (!cfg.configured || !onProbe || probing) return;
     probing = true;
     try {
-      const p = await onProbe(cfg.shimUrl, cfg.token);
+      const p = await onProbe(cfg.shimUrl, cfg.token, includeMeta);
       if (!p) return;
       cfg.conn = { state: p.state, detail: p.detail };
       if (p.meta) {
@@ -505,7 +560,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     } finally { probing = false; }
   }
   // Light liveness polling — only while the panel is OPEN, so closed tabs add no background churn.
-  // A cheap GET /health + /meta flips the status as the shim goes up/down. Cadence is the global
+  // A cheap GET /health flips the status as the shim goes up/down; /meta is loaded only at setup.
+  // Cadence is the global
   // Options setting (seconds; 0/unset → 5s default), floored at 1s.
   let pollTimer = null;
   const pollMs = () => Math.max(1, cfg.pollInterval || 5) * 1000;
@@ -702,6 +758,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     historyBtn.disabled = !ok;
     textarea.disabled = !ok;
     sendBtn.disabled = !ok;
+    modelBtn.disabled = !ok || models.length < 2;
+    effortBtn.disabled = !ok || efforts.length < 2;
     renderConn();
   }
 
@@ -725,7 +783,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   function readComposer() {
     const prompt = textarea.value.trim();
     if (!prompt) return null;
-    const intent = { prompt, image: imageMode, elements: elementCtxs.slice(), model: selectedModel };
+    const intent = { prompt, image: imageMode, elements: elementCtxs.slice(), model: selectedModel, effort: selectedEffort };
     textarea.value = "";
     clearElementContext();
     return intent;
@@ -734,10 +792,10 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   // Run one intent: build the §7 payload (resolving resumeId LIVE so a queued follow-up threads into
   // whatever session the prior run settled on), stream it, then drain the next queued intent.
   function dispatch(intent) {
-    const { prompt, image, elements, model } = intent;
+    const { prompt, image, elements, model, effort } = intent;
     let payload, path;
     if (image) {
-      payload = { imagePrompt: prompt, screen: cfg.screen || "", model, provider: cfg.provider,
+      payload = { imagePrompt: prompt, screen: cfg.screen || "", model, effort, provider: cfg.provider,
         geminiKey: cfg.geminiKey, imageInstructions: cfg.imageInstructions, autoCommit: cfg.autoCommit };
       // Strip the element screenshots — /generate-image uses imageDataUrl (the canvas-read source
       // pixels) for image-to-image; the screenshots would just bloat the payload.
@@ -745,7 +803,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
         payload.elements = elements.map(({ screenshotDataUrl, screenshotW, screenshotH, ...rest }) => rest);
       path = "/generate-image";
     } else {
-      payload = { prompt, screen: cfg.screen || "", model, provider: cfg.provider, autoCommit: cfg.autoCommit };
+      payload = { prompt, screen: cfg.screen || "", model, effort, provider: cfg.provider, autoCommit: cfg.autoCommit };
       // Drop imageDataUrl (only meaningful to /generate-image) and the UI-only screenshot dimensions,
       // but KEEP screenshotDataUrl — the shim writes each to a temp file for claude to Read.
       if (elements.length)
@@ -977,7 +1035,6 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     isOpen: () => true,
     open() {
       textarea.focus();
-      reprobe();        // re-check on open so a stale "wired to" flips to offline immediately
       startPolling();   // keep it live while visible
     },
     close() {
@@ -1012,7 +1069,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       // A fresh /meta, a provider switch (options page), or an explicit model all change which models
       // are offered / selected — rebuild from the active provider and keep the selection valid.
       if (next.meta !== undefined || next.provider !== undefined || next.model !== undefined)
-        recomputeModels(next.model);
+        recomputeModels(next.model, next.effort);
+      else if (next.effort !== undefined) recomputeEfforts(next.effort);
       if (!historyView.hidden) showLive();  // don't strand the user in a stale history pane
       applyConfigured();
       // A just-enabled origin starts polling now; a changed cadence restarts the timer at the new rate.

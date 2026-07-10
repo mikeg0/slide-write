@@ -17,6 +17,7 @@ function resolve(c, origin) {
     autoCommit: !(c && c.autoCommit === false),  // default ON — only an explicit false opts out
     provider: (c && c.provider) || "anthropic",  // chosen on the options page; scopes the model dropdown
     model: (c && c.model) || "",
+    effort: (c && c.effort) || "",
     geminiKey: (c && c.geminiKey) || "",
     pollInterval: (c && c.pollInterval) || 0,
     imageInstructions: (c && c.imageInstructions) || "",
@@ -24,13 +25,15 @@ function resolve(c, origin) {
     copyPath: !(c && c.copyPath === false),     // global, default ON: Shift+click copies the element's selector
   };
 }
-// Same contract as inject.js's probe: { state:"live", meta } · "unauthorized" · "unreachable" · null.
-async function probe(shimUrl, token) {
+// Health is polled while the panel is open; /meta (including model discovery) is requested only
+// during panel/origin setup by passing includeMeta=true.
+async function probe(shimUrl, token, includeMeta = false) {
   if (!token) return { state: null };
   try {
     const h = await fetch(`${shimUrl}/health`, { cache: "no-store" });
     if (!h.ok) return { state: "unreachable", detail: `health ${h.status}` };
   } catch { return { state: "unreachable" }; }
+  if (!includeMeta) return { state: "live" };
   try {
     const r = await fetch(`${shimUrl}/meta`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
     if (r.status === 401) return { state: "unauthorized" };
@@ -55,7 +58,7 @@ async function getCfg(origin) {
 // --- State (one persistent panel, rebound to the active tab) ---------------------------------------
 let panel = null;
 let activeTabId = null, currentOrigin = null;
-let liveCfg = null, lastMeta = null, lastConn = null;
+let liveCfg = null;
 let pickerArmed = false;
 let syncing = false;
 
@@ -152,21 +155,24 @@ async function mount() {
   currentOrigin = tab ? originOf(tab.url) : null;
   const screen = tab ? screenOf(tab.url) : "";
   const init = await getCfg(currentOrigin);
-  const conn = init.configured ? await probe(init.shimUrl, init.token) : { state: null };
-  liveCfg = init; lastMeta = conn.meta || null; lastConn = conn;
+  const conn = init.configured ? await probe(init.shimUrl, init.token, true) : { state: null };
+  liveCfg = init;
 
   panel = createPanel({
     root: document.getElementById("root"),
     shimUrl: init.shimUrl, token: init.token, meta: conn.meta || null,
     conn: { state: conn.state, detail: conn.detail }, screen, origin: currentOrigin || "",
     configured: init.configured, autoReload: init.autoReload, autoCommit: init.autoCommit,
-    provider: init.provider, model: init.model, geminiKey: init.geminiKey, pollInterval: init.pollInterval,
+    provider: init.provider, model: init.model, effort: init.effort,
+    geminiKey: init.geminiKey, pollInterval: init.pollInterval,
     imageInstructions: init.imageInstructions,
     onProbe: probe,
     onMarkup: togglePicker,
     onOpenOptions: () => chrome.runtime.sendMessage({ type: "openOptions" }).catch(() => {}),
     onSelectModel: (id) => currentOrigin &&
       chrome.runtime.sendMessage({ type: "setOrigin", origin: currentOrigin, value: { model: id } }).catch(() => {}),
+    onSelectEffort: (id) => currentOrigin &&
+      chrome.runtime.sendMessage({ type: "setOrigin", origin: currentOrigin, value: { effort: id } }).catch(() => {}),
     // Auto-reload-on-save now reloads the APP tab (the side panel isn't the page).
     onReload: () => { if (activeTabId != null) chrome.tabs.reload(activeTabId).catch(() => {}); },
     // The ✕ closes the side panel document itself.
@@ -198,15 +204,16 @@ async function syncActiveTab() {
     if (newOrigin === currentOrigin) { panel.setConfig({ screen: newScreen }); return; }  // same origin, new route
     currentOrigin = newOrigin;
     const next = await getCfg(newOrigin);
-    const conn = next.configured ? await probe(next.shimUrl, next.token) : { state: null };
-    liveCfg = next; lastMeta = conn.meta || null; lastConn = conn;
+    const conn = next.configured ? await probe(next.shimUrl, next.token, true) : { state: null };
+    liveCfg = next;
     panel.cancel();        // abort any in-flight run bound to the old origin
     panel.resetThread();   // fresh thread + cleared picks for the new origin
     panel.setConfig({
       shimUrl: next.shimUrl, token: next.token, meta: conn.meta || null,
       conn: { state: conn.state, detail: conn.detail }, screen: newScreen, origin: newOrigin || "",
       configured: next.configured, autoReload: next.autoReload, autoCommit: next.autoCommit,
-      provider: next.provider, model: next.model, geminiKey: next.geminiKey, pollInterval: next.pollInterval,
+      provider: next.provider, model: next.model, effort: next.effort,
+      geminiKey: next.geminiKey, pollInterval: next.pollInterval,
       imageInstructions: next.imageInstructions,
     });
   } finally { syncing = false; }
@@ -222,13 +229,18 @@ chrome.storage.onChanged.addListener(async (changes, area) => {
   const nv = changes.slidewrite.newValue || {};
   const next = resolve({ ...((nv.origins || {})[currentOrigin] || null), geminiKey: nv.geminiKey || "", pollInterval: nv.pollInterval || 0 }, currentOrigin);
   const connChanged = next.shimUrl !== liveCfg.shimUrl || next.token !== liveCfg.token || next.configured !== liveCfg.configured;
-  const c = connChanged ? (next.configured ? await probe(next.shimUrl, next.token) : { state: null }) : lastConn;
-  const m = c.meta || (connChanged ? null : lastMeta);
-  liveCfg = next; lastMeta = m; lastConn = c;
-  panel.setConfig({ shimUrl: next.shimUrl, token: next.token, meta: m, conn: { state: c.state, detail: c.detail },
+  const update = { shimUrl: next.shimUrl, token: next.token,
     autoReload: next.autoReload, autoCommit: next.autoCommit, configured: next.configured,
-    provider: next.provider, model: next.model,
-    geminiKey: next.geminiKey, pollInterval: next.pollInterval, imageInstructions: next.imageInstructions });
+    provider: next.provider, model: next.model, effort: next.effort,
+    geminiKey: next.geminiKey, pollInterval: next.pollInterval, imageInstructions: next.imageInstructions };
+  if (connChanged) {
+    const c = next.configured ? await probe(next.shimUrl, next.token, true) : { state: null };
+    const m = c.meta || null;
+    update.meta = m;
+    update.conn = { state: c.state, detail: c.detail };
+  }
+  liveCfg = next;
+  panel.setConfig(update);
 });
 
 mount();

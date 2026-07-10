@@ -34,18 +34,12 @@ const DEBUG   = process.argv.includes("--debug") || !!process.env.SW_DEBUG;  // 
 const USE_SKILLS = process.argv.includes("--use-skills") || !!process.env.SLIDEWRITE_USE_SKILLS;
 const VERSION = "0.1.0";
 
-// Models the UI may pick from. Advertised via /meta so the client dropdown stays server-driven; a
-// `/design` request's `model` is validated against this allowlist before reaching the SDK (an
-// unknown id falls back to DEFAULT_MODEL, or the SDK's own default when that's unset). Keep ids in
-// sync with the installed `claude` CLI / Agent SDK.
-const MODELS = [
-  { id: "claude-fable-5",            label: "Claude Fable 5" },
-  { id: "claude-opus-4-8",           label: "Claude Opus 4.8" },
-  { id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6" },
-  { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
-];
 const DEFAULT_MODEL = arg("model", process.env.SLIDEWRITE_MODEL ?? ""); // "" = let the SDK decide
-const modelAllowed  = (m) => MODELS.some((x) => x.id === m);
+const effortLabel = (id) => id === "xhigh" ? "Extra high" : id.charAt(0).toUpperCase() + id.slice(1);
+const requestedModel = (body) => typeof body.model === "string" && body.model.trim()
+  ? body.model.trim() : undefined;
+const selectedEffort = (body) => typeof body.effort === "string"
+  && body.effort !== "default" && /^[a-z][a-z0-9_-]{0,31}$/.test(body.effort) ? body.effort : undefined;
 
 // --- Provider selection (Anthropic / OpenAI / Google) ---------------------------------------
 // Anthropic is the default path (the claude Agent SDK above). OpenAI is driven by the `codex` CLI
@@ -54,7 +48,7 @@ const modelAllowed  = (m) => MODELS.some((x) => x.id === m);
 const CODEX_BIN  = arg("codex-bin",  process.env.SLIDEWRITE_CODEX_BIN  ?? "codex"); // `codex` on PATH, or a full path
 const CODEX_HOME = arg("codex-home", process.env.SLIDEWRITE_CODEX_HOME ?? "");       // "" → codex's own default (~/.codex)
 const codexHome  = () => CODEX_HOME || join(os.homedir(), ".codex");
-const CODEX_VERSION_FALLBACK = "0.142.0"; // used only if `codex --version` can't be parsed
+const CODEX_VERSION_FALLBACK = "0.144.1"; // used only if `codex --version` can't be parsed
 let _codexVer;
 function codexClientVersion() {                                  // the /models endpoint requires client_version
   if (_codexVer) return _codexVer;
@@ -65,14 +59,39 @@ function codexClientVersion() {                                  // the /models 
   return _codexVer;
 }
 
+// Ask the authenticated Claude Code subprocess for the models available to this repo/account. An
+// empty async input stream lets the SDK complete its initialization handshake without a model turn.
+async function anthropicModels(repo) {
+  async function* emptyPrompt() {}
+  let q;
+  try {
+    q = query({ prompt: emptyPrompt(), options: { cwd: repo, settingSources: ["project"] } });
+    return (await q.supportedModels())
+      .filter((m) => typeof m.value === "string" && m.value)
+      .map((m) => {
+        const levels = (m.supportedEffortLevels || []).filter((id) => typeof id === "string" && id);
+        return {
+          id: m.value,
+          label: m.displayName || m.value,
+          description: m.description || "",
+          efforts: levels.length ? [
+            { id: "default", label: "Default", description: "Use Claude Code's configured effort" },
+            ...levels.map((id) => ({ id, label: effortLabel(id), description: "" })),
+          ] : [],
+          defaultEffort: levels.length ? "default" : "",
+        };
+      });
+  } catch (e) {
+    if (DEBUG) console.error("anthropicModels:", e?.message || e);
+    return [];
+  } finally { q?.close(); }
+}
+
 // Fetch the OpenAI model list the way codex does: the ChatGPT-account-scoped /models endpoint, using
 // the oauth access_token from CODEX_HOME/auth.json. (api.openai.com/v1/models 403s with this token —
-// this is the only working source.) Returns {id:slug,label:display_name}[] of the *listable*,
-// api-supported models. Cached ~60s so /meta polling doesn't hammer it; any failure → [] (never throws).
-let _openAiCache = { at: 0, models: [] };
+// this is the only working source.) Returns model/effort metadata for the *listable*,
+// api-supported models. Called when the panel opens; any failure → [] (never throws).
 async function openAiModels() {
-  const now = Date.now();
-  if (now - _openAiCache.at < 60_000) return _openAiCache.models;
   let models = [];
   try {
     const auth = JSON.parse(await readFile(join(codexHome(), "auth.json"), "utf8"));
@@ -86,23 +105,40 @@ async function openAiModels() {
         const data = await res.json();
         models = (data.models || [])
           .filter((m) => m.visibility === "list" && m.supported_in_api !== false)
-          .map((m) => ({ id: m.slug, label: m.display_name || m.slug }));
+          .map((m) => ({
+            id: m.slug,
+            label: m.display_name || m.slug,
+            efforts: (m.supported_reasoning_levels || [])
+              .filter((level) => typeof level.effort === "string" && level.effort)
+              .map((level) => ({
+                id: level.effort,
+                label: effortLabel(level.effort),
+                description: level.description || "",
+              })),
+            defaultEffort: m.default_reasoning_level || "",
+          }));
       } else if (DEBUG) console.error("openAiModels: HTTP", res.status);
     }
   } catch (e) { if (DEBUG) console.error("openAiModels:", e?.message || e); }
-  _openAiCache = { at: now, models };
   return models;
 }
 
 // Provider list for /meta — the client picks a provider on the options page, then the dropdown shows
 // that provider's `models`. `enabled:false` advertises a provider the UI should show but not allow.
-async function providers() {
-  const openai = await openAiModels();
-  return [
-    { id: "anthropic", label: "Anthropic", enabled: true, models: MODELS, defaultModel: DEFAULT_MODEL || MODELS[0].id },
-    { id: "openai",    label: "OpenAI",    enabled: true, models: openai, defaultModel: openai[0]?.id || "gpt-5.5" },
-    { id: "google",    label: "Google",    enabled: false, models: [] },
-  ];
+async function providerMeta(repo) {
+  const [anthropic, openai] = await Promise.all([anthropicModels(repo), openAiModels()]);
+  const anthropicDefault = (DEFAULT_MODEL && anthropic.some((m) => m.id === DEFAULT_MODEL) && DEFAULT_MODEL)
+    || anthropic[0]?.id || "";
+  return {
+    models: anthropic,
+    defaultModel: anthropicDefault,
+    providers: [
+      { id: "anthropic", label: "Anthropic", enabled: true, models: anthropic, defaultModel: anthropicDefault },
+      { id: "openai",    label: "OpenAI",    enabled: true, models: openai, defaultModel: openai[0]?.id || "" },
+      { id: "google",    label: "Google",    enabled: false, models: [], defaultModel: "" },
+    ],
+    defaultProvider: "anthropic",
+  };
 }
 
 // Gemini "nano banana" image generation. Model id is overridable so a rename doesn't need a code
@@ -550,16 +586,16 @@ async function streamQuery(repo, prompt, body, emit, aborted) {
     emit("usage", { inputTokens: inp, outputTokens: out, cacheReadTokens: cr,
       cacheCreationTokens: cc, thinkingTokens });
   };
-  // Resolve the requested model against the allowlist; fall back to DEFAULT_MODEL (or, if that's
-  // unset, omit `model` entirely so the SDK uses its own default). The actual model the SDK runs is
-  // echoed back to the client in the `start` event from system/init.
-  const model = modelAllowed(body.model) ? body.model : (DEFAULT_MODEL || undefined);
+  // The panel selects from the models discovered during /meta. Omitting either override lets Claude
+  // Code apply its own configured default. The actual model is echoed in system/init.
+  const model = requestedModel(body) || DEFAULT_MODEL || undefined, effort = selectedEffort(body);
   for await (const m of query({ prompt, options: {
     cwd: repo, permissionMode: "bypassPermissions",  // runs as you (non-root) → allowed, no callback
     allowDangerouslySkipPermissions: true,           // required by the SDK alongside bypassPermissions
     includePartialMessages: true, settingSources: ["project"], systemPrompt: PREAMBLE, maxTurns: 40,
     ...(USE_SKILLS ? { skills: "all" } : {}),                         // load the target repo's project skills
     ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
     ...(validSessionId(body.resume) ? { resume: body.resume } : {}),  // continue a prior session if asked
   } })) {
     if (aborted()) return hadError;
@@ -611,10 +647,10 @@ async function streamQuery(repo, prompt, body, emit, aborted) {
 // ChatGPT-oauth login (no API key here). Returns whether the run errored. The generic PREAMBLE is
 // prepended to the prompt (codex exec has no separate system-prompt flag).
 async function streamCodex(repo, prompt, body, emit, aborted) {
-  const allowed = await openAiModels();
-  const model = allowed.some((m) => m.id === body.model) ? body.model : undefined;  // unknown id → codex default
+  const model = requestedModel(body), effort = selectedEffort(body);
   const args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repo];
   if (model) args.push("-m", model);
+  if (effort) args.push("-c", `model_reasoning_effort=${JSON.stringify(effort)}`);
   // Resume a prior codex thread (thread_id is a UUID, so it passes validSessionId). `-` makes codex
   // read the continuation prompt from stdin, same as a fresh run.
   if (validSessionId(body.resume)) args.push("resume", body.resume, "-");
@@ -790,15 +826,19 @@ function serve() {
     // always REPO otherwise. streamRun re-resolves itself (it must 404 before the SSE head).
     const repo = await repoFor(req);
     if (!repo) return json(res, 404, { error: "no repo mapped for this host" });
-    if (path === "/meta")
+    if (path === "/meta") {
+      const [branch, status, modelMeta] = await Promise.all([
+        git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
+        git(repo, "status", "--porcelain"),
+        providerMeta(repo),
+      ]);
       return json(res, 200, {
         project: basename(repo), repoDir: repo, version: VERSION,
-        branch: await git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
-        dirty: !!(await git(repo, "status", "--porcelain")),
-        models: MODELS, defaultModel: DEFAULT_MODEL || MODELS[0].id,  // legacy top-level = Anthropic (back-compat)
-        providers: await providers(), defaultProvider: "anthropic",
+        branch, dirty: !!status,
+        ...modelMeta,  // legacy top-level models/defaultModel = discovered Anthropic list (back-compat)
         geminiModel: GEMINI_MODEL, geminiEnv: !!GEMINI_KEY,  // geminiEnv: shim has a server-side key fallback
       });
+    }
     // History is provider-scoped: the openai provider reads codex's rollout tree, everything else
     // (anthropic/absent) reads claude's ~/.claude/projects transcripts. The extension sends the
     // per-origin provider as a `?provider=` query param so the 🕘 view shows the right backend.

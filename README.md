@@ -330,7 +330,7 @@ implementation; both must change together with the contracts).
 
 The shim can drive a second agentic backend for the **OpenAI** provider: the `codex` CLI, the
 parallel to `claude`. When a request carries `provider: "openai"`, the agent step runs
-`codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <repo> [-m <model>]`
+`codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <repo> [-m <model>] [-c model_reasoning_effort="<effort>"]`
 instead of the SDK/CLI. The prompt (PREAMBLE + the built §7 context) is fed on stdin; codex's JSONL
 event stream is mapped onto the **same** §6 SSE events the claude path emits, so nothing downstream
 changes — `streamCodex` (in `slide-write.mjs`) / `stream_codex` (in `slide-write.py`) is just another
@@ -347,18 +347,25 @@ producer of the contract, dispatched by `runAgent`/`run_agent` on `body.provider
 `~/.codex`), the same ChatGPT-oauth credentials the `codex` CLI logs in with. The shim never handles
 the token for *running* a design; it only reads it to **list models** (below).
 
-**Dynamic model list.** Unlike the hardcoded Anthropic list, the OpenAI models in `/meta` are fetched
-live: `GET https://chatgpt.com/backend-api/codex/models?client_version=<v>` with headers
+**Dynamic model lists.** `/meta` discovers both providers' chat models when the side panel opens;
+there are no hard-coded chat-model lists or client fallbacks. The Node shim asks an empty-input Agent
+SDK query for `supportedModels()`, while the Python shim sends Claude CLI an `initialize` control
+request and reads `response.models`. Both use the normal Claude Code login and consume no model turn;
+the result reflects that shim's executable, account entitlements, and managed model policy. Returned
+effort levels are advertised with a `default` choice that leaves Claude Code's configured effort
+untouched.
+
+OpenAI discovery calls `GET https://chatgpt.com/backend-api/codex/models?client_version=<v>` with
 `Authorization: Bearer <access_token>` (from `CODEX_HOME/auth.json`), `chatgpt-account-id`, and
-`originator: codex_cli_rs`; `<v>` comes from `codex --version`. The listable, api-supported entries
-become `{id: slug, label: display_name}`. (`api.openai.com/v1/models` 403s with a ChatGPT-oauth token,
-so this codex endpoint is the only working source.) The result is cached ~60s so `/meta` polling
-doesn't hammer it; any failure (missing/expired token, offline) yields an empty list rather than an
-error — the dropdown just shows no OpenAI models until it recovers.
+`originator: codex_cli_rs`; `<v>` comes from `codex --version`. The listable, API-supported entries
+and their reasoning levels are normalized to the same `{id,label,description?,efforts,defaultEffort}`
+shape. There is no shim cache: the panel fetches `/meta` once as it opens (and when that open panel
+changes origin/connection), while its liveness timer polls only `/health`. A provider discovery
+failure yields an empty list rather than stale model names.
 
 Extra flags (both shims): **`--codex-bin <path>`/`SLIDEWRITE_CODEX_BIN`** (default `codex`) and
 **`--codex-home <dir>`/`SLIDEWRITE_CODEX_HOME`** (default unset → codex's own `~/.codex`). Validated
-against `codex` CLI 0.142.0; `codex exec --json` is the headless equivalent of
+against `codex` CLI 0.144.1; `codex exec --json` is the headless equivalent of
 `claude -p --output-format stream-json`. Resume threads a prior codex session via
 `codex exec … resume <thread_id> -` (the `-` reads the continuation prompt from stdin).
 
@@ -405,16 +412,19 @@ remain the authority for the stats row — there is no streamed mid-run cost, so
 the end. `usage` is live-only: it is not persisted to transcripts and `GET /history/<id>` does not
 replay it.
 
-**Model selection (additive).** `/design` accepts an optional top-level `model` (a model id). The
-shim validates it against an allowlist advertised by `/meta` (`{ models: [{id,label}], defaultModel }`);
-an unknown/absent id falls back to the shim's `--model`/`SLIDEWRITE_MODEL` default, or the SDK's own
-default when that's unset. The model the SDK actually runs is echoed back in the `start` event. The
-extension renders the `/meta` list in a composer dropdown and persists the choice per-origin.
+**Model and effort selection (additive).** `/design` accepts optional top-level `model` and `effort`
+fields selected from the provider metadata fetched when the panel opens. Anthropic receives the
+model through the Agent SDK / Claude CLI and effort through the SDK `effort` option / CLI `--effort`;
+choosing `default` omits the effort override. OpenAI receives `-m <model>` and
+`-c model_reasoning_effort="<effort>"`. The provider CLIs remain authoritative if a caller bypasses
+the UI and submits an invalid value. The extension renders adjacent model/effort dropdowns and
+persists both choices per-origin. The model actually used is echoed in the `start` event.
 
 **Provider selection (additive).** `/design` and `/generate-image` also accept an optional top-level
 `provider` — `"anthropic"` (default/absent), `"openai"`, or `"google"`. `/meta` advertises the choices
-as `providers: [{ id, label, enabled, models: [{id,label}], defaultModel }]` plus `defaultProvider`,
-and the top-level `models`/`defaultModel` stay as the Anthropic list for backward compatibility. The
+as `providers: [{ id, label, enabled, models: [{id,label,efforts?,defaultEffort?}], defaultModel }]`
+plus `defaultProvider`,
+and the top-level `models`/`defaultModel` expose the discovered Anthropic list for backward compatibility. The
 extension's options page picks the provider per-origin; the side-panel model dropdown then shows that
 provider's `models`. `anthropic` runs the claude path above; `openai` runs the codex path
 ([§5.4](#54-provider-selection-anthropic--openai)); `google` is a reserved placeholder advertised
@@ -730,8 +740,9 @@ The UI is split across two contexts that talk over runtime messaging:
 
 - **`sidepanel.html` / `sidepanel.js`** — the side-panel **host**. On load (and on every active-tab
   change — `tabs.onActivated`/`onUpdated`, `windows.onFocusChanged`) it resolves the active tab's
-  origin, looks up that origin's config via the background store, probes `GET <shimUrl>/meta`, and
-  mounts the panel. The single side panel **follows the active tab**: switching to a different origin
+  origin, looks up that origin's config via the background store, fetches `GET <shimUrl>/meta` once,
+  and mounts the panel. While loaded, it polls only `/health` for liveness. The single side panel
+  **follows the active tab**: switching to a different origin
   re-loads its config and resets the thread (a same-origin navigation just updates the `screen`
   value). It owns the picker bridge: the 🎯 button sends `sw-arm-picker` /`sw-disarm-picker` to the
   active tab's content script, and it listens for `sw-element-picked` (→ stack a chip) and
@@ -745,8 +756,8 @@ The UI is split across two contexts that talk over runtime messaging:
 - **`content/panel.js`** — transcript + composer, now mounted into the side-panel document. Renders
   each [§6](#6-the-sse-event-contract) event as a row; **coalesce consecutive same-role streaming
   deltas** into one bubble; tool/result rows break the chain. Footer textarea (Enter sends, ⌘/Ctrl+Enter or Shift+Enter inserts a newline);
-  `AbortController` cancels on close. The composer's toolbar row holds a model selector (populated
-  from `/meta`, persisted per-origin) and the send button. A 🕘 header button opens a **history
+  `AbortController` cancels on close. The composer's toolbar row holds adjacent model and reasoning-
+  effort selectors (populated from `/meta`, persisted per-origin) and the send button. A 🕘 header button opens a **history
   view**: `GET /history?provider=<selected>` lists this repo's past sessions for the chosen provider;
   picking one calls `GET /history/<id>?provider=<selected>` and
   **replays it read-only** through the same `onEvent` renderer. A **↻ Resume** action threads

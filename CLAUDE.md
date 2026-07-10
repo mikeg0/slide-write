@@ -9,7 +9,7 @@ edits the real source → the dev server hot-reloads. **README.md is the authori
 it and implement/extend in the order of its §12 "Build order for Claude".
 
 **Current state: built.** Both `shim/` and `extension/` exist and run; on top of the original
-`/design` flow the shim adds chat history, session resume, model selection, **Gemini "nano
+`/design` flow the shim adds chat history, session resume, dynamic provider model/effort selection, **Gemini "nano
 banana" image generation** (`POST /generate-image`, the `image_status`/`image_generated` SSE events,
 and the §7 `imageDataUrl` capture field), **multi-host mode** (README §5.2: `--repo-root`/
 `--repos` resolve the target repo per request from the `Host` header behind the §13 reverse proxy;
