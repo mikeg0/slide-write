@@ -549,8 +549,17 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     if (!cfg.configured || !onProbe || probing) return;
     probing = true;
     try {
-      const p = await onProbe(cfg.shimUrl, cfg.token, includeMeta);
+      const previousState = cfg.conn && cfg.conn.state;
+      let p = await onProbe(cfg.shimUrl, cfg.token, includeMeta);
       if (!p) return;
+      // Polling normally uses the cheap /health check. When that check is the one that discovers
+      // the shim has come back, immediately finish the normal startup probe with /meta before
+      // exposing the live state. That refreshes the discovered model list and the repo/branch shown
+      // in the header, leaving the composer ready for its first message without a panel reload.
+      if (!includeMeta && previousState !== "live" && p.state === "live") {
+        const refreshed = await onProbe(cfg.shimUrl, cfg.token, true);
+        if (refreshed) p = refreshed;
+      }
       cfg.conn = { state: p.state, detail: p.detail };
       if (p.meta) {
         cfg.meta = p.meta;
@@ -560,8 +569,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     } finally { probing = false; }
   }
   // Light liveness polling — only while the panel is OPEN, so closed tabs add no background churn.
-  // A cheap GET /health flips the status as the shim goes up/down; /meta is loaded only at setup.
-  // Cadence is the global
+  // A cheap GET /health tracks the shim; the first successful check after an outage also loads
+  // /meta so reconnect has the same model/repo state as initial setup. Cadence is the global
   // Options setting (seconds; 0/unset → 5s default), floored at 1s.
   let pollTimer = null;
   const pollMs = () => Math.max(1, cfg.pollInterval || 5) * 1000;
