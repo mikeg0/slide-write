@@ -741,10 +741,12 @@ The UI is split across two contexts that talk over runtime messaging:
 - **`sidepanel.html` / `sidepanel.js`** — the side-panel **host**. On load (and on every active-tab
   change — `tabs.onActivated`/`onUpdated`, `windows.onFocusChanged`) it resolves the active tab's
   origin, looks up that origin's config via the background store, fetches `GET <shimUrl>/meta` once,
-  and mounts the panel. While loaded, it polls only `/health` for liveness. The single side panel
-  **follows the active tab**: switching to a different origin
-  re-loads its config and resets the thread (a same-origin navigation just updates the `screen`
-  value). It owns the picker bridge: the 🎯 button sends `sw-arm-picker` /`sw-disarm-picker` to the
+  and mounts the panel. While loaded, it polls only `/health` for liveness. The single side-panel
+  document **follows the active tab**, caching one panel instance per browser tab: switching tabs
+  swaps the visible instance, while each tab retains its transcript, draft, picks, history view,
+  and resumed thread. Only the visible instance polls for liveness. A same-tab navigation to a new
+  origin starts a fresh instance; a same-origin navigation just updates the `screen` value. It owns
+  the picker bridge: the 🎯 button sends `sw-arm-picker` /`sw-disarm-picker` to the
   active tab's content script, and it listens for `sw-element-picked` (→ stack a chip) and
   `sw-picker-state` (→ reflect the 🎯 toggle).
 - **`content/inject.js`** — the page-side **picker bridge** (all that's left in the page). Inert until

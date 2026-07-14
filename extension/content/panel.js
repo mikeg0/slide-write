@@ -165,6 +165,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   let selectedEffort = (effort && efforts.some((e) => e.id === effort)) ? effort
     : ((_initModel && _initModel.defaultEffort) || (efforts[0] && efforts[0].id) || "");
   let busy = false;
+  let active = false;                 // only the active browser tab's cached panel is visible/polling
   let controller = null;
   let filesChangedThisRun = false;  // any file_edit this run → auto-reload-on-save reloads at `done`
   // Run-status spinner state: while busy, the status bar shows an animated frame + the current run
@@ -440,7 +441,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   // Close the menu on any click elsewhere (composed clicks from inside the shadow root that should
   // keep it open call stopPropagation, so they never reach here) and on Esc before it closes the
   // whole panel.
-  document.addEventListener("click", () => { toggleModelMenu(false); toggleEffortMenu(false); togglePlusMenu(false); });
+  const closeMenus = () => { toggleModelMenu(false); toggleEffortMenu(false); togglePlusMenu(false); };
+  document.addEventListener("click", closeMenus);
   composer.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     if (!modelMenu.hidden) { e.stopPropagation(); toggleModelMenu(false); }
@@ -1039,21 +1041,40 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
 
   const api = {
     el: panel,
-    // The side panel is always visible while its document is loaded — "open" just means focus +
-    // live polling; "close" closes the side-panel document (onClose → window.close).
-    isOpen: () => true,
+    // sidepanel.js keeps one panel instance per browser tab. Activating/deactivating only swaps
+    // visibility + liveness polling; the transcript, draft, picks and resume id stay on this
+    // instance so returning to the tab restores the conversation exactly where it was.
+    isOpen: () => active,
     open() {
+      active = true;
+      panel.hidden = false;
       textarea.focus();
       startPolling();   // keep it live while visible
+    },
+    deactivate() {
+      active = false;
+      panel.hidden = true;
+      stopPolling();
+      toggleModelMenu(false);
+      toggleEffortMenu(false);
+      togglePlusMenu(false);
     },
     close() {
       stopPolling();
       onClose && onClose();
     },
+    destroy() {
+      active = false;
+      stopPolling();
+      if (spinTimer) { clearInterval(spinTimer); spinTimer = null; }
+      if (controller) controller.abort();
+      document.removeEventListener("click", closeMenus);
+      panel.remove();
+    },
     toggle() { onClose && onClose(); },
-    // Reset to a fresh thread for a new origin/tab (sidepanel.js calls this on origin change).
+    // Reset to a fresh thread (sidepanel.js calls this on a same-tab origin change).
     resetThread: () => newChat(),
-    // Abort an in-flight run (e.g. when the active tab switches origins mid-run).
+    // Abort an in-flight run (e.g. when this tab navigates to another origin mid-run).
     cancel: () => { if (controller) controller.abort(); },
     addElementContext,
     // Surface an out-of-band message (e.g. the CDP picker failing to attach) as a transcript row +
@@ -1072,6 +1093,11 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     // refreshes the model list from a freshly-fetched /meta and keeps the selection valid.
     setConfig(next) {
       const intervalChanged = next.pollInterval != null && next.pollInterval !== cfg.pollInterval;
+      const historyInvalidated =
+        (next.shimUrl !== undefined && next.shimUrl !== cfg.shimUrl) ||
+        (next.token !== undefined && next.token !== cfg.token) ||
+        (next.provider !== undefined && next.provider !== cfg.provider) ||
+        (next.configured !== undefined && !!next.configured !== cfg.configured);
       // Only flip `configured` when the caller actually supplied it — a screen-only update
       // (same-origin navigation) must not knock a live panel back into its "set up" state.
       cfg = { ...cfg, ...next, configured: next.configured != null ? !!next.configured : cfg.configured };
@@ -1080,7 +1106,9 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       if (next.meta !== undefined || next.provider !== undefined || next.model !== undefined)
         recomputeModels(next.model, next.effort);
       else if (next.effort !== undefined) recomputeEfforts(next.effort);
-      if (!historyView.hidden) showLive();  // don't strand the user in a stale history pane
+      // Route-only updates are common while following a tab and must preserve an open history
+      // transcript. Only connection/provider changes make that replay stale.
+      if (historyInvalidated && !historyView.hidden) showLive();
       applyConfigured();
       // A just-enabled origin starts polling now; a changed cadence restarts the timer at the new rate.
       if (intervalChanged) stopPolling();

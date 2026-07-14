@@ -3,8 +3,8 @@
 // service worker, which dies ~30s idle mid-run), so the fetch+getReader loop survives a whole run.
 // The element picker stays a content script in the page (content/inject.js) — only a content
 // script can hit-test and overlay the app's DOM — and the two halves coordinate over runtime
-// messaging. One panel persists per window and FOLLOWS the active tab: switching tabs/origins
-// re-resolves that origin's config and resets the thread.
+// messaging. The side-panel document persists per window and caches one panel instance per tab:
+// switching tabs swaps instances so each tab keeps its own transcript, draft, and resumed thread.
 import { createPanel } from "./content/panel.js";
 
 // --- Per-origin config + shim probe (mirrors content/inject.js, but origin varies per active tab) -
@@ -55,12 +55,13 @@ async function getCfg(origin) {
   return resolve(raw, origin);
 }
 
-// --- State (one persistent panel, rebound to the active tab) ---------------------------------------
+// --- State (one cached panel per browser tab) ------------------------------------------------------
 let panel = null;
 let activeTabId = null, currentOrigin = null;
 let liveCfg = null;
 let pickerArmed = false;
 let syncing = false;
+const tabPanels = new Map();
 
 // --- Element picker bridge -------------------------------------------------------------------------
 // The 🎯 button calls onMarkup → we toggle the picker. Two backends coexist, selected per origin:
@@ -148,20 +149,14 @@ document.addEventListener("keydown", (e) => {
   disarmPicker();
 });
 
-// --- Mount + tab-follow ----------------------------------------------------------------------------
-async function mount() {
-  const tab = await activeTab();
-  activeTabId = tab ? tab.id : null;
-  currentOrigin = tab ? originOf(tab.url) : null;
-  const screen = tab ? screenOf(tab.url) : "";
-  const init = await getCfg(currentOrigin);
-  const conn = init.configured ? await probe(init.shimUrl, init.token, true) : { state: null };
-  liveCfg = init;
-
-  panel = createPanel({
+// Build a panel whose callbacks stay bound to its owning browser tab. The origin is read from the
+// cache record at callback time so same-tab navigation cannot accidentally persist a selection
+// against whichever other tab happens to be active then.
+function createTabPanel(tabId, origin, screen, init, conn) {
+  const ownedPanel = createPanel({
     root: document.getElementById("root"),
     shimUrl: init.shimUrl, token: init.token, meta: conn.meta || null,
-    conn: { state: conn.state, detail: conn.detail }, screen, origin: currentOrigin || "",
+    conn: { state: conn.state, detail: conn.detail }, screen, origin: origin || "",
     configured: init.configured, autoReload: init.autoReload, autoCommit: init.autoCommit,
     provider: init.provider, model: init.model, effort: init.effort,
     geminiKey: init.geminiKey, pollInterval: init.pollInterval,
@@ -169,15 +164,38 @@ async function mount() {
     onProbe: probe,
     onMarkup: togglePicker,
     onOpenOptions: () => chrome.runtime.sendMessage({ type: "openOptions" }).catch(() => {}),
-    onSelectModel: (id) => currentOrigin &&
-      chrome.runtime.sendMessage({ type: "setOrigin", origin: currentOrigin, value: { model: id } }).catch(() => {}),
-    onSelectEffort: (id) => currentOrigin &&
-      chrome.runtime.sendMessage({ type: "setOrigin", origin: currentOrigin, value: { effort: id } }).catch(() => {}),
-    // Auto-reload-on-save now reloads the APP tab (the side panel isn't the page).
-    onReload: () => { if (activeTabId != null) chrome.tabs.reload(activeTabId).catch(() => {}); },
+    onSelectModel: (id) => {
+      const record = tabPanels.get(tabId);
+      if (record && record.origin)
+        chrome.runtime.sendMessage({ type: "setOrigin", origin: record.origin, value: { model: id } }).catch(() => {});
+    },
+    onSelectEffort: (id) => {
+      const record = tabPanels.get(tabId);
+      if (record && record.origin)
+        chrome.runtime.sendMessage({ type: "setOrigin", origin: record.origin, value: { effort: id } }).catch(() => {});
+    },
+    // Auto-reload-on-save reloads the panel's owning app tab, even if another tab is active by then.
+    onReload: () => chrome.tabs.reload(tabId).catch(() => {}),
     // The ✕ closes the side panel document itself.
     onClose: () => window.close(),
   });
+  ownedPanel.deactivate();
+  const record = { panel: ownedPanel, origin, cfg: init };
+  tabPanels.set(tabId, record);
+  return record;
+}
+
+async function mount() {
+  const tab = await activeTab();
+  if (!tab || tab.id == null) return;
+  activeTabId = tab.id;
+  currentOrigin = originOf(tab.url);
+  const screen = screenOf(tab.url);
+  const init = await getCfg(currentOrigin);
+  const conn = init.configured ? await probe(init.shimUrl, init.token, true) : { state: null };
+  const record = createTabPanel(activeTabId, currentOrigin, screen, init, conn);
+  panel = record.panel;
+  liveCfg = init;
   panel.open();
 }
 
@@ -200,15 +218,30 @@ async function syncActiveTab() {
       // state on arm, so it needs no query here.
       if (newId != null) chrome.tabs.sendMessage(newId, { type: "sw-query-picker" }).catch(() => {});
     }
+    // Same tab + same origin is only a route update; keep the current instance untouched.
+    if (newId === activeTabId && newOrigin === currentOrigin) {
+      panel.setConfig({ screen: newScreen });
+      return;
+    }
+
+    panel.deactivate();
     activeTabId = newId;
-    if (newOrigin === currentOrigin) { panel.setConfig({ screen: newScreen }); return; }  // same origin, new route
     currentOrigin = newOrigin;
+    if (newId == null) { panel = null; liveCfg = null; return; }
+
+    let record = tabPanels.get(newId);
+    // A tab that navigated to another origin gets a fresh conversation for that new app. Ordinary
+    // tab switching reuses the existing instance and therefore preserves its complete chat state.
+    if (record && record.origin !== newOrigin) {
+      record.panel.destroy();
+      tabPanels.delete(newId);
+      record = null;
+    }
+
     const next = await getCfg(newOrigin);
     const conn = next.configured ? await probe(next.shimUrl, next.token, true) : { state: null };
-    liveCfg = next;
-    panel.cancel();        // abort any in-flight run bound to the old origin
-    panel.resetThread();   // fresh thread + cleared picks for the new origin
-    panel.setConfig({
+    if (!record) record = createTabPanel(newId, newOrigin, newScreen, next, conn);
+    else record.panel.setConfig({
       shimUrl: next.shimUrl, token: next.token, meta: conn.meta || null,
       conn: { state: conn.state, detail: conn.detail }, screen: newScreen, origin: newOrigin || "",
       configured: next.configured, autoReload: next.autoReload, autoCommit: next.autoCommit,
@@ -216,10 +249,20 @@ async function syncActiveTab() {
       geminiKey: next.geminiKey, pollInterval: next.pollInterval,
       imageInstructions: next.imageInstructions,
     });
+    record.cfg = next;
+    panel = record.panel;
+    liveCfg = next;
+    panel.open();
   } finally { syncing = false; }
 }
 chrome.tabs.onActivated.addListener(syncActiveTab);
 chrome.tabs.onUpdated.addListener((tabId, info) => { if (tabId === activeTabId && (info.status === "complete" || info.url)) syncActiveTab(); });
+chrome.tabs.onRemoved.addListener((tabId) => {
+  const record = tabPanels.get(tabId);
+  if (!record) return;
+  record.panel.destroy();
+  tabPanels.delete(tabId);
+});
 chrome.windows.onFocusChanged.addListener((wid) => { if (wid !== chrome.windows.WINDOW_ID_NONE) syncActiveTab(); });
 
 // Live config: an edit in Options for the current origin re-resolves and pushes to the panel, exactly
