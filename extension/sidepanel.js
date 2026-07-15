@@ -61,6 +61,7 @@ let activeTabId = null, currentOrigin = null;
 let liveCfg = null;
 let pickerArmed = false;
 let syncing = false;
+let syncPending = false;
 const tabPanels = new Map();
 
 // --- Element picker bridge -------------------------------------------------------------------------
@@ -197,63 +198,85 @@ async function mount() {
   panel = record.panel;
   liveCfg = init;
   panel.open();
+  // The active tab may have changed while the async config/probe above was in flight. Any
+  // activation received before `panel` existed was marked pending; always reconcile once mounted.
+  syncActiveTab();
 }
 
+// Apply one snapshot of the currently active tab. The public syncActiveTab wrapper below serializes
+// these runs and queues another snapshot whenever Chrome reports a tab change mid-sync.
+async function syncActiveTabOnce() {
+  const tab = await activeTab();
+  const newId = tab ? tab.id : null;
+  const newOrigin = tab ? originOf(tab.url) : null;
+  const newScreen = tab ? screenOf(tab.url) : "";
+  // Leaving a tab where the picker is still armed → disarm it there (either backend), and clear our
+  // local state so the 🎯 button doesn't carry the old tab's armed state onto the new tab.
+  if (newId !== activeTabId) {
+    if (pickerArmed) disarmPicker(activeTabId);
+    pickerArmed = false;
+    panel.setMarkupActive(false);
+    // Ask the tab we just bound to for its authoritative content-script picker state (it echoes via
+    // sw-picker-state); harmless no-op if it has no content script. The CDP picker reports its own
+    // state on arm, so it needs no query here.
+    if (newId != null) chrome.tabs.sendMessage(newId, { type: "sw-query-picker" }).catch(() => {});
+  }
+  // Same tab + same origin is only a route update; keep the current instance untouched.
+  if (newId === activeTabId && newOrigin === currentOrigin) {
+    panel.setConfig({ screen: newScreen });
+    return;
+  }
+
+  panel.deactivate();
+  activeTabId = newId;
+  currentOrigin = newOrigin;
+  // Keep the last panel reference while Chrome momentarily reports no active tab (for example,
+  // during window teardown/focus transitions) so a later activation can still run the reconciler.
+  if (newId == null) { liveCfg = null; return; }
+
+  let record = tabPanels.get(newId);
+  // A tab that navigated to another origin gets a fresh conversation for that new app. Ordinary
+  // tab switching reuses the existing instance and therefore preserves its complete chat state.
+  if (record && record.origin !== newOrigin) {
+    record.panel.destroy();
+    tabPanels.delete(newId);
+    record = null;
+  }
+
+  const next = await getCfg(newOrigin);
+  const conn = next.configured ? await probe(next.shimUrl, next.token, true) : { state: null };
+  if (!record) record = createTabPanel(newId, newOrigin, newScreen, next, conn);
+  else record.panel.setConfig({
+    shimUrl: next.shimUrl, token: next.token, meta: conn.meta || null,
+    conn: { state: conn.state, detail: conn.detail }, screen: newScreen, origin: newOrigin || "",
+    configured: next.configured, autoReload: next.autoReload, autoCommit: next.autoCommit,
+    provider: next.provider, model: next.model, effort: next.effort,
+    geminiKey: next.geminiKey, pollInterval: next.pollInterval,
+    imageInstructions: next.imageInstructions,
+  });
+  record.cfg = next;
+  panel = record.panel;
+  liveCfg = next;
+  panel.open();
+}
+
+// Tab activation/update events can arrive while getCfg()/probe() is still resolving. Never discard
+// those events: mark the synchronizer dirty and keep sampling until no newer event arrived during
+// the preceding pass. This is what makes a quick A → unwired B → A switch reliably restore A.
 async function syncActiveTab() {
+  syncPending = true;
   if (!panel || syncing) return;
   syncing = true;
   try {
-    const tab = await activeTab();
-    const newId = tab ? tab.id : null;
-    const newOrigin = tab ? originOf(tab.url) : null;
-    const newScreen = tab ? screenOf(tab.url) : "";
-    // Leaving a tab where the picker is still armed → disarm it there (either backend), and clear our
-    // local state so the 🎯 button doesn't carry the old tab's armed state onto the new tab.
-    if (newId !== activeTabId) {
-      if (pickerArmed) disarmPicker(activeTabId);
-      pickerArmed = false;
-      panel.setMarkupActive(false);
-      // Ask the tab we just bound to for its authoritative content-script picker state (it echoes via
-      // sw-picker-state); harmless no-op if it has no content script. The CDP picker reports its own
-      // state on arm, so it needs no query here.
-      if (newId != null) chrome.tabs.sendMessage(newId, { type: "sw-query-picker" }).catch(() => {});
+    while (syncPending) {
+      syncPending = false;
+      await syncActiveTabOnce();
     }
-    // Same tab + same origin is only a route update; keep the current instance untouched.
-    if (newId === activeTabId && newOrigin === currentOrigin) {
-      panel.setConfig({ screen: newScreen });
-      return;
-    }
-
-    panel.deactivate();
-    activeTabId = newId;
-    currentOrigin = newOrigin;
-    if (newId == null) { panel = null; liveCfg = null; return; }
-
-    let record = tabPanels.get(newId);
-    // A tab that navigated to another origin gets a fresh conversation for that new app. Ordinary
-    // tab switching reuses the existing instance and therefore preserves its complete chat state.
-    if (record && record.origin !== newOrigin) {
-      record.panel.destroy();
-      tabPanels.delete(newId);
-      record = null;
-    }
-
-    const next = await getCfg(newOrigin);
-    const conn = next.configured ? await probe(next.shimUrl, next.token, true) : { state: null };
-    if (!record) record = createTabPanel(newId, newOrigin, newScreen, next, conn);
-    else record.panel.setConfig({
-      shimUrl: next.shimUrl, token: next.token, meta: conn.meta || null,
-      conn: { state: conn.state, detail: conn.detail }, screen: newScreen, origin: newOrigin || "",
-      configured: next.configured, autoReload: next.autoReload, autoCommit: next.autoCommit,
-      provider: next.provider, model: next.model, effort: next.effort,
-      geminiKey: next.geminiKey, pollInterval: next.pollInterval,
-      imageInstructions: next.imageInstructions,
-    });
-    record.cfg = next;
-    panel = record.panel;
-    liveCfg = next;
-    panel.open();
-  } finally { syncing = false; }
+  } finally {
+    syncing = false;
+    // Defensive against a future change adding an await between the loop condition and finally.
+    if (syncPending) syncActiveTab();
+  }
 }
 chrome.tabs.onActivated.addListener(syncActiveTab);
 chrome.tabs.onUpdated.addListener((tabId, info) => { if (tabId === activeTabId && (info.status === "complete" || info.url)) syncActiveTab(); });

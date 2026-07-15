@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Slide Write",
-  "version": "0.2.45",
+  "version": "0.2.46",
   "description": "Portable AI design assistant — click an element or type a request and an agent edits the running app's source live.",
   "icons": {
     "16": "icons/icon16.png",
