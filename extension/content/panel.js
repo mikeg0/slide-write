@@ -760,9 +760,12 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   // Reflect cfg.configured across the UI: live composer vs. the "set up" prompt.
   function applyConfigured() {
     const ok = cfg.configured;
+    const historyOpen = !historyView.hidden;
     setup.hidden = ok;
-    transcript.hidden = !ok;
-    composer.hidden = !ok;
+    // A config refresh happens whenever a cached tab regains focus. Preserve which view that tab
+    // owns instead of blindly revealing the live transcript underneath an open history pane.
+    transcript.hidden = !ok || historyOpen;
+    composer.hidden = !ok || (historyOpen && !inHistoryDetail);
     markupBtn.disabled = !ok;
     plusBtn.disabled = !ok;
     newChatBtn.disabled = !ok;
