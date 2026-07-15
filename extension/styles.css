@@ -36,8 +36,10 @@ body { background: #14141b; color: #e6e6ef; }
   box-shadow: 0 0 0 2px rgba(204, 122, 91, .35);
 }
 
-/* The `hidden` attribute must beat the explicit display:flex on composer/chip/etc. */
-.dmsg-panel [hidden] { display: none !important; }
+/* The `hidden` attribute must beat explicit display values. Include the panel root itself: the
+   side-panel host caches one full-screen .dmsg-panel per browser tab, and a descendant-only rule
+   leaves an inactive panel's display:flex in force, covering the restored tab underneath it. */
+.dmsg-panel[hidden], .dmsg-panel [hidden] { display: none !important; }
 
 /* First-run / unconfigured "set up" state — fills the panel body in place of the composer. */
 .dmsg-setup {
