@@ -66,7 +66,10 @@ async function anthropicModels(repo) {
   let q;
   try {
     q = query({ prompt: emptyPrompt(), options: { cwd: repo, settingSources: ["project"] } });
-    return (await q.supportedModels())
+    // Bound the handshake (parity with the Python shim's 20s subprocess timeout) so a stuck
+    // subprocess can't hang /meta; the finally close() reaps it either way.
+    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("model discovery timed out")), 20_000).unref());
+    return (await Promise.race([q.supportedModels(), timeout]))
       .filter((m) => typeof m.value === "string" && m.value)
       .map((m) => {
         const levels = (m.supportedEffortLevels || []).filter((id) => typeof id === "string" && id);
@@ -99,12 +102,13 @@ async function openAiModels() {
     if (token) {
       const ver = await codexClientVersion();
       const res = await fetch(`https://chatgpt.com/backend-api/codex/models?client_version=${encodeURIComponent(ver)}`,
-        { headers: { authorization: `Bearer ${token}`, "chatgpt-account-id": account || "",
+        { signal: AbortSignal.timeout(15_000),   // parity with the Python shim's urlopen timeout
+          headers: { authorization: `Bearer ${token}`, "chatgpt-account-id": account || "",
                      originator: "codex_cli_rs", "user-agent": "codex_cli_rs" } });
       if (res.ok) {
         const data = await res.json();
         models = (data.models || [])
-          .filter((m) => m.visibility === "list" && m.supported_in_api !== false)
+          .filter((m) => m.slug && m.visibility === "list" && m.supported_in_api !== false)
           .map((m) => ({
             id: m.slug,
             label: m.display_name || m.slug,
@@ -281,9 +285,11 @@ function buildImagePrompt({ imagePrompt = "", screen, imageInstructions }, eleme
   return parts.join("\n");
 }
 
+const EDIT_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
 const detailOf = (name, i = {}) =>
   name === "Bash" ? (i.command || "") :
-  ["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"].includes(name) ? (i.file_path || i.notebook_path || "") :
+  (name === "Read" || EDIT_TOOLS.includes(name)) ? (i.file_path || i.notebook_path || "") :
   name === "Grep" || name === "Glob" ? (i.pattern || "") : JSON.stringify(i).slice(0, 600);
 
 function resultText(content) {
@@ -385,7 +391,7 @@ async function readHistory(repo, id) {
         else if (b.type === "thinking" && b.thinking) events.push({ type: "thinking_delta", text: b.thinking });
         else if (b.type === "tool_use") {
           tool[b.id] = b.name;
-          if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(b.name))
+          if (EDIT_TOOLS.includes(b.name))
             events.push({ type: "file_edit", tool: b.name, path: relPath(repo, b.input?.file_path || ""), id: b.id });
           else events.push({ type: "tool", tool: b.name, detail: detailOf(b.name, b.input), id: b.id });
         }
@@ -461,14 +467,16 @@ async function codexRollouts() {
 
 // The actual user request out of a codex user_message: drop the PREAMBLE, then keep only the text
 // before the first `\n[…]` context marker buildPrompt appends (screen/element/screenshot lines).
-const codexRequest = (text) => stripPreamble(text).split("\n[")[0].trim() || stripPreamble(text);
+const codexRequest = (text) => { const t = stripPreamble(text); return t.split("\n[")[0].trim() || t; };
+
+const CWD_RE = /"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"/;
 
 // List this repo's codex sessions, newest first (parallel to listHistory for the claude path).
 async function listCodexHistory(repo) {
   const sessions = [];
   for (const { file, id, startedAt } of await codexRollouts()) {
     const head = await readHead(file);
-    const m = /"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(head);   // cwd lives near the start of session_meta
+    const m = CWD_RE.exec(head);                              // cwd lives near the start of session_meta
     if (!m) continue;
     let cwd; try { cwd = JSON.parse(`"${m[1]}"`); } catch { cwd = m[1]; }
     if (resolve(cwd) !== repo) continue;                      // global tree → keep only this repo's sessions
@@ -496,10 +504,16 @@ async function listCodexHistory(repo) {
 // bad id, a session that isn't in this repo, or a missing file.
 async function readCodexHistory(repo, id) {
   if (!validSessionId(id)) return null;
-  const hit = (await codexRollouts()).find((r) => r.id.toLowerCase() === id.toLowerCase());
+  // The id is the rollout filename's suffix, so one directory scan finds the file — no need to
+  // build (and sort) the full listCodexHistory index for a single lookup.
+  let entries;
+  try { entries = await readdir(codexSessionsDir(), { recursive: true, withFileTypes: true }); }
+  catch { return null; }
+  const suffix = `-${id.toLowerCase()}.jsonl`;
+  const hit = entries.find((e) => e.isFile() && e.name.toLowerCase().endsWith(suffix) && ROLLOUT_RE.test(e.name));
   if (!hit) return null;
   let lines;
-  try { lines = (await readFile(hit.file, "utf8")).split("\n").filter(Boolean); }
+  try { lines = (await readFile(join(hit.parentPath || hit.path, hit.name), "utf8")).split("\n").filter(Boolean); }
   catch { return null; }
   let meta; try { meta = JSON.parse(lines[0]); } catch { return null; }
   const cwd = meta?.payload?.cwd;
@@ -541,26 +555,35 @@ async function generateImage({ prompt, key, image, signal }) {
   const parts = [];
   if (image) parts.push({ inlineData: { mimeType: image.mimeType, data: image.data } });
   parts.push({ text: prompt });
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`,
-    { method: "POST", signal,
-      headers: { "content-type": "application/json", "x-goog-api-key": key },
-      body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseModalities: ["TEXT", "IMAGE"] } }) },
-  );
-  if (!res.ok) {
-    let msg = `HTTP ${res.status}`;
-    try { msg = JSON.parse(await res.text())?.error?.message || msg; } catch { /* non-JSON body */ }
-    throw new Error(`Gemini ${res.status}: ${msg}`);
-  }
-  const data = await res.json();
-  if (data.promptFeedback?.blockReason) throw new Error(`Gemini blocked the prompt: ${data.promptFeedback.blockReason}`);
-  const cand = data.candidates?.[0];
-  for (const p of cand?.content?.parts ?? []) {
-    const inl = p.inlineData || p.inline_data;            // v1beta JSON returns camelCase; accept both
-    if (inl?.data) return { bytes: Buffer.from(inl.data, "base64"), mimeType: inl.mimeType || inl.mime_type || "image/png" };
-  }
-  const why = cand?.finishReason && cand.finishReason !== "STOP" ? ` (finishReason: ${cand.finishReason})` : "";
-  throw new Error(`Gemini returned no image${why}`);
+  // Bound the call (parity with the Python shim's 300s urlopen timeout) while still aborting
+  // immediately on client disconnect. (AbortSignal.any needs Node 20.3+; compose by hand for 18.)
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(new Error("Gemini request timed out")), 300_000);
+  timer.unref();
+  const onAbort = () => ctl.abort(signal.reason);
+  if (signal?.aborted) onAbort(); else signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`,
+      { method: "POST", signal: ctl.signal,
+        headers: { "content-type": "application/json", "x-goog-api-key": key },
+        body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseModalities: ["TEXT", "IMAGE"] } }) },
+    );
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try { msg = JSON.parse(await res.text())?.error?.message || msg; } catch { /* non-JSON body */ }
+      throw new Error(`Gemini ${res.status}: ${msg}`);
+    }
+    const data = await res.json();
+    if (data.promptFeedback?.blockReason) throw new Error(`Gemini blocked the prompt: ${data.promptFeedback.blockReason}`);
+    const cand = data.candidates?.[0];
+    for (const p of cand?.content?.parts ?? []) {
+      const inl = p.inlineData || p.inline_data;            // v1beta JSON returns camelCase; accept both
+      if (inl?.data) return { bytes: Buffer.from(inl.data, "base64"), mimeType: inl.mimeType || inl.mime_type || "image/png" };
+    }
+    const why = cand?.finishReason && cand.finishReason !== "STOP" ? ` (finishReason: ${cand.finishReason})` : "";
+    throw new Error(`Gemini returned no image${why}`);
+  } finally { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); }
 }
 
 // Drive one `claude` query, streaming the §6 SSE events. Returns whether the run errored. Shared by
@@ -623,7 +646,7 @@ async function streamQuery(repo, prompt, body, emit, aborted) {
       for (const b of m.message.content ?? []) {
         if (b.type !== "tool_use") continue;
         tool[b.id] = b.name;
-        if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(b.name))
+        if (EDIT_TOOLS.includes(b.name))
           emit("file_edit", { tool: b.name, path: relPath(repo, b.input?.file_path || ""), id: b.id });
         else emit("tool", { tool: b.name, detail: detailOf(b.name, b.input), id: b.id });
       }
@@ -795,9 +818,7 @@ export async function runImage(body, emit, aborted = () => false, signal, repo =
 // Generic SSE wrapper: enforce the per-repo busy lock, set stream headers, parse the body, run
 // `runner`, and always res.end(). An AbortController is tied to an early client disconnect so an
 // in-flight fetch (Gemini) is cancelled too; the polled `aborted()` continues to guard the SDK loop.
-async function streamRun(req, res, runner) {
-  const repo = await repoFor(req);
-  if (!repo) return json(res, 404, { error: "no repo mapped for this host" });
+async function streamRun(req, res, runner, repo) {
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "connection": "keep-alive" });
   if (busyRepos.has(repo)) { sse(res, "error", { message: "a run is already in progress" }); sse(res, "done"); return res.end(); }
   busyRepos.add(repo);
@@ -819,11 +840,12 @@ function serve() {
   http.createServer(async (req, res) => {
     cors(res);
     if (req.method === "OPTIONS") return res.writeHead(204).end();
-    const path = new URL(req.url, "http://x").pathname;
+    const url = new URL(req.url, "http://x");
+    const path = url.pathname;
     if (path === "/health") return json(res, 200, { ok: true });
     if (!authed(req)) return json(res, 401, { error: "unauthorized" });
     // Routes below operate on a repo — resolved per request from Host in multi-host mode,
-    // always REPO otherwise. streamRun re-resolves itself (it must 404 before the SSE head).
+    // always REPO otherwise (404 lands before any SSE head is written).
     const repo = await repoFor(req);
     if (!repo) return json(res, 404, { error: "no repo mapped for this host" });
     if (path === "/meta") {
@@ -842,7 +864,7 @@ function serve() {
     // History is provider-scoped: the openai provider reads codex's rollout tree, everything else
     // (anthropic/absent) reads claude's ~/.claude/projects transcripts. The extension sends the
     // per-origin provider as a `?provider=` query param so the 🕘 view shows the right backend.
-    const histProvider = new URL(req.url, "http://x").searchParams.get("provider") || "anthropic";
+    const histProvider = url.searchParams.get("provider") || "anthropic";
     if (path === "/history" && req.method === "GET")
       return json(res, 200, { sessions: histProvider === "openai" ? await listCodexHistory(repo) : await listHistory(repo) });
     if (path.startsWith("/history/") && req.method === "GET") {
@@ -850,8 +872,8 @@ function serve() {
       const data = histProvider === "openai" ? await readCodexHistory(repo, id) : await readHistory(repo, id);
       return data ? json(res, 200, data) : json(res, 404, { error: "not found" });
     }
-    if (path === "/design" && req.method === "POST") return streamRun(req, res, runDesign);
-    if (path === "/generate-image" && req.method === "POST") return streamRun(req, res, runImage);
+    if (path === "/design" && req.method === "POST") return streamRun(req, res, runDesign, repo);
+    if (path === "/generate-image" && req.method === "POST") return streamRun(req, res, runImage, repo);
     json(res, 404, { error: "not found" });
   }).listen(PORT, BIND, () =>
     console.error(`slide-write → http://${BIND}:${PORT}  ` +

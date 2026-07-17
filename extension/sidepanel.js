@@ -177,8 +177,6 @@ function createTabPanel(tabId, origin, screen, init, conn) {
     },
     // Auto-reload-on-save reloads the panel's owning app tab, even if another tab is active by then.
     onReload: () => chrome.tabs.reload(tabId).catch(() => {}),
-    // The ✕ closes the side panel document itself.
-    onClose: () => window.close(),
   });
   ownedPanel.deactivate();
   const record = { panel: ownedPanel, origin, cfg: init };

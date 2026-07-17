@@ -144,7 +144,7 @@ function modelsFor(meta, provider) {
   return { models: [], defaultModel: "" };
 }
 
-export function createPanel({ root, shimUrl, token, meta, conn, provider, model, effort, screen, origin, onMarkup, onOpenOptions, onProbe, onSelectModel, onSelectEffort, onReload, onClose, autoReload, autoCommit, configured, geminiKey, pollInterval, imageInstructions }) {
+export function createPanel({ root, shimUrl, token, meta, conn, provider, model, effort, screen, origin, onMarkup, onOpenOptions, onProbe, onSelectModel, onSelectEffort, onReload, autoReload, autoCommit, configured, geminiKey, pollInterval, imageInstructions }) {
   // Live config — reassignable via api.setConfig so enabling the origin in Options flips the panel
   // from its disabled "set up" state to live, with no reload. `screen` is the active tab's route
   // (sidepanel.js keeps it current as the tab navigates/switches), sent with each run. `provider`
@@ -230,7 +230,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   const transcript = el("div", { class: "dmsg-transcript" });
   target = transcript;
   // History pane (list of past sessions, or a read-only replay of one) — shown in place of the
-  // transcript+composer; everything stays inside the shadow root.
+  // transcript+composer, inside the same panel element.
   const historyView = el("div", { class: "dmsg-history", hidden: "" });
   // Picked elements render as a stack of chips (one identity chip + optional screenshot chip each),
   // each individually removable — re-rendered wholesale by renderChips().
@@ -438,9 +438,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     toggleEffortMenu(false);
     onSelectEffort && onSelectEffort(id);
   }
-  // Close the menu on any click elsewhere (composed clicks from inside the shadow root that should
-  // keep it open call stopPropagation, so they never reach here) and on Esc before it closes the
-  // whole panel.
+  // Close the menu on any click elsewhere (clicks from inside the menus that should keep them open
+  // call stopPropagation, so they never reach here) and on Esc.
   const closeMenus = () => { toggleModelMenu(false); toggleEffortMenu(false); togglePlusMenu(false); };
   document.addEventListener("click", closeMenus);
   composer.addEventListener("keydown", (e) => {
@@ -678,7 +677,6 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
         break;
       case "commit_error": addRow(el("div", { class: "dmsg-row dmsg-error", text: `commit error: ${ev.message}` })); break;
       case "error":   addRow(el("div", { class: "dmsg-row dmsg-error", text: ev.message })); break;
-      case "aborted": addRow(el("div", { class: "dmsg-row dmsg-note", text: "stream ended" })); break;
       case "done": {
         // Settle the live verb to "finished" (capture model/tokens before setBusy clears them) so
         // the run-status line stops reading "responding" once the turn is complete.
@@ -1043,7 +1041,6 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   }
 
   const api = {
-    el: panel,
     // sidepanel.js keeps one panel instance per browser tab. Activating/deactivating only swaps
     // visibility + liveness polling; the transcript, draft, picks and resume id stay on this
     // instance so returning to the tab restores the conversation exactly where it was.
@@ -1062,10 +1059,6 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       toggleEffortMenu(false);
       togglePlusMenu(false);
     },
-    close() {
-      stopPolling();
-      onClose && onClose();
-    },
     destroy() {
       active = false;
       stopPolling();
@@ -1074,11 +1067,6 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       document.removeEventListener("click", closeMenus);
       panel.remove();
     },
-    toggle() { onClose && onClose(); },
-    // Reset to a fresh thread (sidepanel.js calls this on a same-tab origin change).
-    resetThread: () => newChat(),
-    // Abort an in-flight run (e.g. when this tab navigates to another origin mid-run).
-    cancel: () => { if (controller) controller.abort(); },
     addElementContext,
     // Surface an out-of-band message (e.g. the CDP picker failing to attach) as a transcript row +
     // status line. `error` styles it red. Used by sidepanel.js for "sw-picker-error".
@@ -1091,7 +1079,6 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       markupBtn.classList.toggle("dmsg-iconbtn-active", on);
       markupBtn.title = on ? "Picking — click elements to stack; 🎯 or Esc to finish" : "Pick an element";
     },
-    isBusy: () => busy,
     // Live-update config (e.g. after the origin is enabled in Options) without remounting. Also
     // refreshes the model list from a freshly-fetched /meta and keeps the selection valid.
     setConfig(next) {

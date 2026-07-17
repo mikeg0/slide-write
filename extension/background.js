@@ -1,5 +1,5 @@
 // Slide Write — background service worker (ES module: see manifest "background.type": "module").
-// Owns (1) the per-origin config in chrome.storage, served to options/popup/side panel; (2) the §8.1
+// Owns (1) the per-origin config in chrome.storage, served to the options page & side panel; (2) the §8.1
 // dynamic per-origin content scripts for the default content-script picker; and (3) the OPT-IN
 // chrome.debugger / Chrome DevTools Protocol picker — selected per origin (`debuggerPicker`). The two
 // pickers coexist: the side panel routes to whichever the origin opted into, and both post the same
@@ -22,8 +22,8 @@ async function save(cfg) {
 
 // --- Dynamic per-origin content scripts (§8.1) ---
 // Localhost origins are covered by the static content_scripts entry; every other origin gets a
-// runtime-granted host permission (requested in options/popup, on the user gesture) plus a
-// dynamically registered copy of inject.js. Registration lives here so options, popup, and the
+// runtime-granted host permission (requested on the options page, on the user gesture) plus a
+// dynamically registered copy of inject.js. Registration lives here so the options page and the
 // startup reconcile share one implementation.
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 function isLocalOrigin(origin) {
@@ -397,7 +397,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         cfg.origins[msg.origin] = { ...(cfg.origins[msg.origin] || {}), ...msg.value };
         await save(cfg);
         // Keep the dynamic-script registry in step with `enabled` (no-op for localhost). The host
-        // permission itself was requested by options/popup on the user gesture before this message.
+        // permission itself was requested by the options page on the user gesture before this message.
         const registration = cfg.origins[msg.origin].enabled
           ? await registerOrigin(msg.origin).catch((e) => ({ ok: false, error: String(e?.message || e) }))
           : await unregisterOrigin(msg.origin);

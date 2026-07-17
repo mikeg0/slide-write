@@ -92,8 +92,6 @@ Single-developer, trusted-local tool ([§10](#10-security-model)).
     │   └── sse.js                  # fetch + getReader SSE reader (§8.2, verbatim)
     ├── options.html
     ├── options.js                  # per-origin config: enabled + token + shim URL
-    ├── popup.html
-    ├── popup.js                    # quick enable/disable + "wired to <project>" via /meta
     └── styles.css                  # the side-panel document's styles
 ```
 
@@ -623,7 +621,7 @@ the app's DOM and overlay a highlight. The two halves coordinate over runtime me
   "manifest_version": 3,
   "name": "Slide Write",
   "version": "0.2.x",
-  "permissions": ["storage", "activeTab", "scripting", "sidePanel", "tabs"],
+  "permissions": ["storage", "scripting", "sidePanel", "tabs", "debugger"],
   "host_permissions": ["<all_urls>"],
   "optional_host_permissions": ["https://*/*", "http://*/*"],
   "background": { "service_worker": "background.js" },
@@ -653,7 +651,7 @@ opens it via `chrome.sidePanel.open({ windowId })`.
 
 The content-script `content_scripts` entry (the picker) still matches localhost only; the side panel
 itself works on every tab. **Non-localhost origins (the §13 reverse-proxy fallback) get a
-runtime-granted picker content script:** `optional_host_permissions` lets options/popup call
+runtime-granted picker content script:** `optional_host_permissions` lets the options page call
 `chrome.permissions.request({ origins })` on the save click (user gesture), and on grant the
 background registers `content/inject.js` for that origin via
 `chrome.scripting.registerContentScripts` (id `sw:<origin>`). Disabling unregisters; deleting also
@@ -768,11 +766,10 @@ The UI is split across two contexts that talk over runtime messaging:
   save calls `chrome.tabs.reload`, and ✕ closes the side panel (`window.close`).
 - **`content/sse.js`** — the SSE reader plus `fetchHistory`/`fetchHistoryDetail` JSON GET helpers
   (both pass the per-origin provider as `?provider=` so history matches the selected backend).
-- **`background.js`** — owns `chrome.storage` config; serves get/set to side panel, options & popup;
+- **`background.js`** — owns `chrome.storage` config; serves get/set to the side panel & options;
   performs `captureVisibleTab` on request; drives the opt-in `chrome.debugger` picker
   ([§8.5](#85-opt-in-chromedebugger-picker)); opens the side panel from the toolbar action / command.
 - **`options.html/js`** — per-origin rows: `{ origin, enabled, token, shimUrl }`.
-- **`popup.html/js`** — quick enable/disable for an origin; show `/meta` confirmation.
 - **`styles.css`** — the side-panel document's styles (the panel fills the panel viewport).
 
 **Roadmap:** the picker content script runs *in the page*, so it can read the React fiber
@@ -958,7 +955,7 @@ Each phase is independently testable; build and verify in order.
    ([§8.3](#83-contentpickerjs--the-element-picker-capture-phase)/[§8.4](#84-the-widget-the-bridge--remaining-files));
    side panel arms the picker, receives the [§7](#7-the-element-capture-contract) contract + cropped
    screenshot over messaging; anchored composer; markup toggle.
-4. **Polish.** Popup enable/disable, auto-reload-on-save option, token UX, the [§10](#10-security-model) checklist.
+4. **Polish.** Auto-reload-on-save option, token UX, the [§10](#10-security-model) checklist.
 5. **History & resume.** Add the `/history` + `/history/<id>` routes and the `resume` field
    ([§6](#6-the-sse-event-contract)) to the shim, then the 🕘 history view + ↻ Resume in the panel. Verify:
    ```bash

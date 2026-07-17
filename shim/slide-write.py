@@ -178,7 +178,7 @@ def openai_models():
                   if isinstance(level.get("effort"), str) and level["effort"]],
                 "defaultEffort": m.get("default_reasoning_level") or "",
             } for m in (data.get("models") or [])
-              if m.get("visibility") == "list" and m.get("supported_in_api") is not False]
+              if m.get("slug") and m.get("visibility") == "list" and m.get("supported_in_api") is not False]
     except (OSError, ValueError, urllib.error.URLError) as e:
         if DEBUG:
             print("openai_models:", e, file=sys.stderr)
@@ -640,7 +640,7 @@ def list_codex_history(repo):
             cwd = json.loads(f'"{m.group(1)}"')
         except ValueError:
             cwd = m.group(1)
-        if os.path.realpath(cwd) != repo:  # global tree → keep only this repo's sessions
+        if os.path.realpath(cwd) != os.path.realpath(repo):  # global tree → keep only this repo's sessions
             continue
         try:
             with open(file, encoding="utf-8") as fh:
@@ -675,16 +675,27 @@ def list_codex_history(repo):
     return sessions  # codex_rollouts() already ordered newest-first by timestamp
 
 
+# Find one rollout file by session id. The id is the filename's suffix, so a directory scan that
+# stops at the first match suffices — no need to build the full codex_rollouts() index for one lookup.
+def find_rollout(sid):
+    suffix = f"-{sid.lower()}.jsonl"
+    for root, _dirs, files in os.walk(codex_sessions_dir()):
+        for name in files:
+            if name.lower().endswith(suffix) and ROLLOUT_RE.match(name):
+                return os.path.join(root, name)
+    return None
+
+
 # Parse one codex rollout into render-ready §6 events (parallel to read_history). Returns None for a
 # bad id, a session that isn't in this repo, or a missing file.
 def read_codex_history(repo, sid):
     if not valid_session_id(sid):
         return None
-    hit = next((r for r in codex_rollouts() if r[1].lower() == sid.lower()), None)
-    if not hit:
+    file = find_rollout(sid)
+    if not file:
         return None
     try:
-        with open(hit[0], encoding="utf-8") as fh:
+        with open(file, encoding="utf-8") as fh:
             lines = [ln for ln in fh.read().split("\n") if ln]
     except OSError:
         return None
@@ -692,7 +703,7 @@ def read_codex_history(repo, sid):
         cwd = (json.loads(lines[0]).get("payload") or {}).get("cwd")
     except (ValueError, IndexError):
         return None
-    if not cwd or os.path.realpath(cwd) != repo:  # don't replay another repo's transcript
+    if not cwd or os.path.realpath(cwd) != os.path.realpath(repo):  # don't replay another repo's transcript
         return None
     events = []
     last_agent = None

@@ -39,7 +39,7 @@ async function render() {
     const row = document.createElement("div");
     row.className = "row";
     row.innerHTML = `
-      <div class="origin">${c.name ? `${esc(c.name)} <span class="hint" style="font-weight:400">${origin}</span>` : origin}</div>
+      <div class="origin">${c.name ? `${esc(c.name)} <span class="hint" style="font-weight:400">${esc(origin)}</span>` : esc(origin)}</div>
       <div class="controls">
         <label><input type="checkbox" class="en" ${c.enabled ? "checked" : ""}/> enabled</label>
         <label title="When on, reload the page after any run that changed a file — for apps without hot-reload"><input type="checkbox" class="ar" ${c.autoReload ? "checked" : ""}/> auto-reload on save</label>
