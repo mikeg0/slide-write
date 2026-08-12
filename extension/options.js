@@ -55,6 +55,7 @@ async function render() {
         <label>Provider</label><select class="prov">
           <option value="anthropic">Anthropic (Claude)</option>
           <option value="openai">OpenAI (Codex)</option>
+          <option value="grok">xAI (Grok)</option>
           <option value="google" disabled>Google (not yet wired)</option>
         </select>
         <label>Image steps (override)</label><textarea class="imgsteps" placeholder="Optional override — prefer the repo's CLAUDE.md / a skill. Layered on top (path, naming, DB write, resize…)">${esc(c.imageInstructions || "")}</textarea>

@@ -144,6 +144,17 @@ function modelsFor(meta, provider) {
   return { models: [], defaultModel: "" };
 }
 
+// When /meta has a `providers` array, only allow Send for providers listed and enabled there.
+// Blocks new-extension + old-shim footgun where `provider:"grok"` would silently run Claude and
+// modelsFor would fall back to Anthropic models. Ancient shims without providers[] cannot be
+// distinguished — keep previous behavior (caller should upgrade).
+function providerAllowed(meta, provider) {
+  const list = meta && Array.isArray(meta.providers) ? meta.providers : null;
+  if (!list) return true;
+  const p = list.find((x) => x.id === provider);
+  return !!(p && p.enabled);
+}
+
 export function createPanel({ root, shimUrl, token, meta, conn, provider, model, effort, screen, origin, onMarkup, onOpenOptions, onProbe, onSelectModel, onSelectEffort, onReload, autoReload, autoCommit, configured, geminiKey, pollInterval, imageInstructions }) {
   // Live config — reassignable via api.setConfig so enabling the origin in Options flips the panel
   // from its disabled "set up" state to live, with no reload. `screen` is the active tab's route
@@ -392,6 +403,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     selectedModel = (models.some((m) => m.id === want) ? want : defaultModel) || (models[0] && models[0].id) || "";
     renderModels();
     recomputeEfforts(preferEffort);
+    // Provider enablement can change with /meta or options — re-apply Send disable + status.
+    applyConfigured();
   }
 
   // Render the "+" menu items, reflecting current toggle state (Image Generation = imageMode).
@@ -511,7 +524,16 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   function idleStatus() {
     if (!cfg.configured) return "not configured";
     const st = cfg.conn && cfg.conn.state;
-    if (st === "live" || (!st && cfg.meta)) return cfg.meta ? `wired to ${cfg.meta.project}${cfg.meta.branch ? ` @ ${cfg.meta.branch}` : " (no git)"}` : "connected";
+    if (st === "live" || (!st && cfg.meta)) {
+      if (cfg.meta && !providerAllowed(cfg.meta, cfg.provider))
+        return `shim does not support provider “${cfg.provider}” — upgrade slide-write`;
+      if (cfg.meta && providerAllowed(cfg.meta, cfg.provider) && models.length === 0) {
+        if (cfg.provider === "grok") return "no Grok models — run grok login or check GROK_HOME";
+        if (cfg.provider === "openai") return "no OpenAI models — check codex login / CODEX_HOME";
+        return `no models for provider “${cfg.provider}”`;
+      }
+      return cfg.meta ? `wired to ${cfg.meta.project}${cfg.meta.branch ? ` @ ${cfg.meta.branch}` : " (no git)"}` : "connected";
+    }
     if (st === "unauthorized") return "agent rejected the token — check Options";
     if (st === "unreachable") return `agent offline — can't reach ${shimHost()}`;
     return "not connected";
@@ -758,6 +780,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   // Reflect cfg.configured across the UI: live composer vs. the "set up" prompt.
   function applyConfigured() {
     const ok = cfg.configured;
+    const allowed = ok && providerAllowed(cfg.meta, cfg.provider);
     const historyOpen = !historyView.hidden;
     setup.hidden = ok;
     // A config refresh happens whenever a cached tab regains focus. Preserve which view that tab
@@ -769,7 +792,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     newChatBtn.disabled = !ok;
     historyBtn.disabled = !ok;
     textarea.disabled = !ok;
-    sendBtn.disabled = !ok;
+    // Merge-blocking: never fire /design for a provider the shim does not advertise as enabled.
+    sendBtn.disabled = !allowed;
     modelBtn.disabled = !ok || models.length < 2;
     effortBtn.disabled = !ok || efforts.length < 2;
     renderConn();
@@ -779,6 +803,10 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   // it (drained when the current run finishes); otherwise cancel the run (and drop any queue).
   function send() {
     if (!cfg.configured) return;
+    if (!providerAllowed(cfg.meta, cfg.provider)) {
+      setStatus(`shim does not support provider “${cfg.provider}” — upgrade slide-write`);
+      return;
+    }
     if (busy) {
       const intent = readComposer();
       if (intent) { enqueue(intent); updateSendBtn(); }

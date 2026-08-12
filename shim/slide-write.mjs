@@ -5,7 +5,8 @@
 import http from "node:http";
 import os from "node:os";
 import { execFile, spawn } from "node:child_process";
-import { open, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { open, readdir, readFile, realpath, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { query } from "@anthropic-ai/claude-agent-sdk";
@@ -41,14 +42,22 @@ const requestedModel = (body) => typeof body.model === "string" && body.model.tr
 const selectedEffort = (body) => typeof body.effort === "string"
   && body.effort !== "default" && /^[a-z][a-z0-9_-]{0,31}$/.test(body.effort) ? body.effort : undefined;
 
-// --- Provider selection (Anthropic / OpenAI / Google) ---------------------------------------
+// --- Provider selection (Anthropic / OpenAI / Grok / Google) --------------------------------
 // Anthropic is the default path (the claude Agent SDK above). OpenAI is driven by the `codex` CLI
 // (`codex exec --json`) — the agentic parallel to claude — which natively authenticates from
-// CODEX_HOME/auth.json (ChatGPT oauth). Google is a not-yet-wired placeholder advertised as disabled.
+// CODEX_HOME/auth.json (ChatGPT oauth). Grok (xAI) is driven by the host `grok` CLI headless
+// (`streaming-messages-json`), reusing `~/.grok` login or inherited `XAI_API_KEY`. Google is a
+// not-yet-wired placeholder advertised as disabled.
 const CODEX_BIN  = arg("codex-bin",  process.env.SLIDEWRITE_CODEX_BIN  ?? "codex"); // `codex` on PATH, or a full path
 const CODEX_HOME = arg("codex-home", process.env.SLIDEWRITE_CODEX_HOME ?? "");       // "" → codex's own default (~/.codex)
 const codexHome  = () => CODEX_HOME || join(os.homedir(), ".codex");
 const CODEX_VERSION_FALLBACK = "0.144.1"; // used only if `codex --version` can't be parsed
+const GROK_BIN  = arg("grok-bin",  process.env.SLIDEWRITE_GROK_BIN  ?? "grok"); // `grok` on PATH, or a full path
+const GROK_HOME = arg("grok-home", process.env.SLIDEWRITE_GROK_HOME ?? "");       // "" → grok's own default (~/.grok)
+const grokHome  = () => GROK_HOME || join(os.homedir(), ".grok");
+// Live stream: Grok edit tools (≠ Claude EDIT_TOOLS). Path field is always `file_path`.
+// Frozen against grok CLI 1.0.3 — see shim/fixtures/grok-streaming-messages-edit.jsonl.
+const GROK_EDIT_TOOLS = ["search_replace", "write"];
 let _codexVer;
 function codexClientVersion() {                                  // the /models endpoint requires client_version
   if (_codexVer) return _codexVer;
@@ -127,10 +136,51 @@ async function openAiModels() {
   return models;
 }
 
+// Grok model list: prefer a short `grok models` refresh (populates cache/login path), then read
+// `$GROK_HOME/models_cache.json`. Any failure → [] (never throws) — empty means not logged in / CLI missing.
+async function grokModels() {
+  const env = { ...process.env };
+  if (GROK_HOME) env.GROK_HOME = GROK_HOME;
+  try {
+    await new Promise((resolveDone) => {
+      const child = spawn(GROK_BIN, ["models"], { env, stdio: ["ignore", "pipe", "pipe"] });
+      const t = setTimeout(() => { try { child.kill("SIGTERM"); } catch {} resolveDone(); }, 15_000);
+      t.unref();
+      child.on("close", () => { clearTimeout(t); resolveDone(); });
+      child.on("error", () => { clearTimeout(t); resolveDone(); });
+    });
+  } catch (e) { if (DEBUG) console.error("grokModels spawn:", e?.message || e); }
+  try {
+    const raw = JSON.parse(await readFile(join(grokHome(), "models_cache.json"), "utf8"));
+    const entries = raw?.models && typeof raw.models === "object" ? Object.values(raw.models) : [];
+    return entries.map((entry) => {
+      const info = entry?.info || entry || {};
+      const id = info.id || info.model;
+      if (typeof id !== "string" || !id) return null;
+      const efforts = (info.reasoning_efforts || [])
+        .filter((e) => e && (typeof e.id === "string" || typeof e.value === "string"))
+        .map((e) => {
+          const eid = e.id || e.value;
+          return { id: eid, label: e.label || effortLabel(eid), description: e.description || "" };
+        });
+      const defaultEffort = (info.reasoning_efforts || []).find((e) => e?.default)?.id
+        || (info.reasoning_efforts || []).find((e) => e?.default)?.value
+        || info.reasoning_effort || "";
+      return {
+        id,
+        label: info.name || id,
+        description: info.description || "",
+        efforts,
+        defaultEffort: efforts.some((e) => e.id === defaultEffort) ? defaultEffort : (efforts[0]?.id || ""),
+      };
+    }).filter(Boolean);
+  } catch (e) { if (DEBUG) console.error("grokModels cache:", e?.message || e); return []; }
+}
+
 // Provider list for /meta — the client picks a provider on the options page, then the dropdown shows
 // that provider's `models`. `enabled:false` advertises a provider the UI should show but not allow.
 async function providerMeta(repo) {
-  const [anthropic, openai] = await Promise.all([anthropicModels(repo), openAiModels()]);
+  const [anthropic, openai, grok] = await Promise.all([anthropicModels(repo), openAiModels(), grokModels()]);
   const anthropicDefault = (DEFAULT_MODEL && anthropic.some((m) => m.id === DEFAULT_MODEL) && DEFAULT_MODEL)
     || anthropic[0]?.id || "";
   return {
@@ -139,6 +189,7 @@ async function providerMeta(repo) {
     providers: [
       { id: "anthropic", label: "Anthropic", enabled: true, models: anthropic, defaultModel: anthropicDefault },
       { id: "openai",    label: "OpenAI",    enabled: true, models: openai, defaultModel: openai[0]?.id || "" },
+      { id: "grok",      label: "xAI",       enabled: true, models: grok, defaultModel: grok[0]?.id || "" },
       { id: "google",    label: "Google",    enabled: false, models: [], defaultModel: "" },
     ],
     defaultProvider: "anthropic",
@@ -160,7 +211,7 @@ const PREAMBLE =
   "You are editing a web app live from within its running dev environment. Your edits land on the " +
   "repo at the working directory and the app's own dev server hot-reloads, so changes appear in the " +
   "browser within seconds.\n\n" +
-  "FIRST, read the repo's CLAUDE.md (and README) for THIS project's conventions — where styling " +
+  "FIRST, read the repo's CLAUDE.md / AGENTS.md (and README) for THIS project's conventions — where styling " +
   "lives, where components/screens live, the framework in use. Follow them.\n\n" +
   "- Make the SMALLEST focused change that satisfies the request, in the spirit of the existing code.\n" +
   "- Reuse existing tokens/components/patterns; don't add dependencies unless asked.\n" +
@@ -288,9 +339,12 @@ function buildImagePrompt({ imagePrompt = "", screen, imageInstructions }, eleme
 const EDIT_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
 const detailOf = (name, i = {}) =>
-  name === "Bash" ? (i.command || "") :
-  (name === "Read" || EDIT_TOOLS.includes(name)) ? (i.file_path || i.notebook_path || "") :
-  name === "Grep" || name === "Glob" ? (i.pattern || "") : JSON.stringify(i).slice(0, 600);
+  name === "Bash" || name === "run_terminal_command" ? (i.command || "") :
+  (name === "Read" || name === "read_file" || EDIT_TOOLS.includes(name) || GROK_EDIT_TOOLS.includes(name))
+    ? (i.file_path || i.target_file || i.notebook_path || "") :
+  name === "Grep" || name === "Glob" || name === "grep" ? (i.pattern || "") :
+  name === "list_dir" ? (i.target_directory || i.path || "") :
+  JSON.stringify(i).slice(0, 600);
 
 function resultText(content) {
   let t = typeof content === "string" ? content
@@ -547,6 +601,167 @@ async function readCodexHistory(repo, id) {
   return { id, events };
 }
 
+// --- Grok (xAI) chat history (read-only) -----------------------------------------------------
+// Grok writes sessions under ~/.grok/sessions/<encodeURIComponent(cwd)>/<uuid>/ with summary.json
+// + chat_history.jsonl. The on-disk history shape ≠ live streaming-messages-json (string content +
+// JSON-string tool_calls.arguments), so list/read use a separate mapper. absRepo is always
+// realpath(repo) so Node and Python shims share the same session storage key.
+const grokSessionsRoot = () => join(grokHome(), "sessions");
+const absRepoOf = async (repo) => { try { return await realpath(repo); } catch { return resolve(repo); } };
+const grokPrimaryDir = (absRepo) => join(grokSessionsRoot(), encodeURIComponent(absRepo));
+
+// text out of a grok history user line (string or [{type:text,text}])
+const grokUserText = (content) => {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content))
+    return content.filter((b) => b?.type === "text" && b.text).map((b) => b.text).join("\n").trim();
+  return "";
+};
+// First meaningful user prompt for titles: unwrap <user_query> when present, then strip PREAMBLE
+// (headless --prompt-file content is often stored inside user_query, so PREAMBLE strip must run after).
+const grokFirstPrompt = (text) => {
+  let t = String(text || "");
+  const m = /<user_query>\s*([\s\S]*?)\s*<\/user_query>/i.exec(t);
+  if (m) t = m[1];
+  t = stripPreamble(t);
+  t = t.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim();
+  t = t.replace(/<user_info>[\s\S]*?<\/user_info>/gi, "").trim();
+  return t.split("\n[")[0].trim() || t;
+};
+const reasoningSummaryText = (summary) => {
+  if (typeof summary === "string") return summary;
+  if (Array.isArray(summary))
+    return summary.map((s) => (typeof s === "string" ? s : s?.text || s?.summary_text || "")).filter(Boolean).join("\n");
+  if (summary && typeof summary === "object") return summary.text || summary.summary_text || "";
+  return "";
+};
+
+// Collect session dirs for this repo: primary encoded-cwd path, plus a realpath-equality scan for
+// sessions created with a different cwd string (interactive grok, older shims).
+async function grokSessionDirs(absRepo) {
+  const found = new Map(); // id → { dir, summary }
+  const tryDir = async (dir) => {
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (!e.isDirectory() || !validSessionId(e.name)) continue;
+      const sdir = join(dir, e.name);
+      try {
+        const summary = JSON.parse(await readFile(join(sdir, "summary.json"), "utf8"));
+        const id = summary?.info?.id || e.name;
+        if (!validSessionId(id)) continue;
+        found.set(id, { dir: sdir, summary });
+      } catch { /* skip */ }
+    }
+  };
+  await tryDir(grokPrimaryDir(absRepo));
+  // Fallback scan of all session parent dirs (defensive).
+  let parents;
+  try { parents = await readdir(grokSessionsRoot(), { withFileTypes: true }); } catch { return [...found.values()]; }
+  for (const p of parents) {
+    if (!p.isDirectory()) continue;
+    const parent = join(grokSessionsRoot(), p.name);
+    if (parent === grokPrimaryDir(absRepo)) continue; // already scanned
+    let entries;
+    try { entries = await readdir(parent, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (!e.isDirectory() || !validSessionId(e.name) || found.has(e.name)) continue;
+      const sdir = join(parent, e.name);
+      try {
+        const summary = JSON.parse(await readFile(join(sdir, "summary.json"), "utf8"));
+        const cwd = summary?.info?.cwd;
+        if (!cwd) continue;
+        let rc; try { rc = await realpath(cwd); } catch { rc = resolve(cwd); }
+        if (rc !== absRepo) continue;
+        const id = summary?.info?.id || e.name;
+        if (validSessionId(id)) found.set(id, { dir: sdir, summary });
+      } catch { /* skip */ }
+    }
+  }
+  return [...found.values()];
+}
+
+async function listGrokHistory(repo) {
+  const absRepo = await absRepoOf(repo);
+  const sessions = [];
+  for (const { dir, summary } of await grokSessionDirs(absRepo)) {
+    const id = summary?.info?.id || basename(dir);
+    let firstPrompt = "";
+    try {
+      const lines = (await readFile(join(dir, "chat_history.jsonl"), "utf8")).split("\n").filter(Boolean);
+      for (const line of lines) {
+        let rec; try { rec = JSON.parse(line); } catch { continue; }
+        if (rec.type !== "user") continue;
+        const t = grokFirstPrompt(grokUserText(rec.content));
+        if (t && !t.startsWith("<")) { firstPrompt = t; break; }
+        if (t) { firstPrompt ||= t; }
+      }
+    } catch { /* no history file */ }
+    const title = summary.generated_title || summary.session_summary || (firstPrompt || "(untitled)").slice(0, 80);
+    sessions.push({
+      id,
+      title: String(title).slice(0, 80),
+      firstPrompt: (firstPrompt || String(title)).slice(0, 140),
+      startedAt: summary.created_at || "",
+      endedAt: summary.updated_at || summary.last_active_at || summary.created_at || "",
+      branch: summary.head_branch || "",
+      messageCount: summary.num_chat_messages || summary.num_messages || 0,
+    });
+  }
+  sessions.sort((a, b) => (b.endedAt || "").localeCompare(a.endedAt || ""));
+  return sessions;
+}
+
+// History-detail mapper for chat_history.jsonl (≠ live stream). Returns null for bad/missing id.
+async function readGrokHistory(repo, id) {
+  if (!validSessionId(id)) return null;
+  const absRepo = await absRepoOf(repo);
+  const dirs = await grokSessionDirs(absRepo);
+  const hit = dirs.find((d) => (d.summary?.info?.id || basename(d.dir)) === id);
+  if (!hit) return null;
+  let lines;
+  try { lines = (await readFile(join(hit.dir, "chat_history.jsonl"), "utf8")).split("\n").filter(Boolean); }
+  catch { return null; }
+  const events = [];
+  let lastText = null;
+  for (const line of lines) {
+    let rec; try { rec = JSON.parse(line); } catch { continue; }
+    if (rec.type === "system") continue;
+    if (rec.type === "user") {
+      const t = stripPreamble(grokUserText(rec.content));
+      // Skip pure synthetic wrappers.
+      if (!t || /^<system-reminder>/.test(t.trim()) || /^<user_info>/.test(t.trim())) continue;
+      const cleaned = grokFirstPrompt(t);
+      if (cleaned) events.push({ type: "user", text: cleaned });
+    } else if (rec.type === "reasoning") {
+      const t = reasoningSummaryText(rec.summary);
+      if (t) events.push({ type: "thinking_delta", text: t });
+    } else if (rec.type === "assistant") {
+      if (typeof rec.content === "string" && rec.content) {
+        lastText = rec.content;
+        events.push({ type: "delta", text: rec.content });
+      }
+      for (const tc of rec.tool_calls || []) {
+        let args = {};
+        try { args = typeof tc.arguments === "string" ? JSON.parse(tc.arguments || "{}") : (tc.arguments || {}); }
+        catch { args = {}; }
+        const name = tc.name || "tool";
+        if (GROK_EDIT_TOOLS.includes(name))
+          events.push({ type: "file_edit", tool: name, path: relPath(absRepo, args.file_path || ""), id: tc.id });
+        else events.push({ type: "tool", tool: name, detail: detailOf(name, args), id: tc.id });
+      }
+    } else if (rec.type === "tool_result") {
+      const { text, trunc } = resultText(rec.content);
+      events.push({ type: "tool_result", tool: undefined, id: rec.tool_call_id, text, isError: !!rec.is_error, truncated: trunc });
+    } else if (rec.type === "backend_tool_call") {
+      events.push({ type: "tool", tool: rec.name || "backend_tool", detail: typeof rec.detail === "string" ? rec.detail : "", id: rec.id });
+    }
+  }
+  events.push({ type: "result", isError: false, numTurns: null, durationMs: null,
+    totalCostUsd: null, usage: null, result: lastText });
+  return { id, events };
+}
+
 // Generate (or edit) an image with Gemini "nano banana" via the Generative Language REST API.
 // Generic — knows nothing about the target repo. The key goes in a header (never the URL, so it
 // can't leak into request logs); `image` (optional, {mimeType,data}) makes it image-to-image.
@@ -733,13 +948,151 @@ async function streamCodex(repo, prompt, body, emit, aborted) {
   });
 }
 
-// Provider dispatch for the agent step. Anthropic (default/absent) → the claude SDK; OpenAI → codex;
-// Google → a clean not-yet-supported error. Shared by runDesign and runImage.
+// Drive one headless `grok` run (the xAI provider). Live format is `streaming-messages-json` +
+// `--include-partial-messages` (Claude-like Messages wire shape; frozen against grok 1.0.3 — see
+// shim/fixtures/grok-streaming-messages-edit.jsonl). Large prompts go through `--prompt-file` (never
+// argv `-p`). PREAMBLE is prepended into that file. Auth is host-only: `grok login` / XAI_API_KEY env.
+async function streamGrok(repo, prompt, body, emit, aborted) {
+  const model = requestedModel(body), effort = selectedEffort(body);
+  let absRepo;
+  try { absRepo = await realpath(repo); }
+  catch (e) { emit("error", { message: `could not resolve repo path: ${e?.message || e}` }); return true; }
+  const promptFile = join(os.tmpdir(), `slidewrite-grok-prompt-${Date.now()}-${randomBytes(4).toString("hex")}.txt`);
+  try { await writeFile(promptFile, PREAMBLE + "\n\n" + prompt, "utf8"); }
+  catch (e) { emit("error", { message: `could not write grok prompt file: ${e?.message || e}` }); return true; }
+  const args = [
+    "--prompt-file", promptFile,
+    "--cwd", absRepo,
+    "--output-format", "streaming-messages-json",
+    "--include-partial-messages",
+    "--always-approve",
+    "--permission-mode", "bypassPermissions",
+    "--sandbox", "off",
+    "--no-auto-update",
+    "--max-turns", "40",
+  ];
+  if (model) args.push("-m", model);
+  if (effort) args.push("--effort", effort);
+  if (validSessionId(body.resume)) args.push("-r", body.resume);
+  const env = { ...process.env };
+  if (GROK_HOME) env.GROK_HOME = GROK_HOME;
+  const cleanup = async () => { try { await unlink(promptFile); } catch {} };
+  return new Promise((done) => {
+    let child;
+    try { child = spawn(GROK_BIN, args, { cwd: absRepo, env, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (e) { cleanup().then(() => { emit("error", { message: `grok spawn failed: ${e?.message || e}` }); done(true); }); return; }
+    let hadError = false, streamedText = false, started = false, sawResult = false, buf = "", stderr = "", finished = false;
+    const tool = {};
+    // Best-effort cumulative usage (parity with streamQuery when message ids exist).
+    const perMsg = new Map(); let thinkingTokens = 0, lastUsageAt = 0;
+    const emitUsage = (force = false) => {
+      const now = Date.now();
+      if (!force && now - lastUsageAt < 250) return;
+      lastUsageAt = now;
+      let inp = 0, out = 0, cr = 0, cc = 0;
+      for (const u of perMsg.values()) {
+        inp += u.input_tokens || 0; out += u.output_tokens || 0;
+        cr += u.cache_read_input_tokens || 0; cc += u.cache_creation_input_tokens || 0;
+      }
+      emit("usage", { inputTokens: inp, outputTokens: out, cacheReadTokens: cr,
+        cacheCreationTokens: cc, thinkingTokens });
+    };
+    const handle = (m) => {
+      if (m.type === "system" && m.subtype === "init") {
+        started = true;
+        emit("start", { sessionId: m.session_id, model: m.model || model || "" });
+      } else if (m.type === "stream_event" && m.event?.type === "content_block_delta") {
+        const d = m.event.delta || {};
+        if (d.type === "text_delta" && d.text) { streamedText = true; emit("delta", { text: d.text }); }
+        else if (d.type === "thinking_delta" && d.thinking) emit("thinking_delta", { text: d.thinking });
+      } else if (m.type === "stream_event" && m.event?.type === "message_start") {
+        const msg = m.event.message;
+        if (msg?.id && msg.usage) { perMsg.set(msg.id, msg.usage); emitUsage(true); }
+      } else if (m.type === "system" && m.subtype === "thinking_tokens") {
+        thinkingTokens += m.estimated_tokens_delta || 0;
+        emitUsage();
+      } else if (m.type === "assistant") {
+        if (m.message?.id && m.message.usage) {
+          perMsg.set(m.message.id, m.message.usage);
+          thinkingTokens = 0;
+          emitUsage(true);
+        }
+        for (const b of m.message?.content ?? []) {
+          if (b.type !== "tool_use") continue;
+          tool[b.id] = b.name;
+          if (GROK_EDIT_TOOLS.includes(b.name))
+            emit("file_edit", { tool: b.name, path: relPath(absRepo, b.input?.file_path || ""), id: b.id });
+          else emit("tool", { tool: b.name, detail: detailOf(b.name, b.input), id: b.id });
+        }
+      } else if (m.type === "user") {
+        const content = m.message?.content;
+        for (const b of (Array.isArray(content) ? content : [])) {
+          if (b.type !== "tool_result") continue;
+          const { text, trunc } = resultText(b.content);
+          emit("tool_result", { tool: tool[b.tool_use_id], id: b.tool_use_id, text, isError: !!b.is_error, truncated: trunc });
+        }
+      } else if (m.type === "result") {
+        started = true;
+        sawResult = true;
+        hadError = !!m.is_error;
+        if (m.usage) {
+          if (!perMsg.size) perMsg.set("_result", m.usage);
+          emitUsage(true);
+        }
+        emit("result", { isError: hadError, numTurns: m.num_turns, durationMs: m.duration_ms,
+          totalCostUsd: m.total_cost_usd, usage: m.usage, result: streamedText ? null : m.result });
+      }
+    };
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      if (aborted()) { try { child.kill("SIGTERM"); } catch {} return; }
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        let ev; try { ev = JSON.parse(line); } catch { continue; }
+        if (DEBUG) console.error("grok", ev.type, ev.subtype ?? "");
+        handle(ev);
+      }
+    });
+    child.stderr.on("data", (c) => { stderr += c; if (DEBUG) console.error("grok stderr:", String(c)); });
+    const finish = () => {
+      if (finished) return; finished = true;
+      if (buf.trim()) { try { handle(JSON.parse(buf)); } catch { /* partial */ } }
+      cleanup().finally(() => {
+        if (aborted()) return done(hadError);
+        if (!started) {
+          hadError = true;
+          emit("error", { message: (stderr.trim().slice(0, 500) || "grok did not start") +
+            " — run `grok login` or set XAI_API_KEY" });
+        } else if (!sawResult) {
+          // Child exited after init without a terminal `result` line (crash / kill).
+          hadError = true;
+          emit("error", { message: (stderr.trim().slice(0, 500) || "grok exited without a result") });
+          emit("result", { isError: true, result: null });
+        }
+        done(hadError);
+      });
+    };
+    child.on("error", (e) => {
+      if (!started) emit("error", { message: `grok error: ${e?.message || e} — is \`${GROK_BIN}\` on PATH?` });
+      hadError = true; finish();
+    });
+    child.on("close", finish);
+  });
+}
+
+// Provider dispatch for the agent step. Explicit allow-list — unknown providers hard-error (no
+// silent Claude fallthrough). Shared by runDesign and runImage.
 function runAgent(repo, prompt, body, emit, aborted) {
   const provider = body.provider || "anthropic";
+  if (provider === "anthropic") return streamQuery(repo, prompt, body, emit, aborted);
   if (provider === "openai") return streamCodex(repo, prompt, body, emit, aborted);
+  if (provider === "grok") return streamGrok(repo, prompt, body, emit, aborted);
   if (provider === "google") { emit("error", { message: "Google provider is not yet supported" }); return Promise.resolve(true); }
-  return streamQuery(repo, prompt, body, emit, aborted);
+  emit("error", { message: `Unknown provider "${provider}" — upgrade the shim or pick anthropic/openai/grok in options` });
+  return Promise.resolve(true);
 }
 
 // Commit only what THIS run changed (diff of porcelain before/after); no push.
@@ -861,15 +1214,20 @@ function serve() {
         geminiModel: GEMINI_MODEL, geminiEnv: !!GEMINI_KEY,  // geminiEnv: shim has a server-side key fallback
       });
     }
-    // History is provider-scoped: the openai provider reads codex's rollout tree, everything else
-    // (anthropic/absent) reads claude's ~/.claude/projects transcripts. The extension sends the
-    // per-origin provider as a `?provider=` query param so the 🕘 view shows the right backend.
+    // History is provider-scoped: openai → codex rollouts, grok → ~/.grok/sessions, else claude
+    // ~/.claude/projects. The extension sends the per-origin provider as `?provider=`.
     const histProvider = url.searchParams.get("provider") || "anthropic";
-    if (path === "/history" && req.method === "GET")
-      return json(res, 200, { sessions: histProvider === "openai" ? await listCodexHistory(repo) : await listHistory(repo) });
+    if (path === "/history" && req.method === "GET") {
+      const sessions = histProvider === "openai" ? await listCodexHistory(repo)
+        : histProvider === "grok" ? await listGrokHistory(repo)
+        : await listHistory(repo);
+      return json(res, 200, { sessions });
+    }
     if (path.startsWith("/history/") && req.method === "GET") {
       const id = decodeURIComponent(path.slice("/history/".length));
-      const data = histProvider === "openai" ? await readCodexHistory(repo, id) : await readHistory(repo, id);
+      const data = histProvider === "openai" ? await readCodexHistory(repo, id)
+        : histProvider === "grok" ? await readGrokHistory(repo, id)
+        : await readHistory(repo, id);
       return data ? json(res, 200, data) : json(res, 404, { error: "not found" });
     }
     if (path === "/design" && req.method === "POST") return streamRun(req, res, runDesign, repo);

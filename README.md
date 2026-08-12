@@ -198,8 +198,8 @@ its JSONL as SSE — same event mapping. The SDK is used here for typed messages
 A single `.mjs` file. CLI flags / env
 (`--port`/`--repo`/`--token`/`--origin`/`--bind`/`--model`/`--debug`/`--use-skills`, the multi-host
 flags `--repo-root`/`--repos`, the image flags
-`--gemini-key`/`--gemini-model`/`--image-instructions`, plus the OpenAI-provider flags
-`--codex-bin`/`--codex-home` — see [§5.4](#54-provider-selection-anthropic--openai)) configure it; it stands up an
+`--gemini-key`/`--gemini-model`/`--image-instructions`, plus the provider flags
+`--codex-bin`/`--codex-home` and `--grok-bin`/`--grok-home` — see [§5.4](#54-provider-selection-anthropic--openai--grok)) configure it; it stands up an
 `http.createServer` on `127.0.0.1` (overridable via `--bind` for §13 only), and the run logic lives
 in exported `runDesign(body, emit, aborted, signal, repo)` / `runImage(body, emit, aborted, signal,
 repo)` so the HTTP handler and tests share one implementation (the server only starts when the file
@@ -225,7 +225,7 @@ Rendered, the system prompt reads:
 > repo at the working directory and the app's own dev server hot-reloads, so changes appear in the
 > browser within seconds.
 >
-> FIRST, read the repo's CLAUDE.md (and README) for THIS project's conventions — where styling
+> FIRST, read the repo's CLAUDE.md / AGENTS.md (and README) for THIS project's conventions — where styling
 > lives, where components/screens live, the framework in use. Follow them.
 >
 > - Make the SMALLEST focused change that satisfies the request, in the spirit of the existing code.
@@ -324,15 +324,18 @@ Validated against `claude` CLI 2.1.173 — same drift caveat as the SDK: re-veri
 shapes on upgrade. Keep this file in lockstep with `slide-write.mjs` (the `.mjs` is the reference
 implementation; both must change together with the contracts).
 
-### 5.4 Provider selection (Anthropic / OpenAI)
+### 5.4 Provider selection (Anthropic / OpenAI / Grok)
 
-The shim can drive a second agentic backend for the **OpenAI** provider: the `codex` CLI, the
-parallel to `claude`. When a request carries `provider: "openai"`, the agent step runs
+The shim can drive additional agentic backends selected by `body.provider`. Each is another
+producer of the **same** §6 SSE events, dispatched by `runAgent`/`run_agent`. Unknown provider
+ids hard-error (no silent Claude fallthrough); omit/`"anthropic"` still defaults to Claude.
+
+#### OpenAI (`provider: "openai"`) — `codex` CLI
+
+When a request carries `provider: "openai"`, the agent step runs
 `codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <repo> [-m <model>] [-c model_reasoning_effort="<effort>"]`
 instead of the SDK/CLI. The prompt (PREAMBLE + the built §7 context) is fed on stdin; codex's JSONL
-event stream is mapped onto the **same** §6 SSE events the claude path emits, so nothing downstream
-changes — `streamCodex` (in `slide-write.mjs`) / `stream_codex` (in `slide-write.py`) is just another
-producer of the contract, dispatched by `runAgent`/`run_agent` on `body.provider`:
+event stream is mapped by `streamCodex` / `stream_codex`:
 
 - `thread.started` → `start` (its `thread_id` is the session id, used for resume)
 - `item.completed` with `file_change` → `file_edit` (one per changed path) · `agent_message` →
@@ -345,27 +348,74 @@ producer of the contract, dispatched by `runAgent`/`run_agent` on `body.provider
 `~/.codex`), the same ChatGPT-oauth credentials the `codex` CLI logs in with. The shim never handles
 the token for *running* a design; it only reads it to **list models** (below).
 
-**Dynamic model lists.** `/meta` discovers both providers' chat models when the side panel opens;
-there are no hard-coded chat-model lists or client fallbacks. The Node shim asks an empty-input Agent
-SDK query for `supportedModels()`, while the Python shim sends Claude CLI an `initialize` control
-request and reads `response.models`. Both use the normal Claude Code login and consume no model turn;
-the result reflects that shim's executable, account entitlements, and managed model policy. Returned
-effort levels are advertised with a `default` choice that leaves Claude Code's configured effort
-untouched.
-
-OpenAI discovery calls `GET https://chatgpt.com/backend-api/codex/models?client_version=<v>` with
-`Authorization: Bearer <access_token>` (from `CODEX_HOME/auth.json`), `chatgpt-account-id`, and
-`originator: codex_cli_rs`; `<v>` comes from `codex --version`. The listable, API-supported entries
-and their reasoning levels are normalized to the same `{id,label,description?,efforts,defaultEffort}`
-shape. There is no shim cache: the panel fetches `/meta` once as it opens (and when that open panel
-changes origin/connection), while its liveness timer polls only `/health`. A provider discovery
-failure yields an empty list rather than stale model names.
-
 Extra flags (both shims): **`--codex-bin <path>`/`SLIDEWRITE_CODEX_BIN`** (default `codex`) and
 **`--codex-home <dir>`/`SLIDEWRITE_CODEX_HOME`** (default unset → codex's own `~/.codex`). Validated
 against `codex` CLI 0.144.1; `codex exec --json` is the headless equivalent of
 `claude -p --output-format stream-json`. Resume threads a prior codex session via
 `codex exec … resume <thread_id> -` (the `-` reads the continuation prompt from stdin).
+
+#### Grok / xAI (`provider: "grok"`) — Grok Build CLI
+
+When a request carries `provider: "grok"`, the agent step runs the host **`grok`** CLI headless:
+
+```text
+grok --prompt-file <tmp> --cwd <realpath(repo)> \
+  --output-format streaming-messages-json --include-partial-messages \
+  --always-approve --permission-mode bypassPermissions --sandbox off \
+  --no-auto-update --max-turns 40 [-m <model>] [--effort <effort>] [-r <session-id>]
+```
+
+**Prompt delivery:** PREAMBLE + the built §7 context are written to a temp file **outside the repo**
+(`$TMPDIR/slidewrite-grok-prompt-<ts>-<rand>.txt`) and passed via **`--prompt-file`** — never as a
+giant `-p` argv string (real multi-element prompts can blow `ARG_MAX`). The temp file is unlinked
+when the child exits (or on abort).
+
+**Live stream mapping** (`streamGrok` / `stream_grok`) reuses the Claude Messages/`stream-json`
+shapes (validated against **`grok` CLI 1.0.3**; a redacted fixture lives at
+`shim/fixtures/grok-streaming-messages-edit.jsonl` — CLI help is authoritative for formats when
+docs.x.ai tables lag):
+
+- `system`/`subtype:init` → `start` (`session_id`, `model`)
+- `stream_event` / `content_block_delta` / `text_delta` → `delta`; `thinking_delta` → `thinking_delta`
+- `assistant` `tool_use` with name `search_replace` or `write` → `file_edit` (`input.file_path`);
+  other tools → `tool`
+- `user` `tool_result` → `tool_result`
+- `result` → `result` (`is_error`, usage, …)
+
+**Auth is host-only** — `grok login` → `~/.grok/auth.json`, or inherit **`XAI_API_KEY`** on the shim
+process. There is **no** extension-stored coding key and **no** `--xai-key` argv flag (secrets must
+not appear in process listings).
+
+**`--cwd` and history keys use `realpath(repo)` in both shims** (`fs.realpathSync` /
+`os.path.realpath`) so Node and Python cannot diverge under symlinks. Encoded cwd **is** the session
+storage key under `~/.grok/sessions/<encodeURIComponent(absRepo)>/<uuid>/`.
+
+Extra flags (both shims): **`--grok-bin <path>`/`SLIDEWRITE_GROK_BIN`** (default `grok`) and
+**`--grok-home <dir>`/`SLIDEWRITE_GROK_HOME`** (default unset → grok's own `~/.grok` / `$GROK_HOME`).
+Resume uses `-r <session-id>` when `resume` is a valid UUID.
+
+#### Dynamic model lists
+
+`/meta` discovers each provider's chat models when the side panel opens; there are no hard-coded
+chat-model lists or client fallbacks. The Node shim asks an empty-input Agent SDK query for
+`supportedModels()`, while the Python shim sends Claude CLI an `initialize` control request and
+reads `response.models`. Both use the normal Claude Code login and consume no model turn; the result
+reflects that shim's executable, account entitlements, and managed model policy. Returned effort
+levels are advertised with a `default` choice that leaves Claude Code's configured effort untouched.
+
+OpenAI discovery calls `GET https://chatgpt.com/backend-api/codex/models?client_version=<v>` with
+`Authorization: Bearer <access_token>` (from `CODEX_HOME/auth.json`), `chatgpt-account-id`, and
+`originator: codex_cli_rs`; `<v>` comes from `codex --version`. The listable, API-supported entries
+and their reasoning levels are normalized to the same `{id,label,description?,efforts,defaultEffort}`
+shape.
+
+Grok discovery prefers a short `grok models` refresh, then reads `$GROK_HOME/models_cache.json`
+(`reasoning_efforts` → the same model shape). Empty list means not logged in / CLI missing — the
+extension surfaces a status hint; Send is not hard-blocked (parity with OpenAI).
+
+There is no shim cache of discovery results beyond what each CLI maintains: the panel fetches `/meta`
+once as it opens (and when that open panel changes origin/connection), while its liveness timer
+polls only `/health`. A provider discovery failure yields an empty list rather than stale model names.
 
 ---
 
@@ -414,20 +464,25 @@ replay it.
 fields selected from the provider metadata fetched when the panel opens. Anthropic receives the
 model through the Agent SDK / Claude CLI and effort through the SDK `effort` option / CLI `--effort`;
 choosing `default` omits the effort override. OpenAI receives `-m <model>` and
-`-c model_reasoning_effort="<effort>"`. The provider CLIs remain authoritative if a caller bypasses
-the UI and submits an invalid value. The extension renders adjacent model/effort dropdowns and
-persists both choices per-origin. The model actually used is echoed in the `start` event.
+`-c model_reasoning_effort="<effort>"`. Grok receives `-m <model>` and `--effort <effort>`. The
+provider CLIs remain authoritative if a caller bypasses the UI and submits an invalid value. The
+extension renders adjacent model/effort dropdowns and persists both choices per-origin. The model
+actually used is echoed in the `start` event.
 
 **Provider selection (additive).** `/design` and `/generate-image` also accept an optional top-level
-`provider` — `"anthropic"` (default/absent), `"openai"`, or `"google"`. `/meta` advertises the choices
-as `providers: [{ id, label, enabled, models: [{id,label,efforts?,defaultEffort?}], defaultModel }]`
+`provider` — `"anthropic"` (default/absent), `"openai"`, `"grok"`, or `"google"`. `/meta` advertises
+the choices as
+`providers: [{ id, label, enabled, models: [{id,label,efforts?,defaultEffort?}], defaultModel }]`
 plus `defaultProvider`,
 and the top-level `models`/`defaultModel` expose the discovered Anthropic list for backward compatibility. The
 extension's options page picks the provider per-origin; the side-panel model dropdown then shows that
-provider's `models`. `anthropic` runs the claude path above; `openai` runs the codex path
-([§5.4](#54-provider-selection-anthropic--openai)); `google` is a reserved placeholder advertised
-`enabled:false` that returns an `error` event if invoked. Everything downstream of the agent step
-(SSE contract, the porcelain-diff auto-commit, `done`) is provider-agnostic.
+provider's `models`. `anthropic` runs the claude path above; `openai` runs the codex path and
+`grok` runs the Grok Build CLI path ([§5.4](#54-provider-selection-anthropic--openai--grok));
+`google` is a reserved placeholder advertised `enabled:false` that returns an `error` event if
+invoked. Unknown provider ids also return `error` (no silent Claude fallthrough). The extension
+**blocks Send** when the selected provider is missing or `enabled:false` in `/meta.providers`
+(guards new-extension + old-shim combinations). Everything downstream of the agent step (SSE
+contract, the porcelain-diff auto-commit, `done`) is provider-agnostic.
 
 **Image generation (additive — Gemini "nano banana").** `POST /generate-image` is an SSE route
 (same Bearer+CORS gate, same `busy` lock and per-run auto-commit as `/design`). It takes
@@ -496,17 +551,26 @@ shows the conversations from the provider currently selected on the options page
   `streamCodex` emits (`tool`/`file_edit`, no `tool_result`, `result` = the last agent message). The
   PREAMBLE the shim prepends to every codex prompt is stripped from titles and the replayed `user`
   event so they show the actual request (parity with claude, whose PREAMBLE rides in `systemPrompt`).
+- **`grok`** — Grok writes sessions under
+  `~/.grok/sessions/<encodeURIComponent(realpath(cwd))>/<uuid>/` (`summary.json` +
+  `chat_history.jsonl`). Live `streaming-messages-json` and on-disk history use **different shapes**
+  (history uses string `content` + JSON-string `tool_calls.arguments`); the shim uses a separate
+  history mapper. List projection reads `summary.json` (`generated_title`, `created_at`/`updated_at`,
+  `head_branch`, `num_chat_messages`, …). PREAMBLE is stripped from titles and replayed `user`
+  events when present.
 
 Two GET routes, behind the same Bearer+CORS gate as `/meta`, expose the **current repo's** sessions:
 
 - `GET /history[?provider=…]` → `{ sessions: [{ id, title, firstPrompt, startedAt, endedAt, branch, messageCount }] }`,
-  newest first. `title` is the session's `ai-title` if present (claude), else its first user prompt.
+  newest first. `title` is the session's `ai-title` if present (claude), Grok `generated_title` /
+  `session_summary`, else its first user prompt.
   Missing store / no sessions for this repo → `{ sessions: [] }`.
 - `GET /history/<id>[?provider=…]` → `{ id, events: [...] }`, where `events` reuses the §6 shapes above
   (plus the `user` event) so the panel replays a past session through the same renderer. `id` must be
   a valid session UUID (regex-validated; the claude path is path-traversal-guarded, the codex path
-  re-checks the rollout's `cwd` against the repo); a bad/missing/foreign id → 404. Lifecycle events
-  (`start`/`commit`/`done`) are not emitted for a replay.
+  re-checks the rollout's `cwd` against the repo, the grok path scopes to `realpath` of this repo);
+  a bad/missing/foreign id → 404. Lifecycle events (`start`/`commit`/`done`) are not emitted for a
+  replay.
 
 **Auto-commit opt-out (additive).** `/design` and `/generate-image` accept an optional top-level
 `autoCommit` (boolean). When it is **exactly `false`**, the shim skips the per-run commit — the
@@ -869,8 +933,9 @@ The shim runs **arbitrary code edits + shell** in a repo as you. Defenses:
 - **Prompt injection.** A malicious string in the repo could steer `claude`; the working-directory
   boundary (`cwd: REPO`) is the main mitigation. For higher assurance, run against a throwaway `git worktree`.
 - **History is read-only and repo-scoped.** `/history*` only read the selected provider's transcript
-  store for **this repo** — claude's `~/.claude/projects/<this repo>/` (anthropic) or codex's rollout
-  tree filtered to `session_meta.cwd === <this repo>` (openai). The session `id` is UUID-validated
+  store for **this repo** — claude's `~/.claude/projects/<this repo>/` (anthropic), codex's rollout
+  tree filtered to `session_meta.cwd === <this repo>` (openai), or Grok's
+  `~/.grok/sessions/<encodeURIComponent(realpath(repo))>/` (grok). The session `id` is UUID-validated
   before any file read; the claude path is additionally path-traversal-guarded, and the codex path
   re-checks `cwd` against the repo before replaying so it can't be coerced into reading another
   project's session. Same Bearer+CORS gate as `/meta`.
@@ -928,8 +993,14 @@ auto-forwards port 4040 (and your dev server's port) to your laptop's `localhost
 its forwarded `localhost` URL.
 
 **In the extension (once per project):** open options → add origin `http://localhost:5173`, set
-`shimUrl http://localhost:4040` + the token, enable. Then open the app, click the toolbar button,
-and design. To stop: kill the shim process.
+`shimUrl http://localhost:4040` + the token, enable. Choose **Provider** per origin (Anthropic /
+OpenAI / xAI (Grok)). Then open the app, click the toolbar button, and design. To stop: kill the
+shim process.
+
+**Optional — Grok (xAI) provider:** install the [Grok Build CLI](https://docs.x.ai/build/cli)
+(`curl -fsSL https://x.ai/cli/install.sh | bash` — re-verify the install URL at write time if it
+moves), then `grok login` (or export `XAI_API_KEY` on the shim process). Select **xAI (Grok)** in
+Options. Image generation still uses Gemini; only the design/placement agent step switches to Grok.
 
 ---
 
@@ -967,6 +1038,16 @@ Each phase is independently testable; build and verify in order.
    Expect the resumed run to reference prior context and still commit only its own changes. In the UI:
    🕘 → pick a session → read-only replay → ↻ Resume → follow-up threads into that session.
 6. **(Optional)** fiber-based element resolution ([§8.4](#84-the-widget-the-bridge--remaining-files)).
+7. **(Optional) Grok provider.** With `grok` on PATH and logged in:
+   ```bash
+   curl -s -H 'Authorization: Bearer test' localhost:4040/meta | jq '.providers[] | select(.id=="grok")'
+   curl -sN -X POST localhost:4040/design -H 'Authorization: Bearer test' \
+     -H 'Content-Type: application/json' \
+     -d '{"prompt":"append a CSS comment to <some file>","provider":"grok","model":"grok-4.5","effort":"low"}'
+   curl -s -H 'Authorization: Bearer test' 'localhost:4040/history?provider=grok'
+   ```
+   Expect `start → file_edit (search_replace|write) → result → commit? → done`, then a session in
+   `GET /history?provider=grok`. Clean up with `git reset --hard HEAD~1` if auto-commit landed.
 
 ---
 

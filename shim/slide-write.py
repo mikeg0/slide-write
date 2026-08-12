@@ -10,6 +10,7 @@ import base64
 import json
 import os
 import re
+import secrets
 import select
 import socket
 import subprocess
@@ -73,18 +74,29 @@ def requested_effort(body):
                       and re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", effort)) else None
 
 
-# --- Provider selection (Anthropic / OpenAI / Google) ---------------------------------------
+# --- Provider selection (Anthropic / OpenAI / Grok / Google) --------------------------------
 # Anthropic is the default path (the `claude` CLI above). OpenAI is driven by the `codex` CLI
 # (`codex exec --json`) — the agentic parallel to claude — which natively authenticates from
-# CODEX_HOME/auth.json (ChatGPT oauth). Google is a not-yet-wired placeholder advertised as disabled.
+# CODEX_HOME/auth.json (ChatGPT oauth). Grok (xAI) is driven by the host `grok` CLI headless
+# (`streaming-messages-json`), reusing `~/.grok` login or inherited `XAI_API_KEY`. Google is a
+# not-yet-wired placeholder advertised as disabled.
 CODEX_BIN = arg("codex-bin", os.environ.get("SLIDEWRITE_CODEX_BIN", "codex"))  # `codex` on PATH, or a full path
 CODEX_HOME = arg("codex-home", os.environ.get("SLIDEWRITE_CODEX_HOME", ""))  # "" → codex's own default (~/.codex)
 CODEX_VERSION_FALLBACK = "0.144.1"  # used only if `codex --version` can't be parsed
+GROK_BIN = arg("grok-bin", os.environ.get("SLIDEWRITE_GROK_BIN", "grok"))  # `grok` on PATH, or a full path
+GROK_HOME = arg("grok-home", os.environ.get("SLIDEWRITE_GROK_HOME", ""))  # "" → grok's own default (~/.grok)
+# Live stream: Grok edit tools (≠ Claude EDIT_TOOLS). Path field is always `file_path`.
+# Frozen against grok CLI 1.0.3 — see shim/fixtures/grok-streaming-messages-edit.jsonl.
+GROK_EDIT_TOOLS = ("search_replace", "write")
 _codex_ver = None
 
 
 def codex_home():
     return CODEX_HOME or os.path.join(os.path.expanduser("~"), ".codex")
+
+
+def grok_home():
+    return GROK_HOME or os.path.join(os.path.expanduser("~"), ".grok")
 
 
 def codex_client_version():  # the /models endpoint requires client_version
@@ -185,10 +197,58 @@ def openai_models():
     return models
 
 
+# Grok model list: prefer a short `grok models` refresh (populates cache/login path), then read
+# `$GROK_HOME/models_cache.json`. Any failure → [] (never raises) — empty means not logged in / CLI missing.
+def grok_models():
+    env = dict(os.environ)
+    if GROK_HOME:
+        env["GROK_HOME"] = GROK_HOME
+    try:
+        subprocess.run([GROK_BIN, "models"], env=env, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        if DEBUG:
+            print("grok_models spawn:", e, file=sys.stderr)
+    try:
+        with open(os.path.join(grok_home(), "models_cache.json"), encoding="utf-8") as fh:
+            raw = json.load(fh)
+        entries = list((raw.get("models") or {}).values()) if isinstance(raw.get("models"), dict) else []
+        models = []
+        for entry in entries:
+            info = (entry or {}).get("info") or entry or {}
+            mid = info.get("id") or info.get("model")
+            if not isinstance(mid, str) or not mid:
+                continue
+            efforts = []
+            for e in info.get("reasoning_efforts") or []:
+                if not e:
+                    continue
+                eid = e.get("id") or e.get("value")
+                if not isinstance(eid, str) or not eid:
+                    continue
+                efforts.append({"id": eid, "label": e.get("label") or effort_label(eid),
+                                "description": e.get("description") or ""})
+            default_effort = next((e.get("id") or e.get("value") for e in (info.get("reasoning_efforts") or [])
+                                   if e and e.get("default")), None) or info.get("reasoning_effort") or ""
+            if not any(e["id"] == default_effort for e in efforts):
+                default_effort = efforts[0]["id"] if efforts else ""
+            models.append({
+                "id": mid,
+                "label": info.get("name") or mid,
+                "description": info.get("description") or "",
+                "efforts": efforts,
+                "defaultEffort": default_effort,
+            })
+        return models
+    except (OSError, ValueError) as e:
+        if DEBUG:
+            print("grok_models cache:", e, file=sys.stderr)
+        return []
+
+
 # Provider list for /meta — the client picks a provider on the options page, then the dropdown shows
 # that provider's `models`. `enabled: False` advertises a provider the UI should show but not allow.
 def provider_meta(repo):
-    anthropic, openai = anthropic_models(repo), openai_models()
+    anthropic, openai, grok = anthropic_models(repo), openai_models(), grok_models()
     anthropic_default = (DEFAULT_MODEL if DEFAULT_MODEL
                           and any(m["id"] == DEFAULT_MODEL for m in anthropic)
                           else (anthropic[0]["id"] if anthropic else ""))
@@ -200,6 +260,8 @@ def provider_meta(repo):
              "models": anthropic, "defaultModel": anthropic_default},
             {"id": "openai", "label": "OpenAI", "enabled": True,
              "models": openai, "defaultModel": (openai[0]["id"] if openai else "")},
+            {"id": "grok", "label": "xAI", "enabled": True,
+             "models": grok, "defaultModel": (grok[0]["id"] if grok else "")},
             {"id": "google", "label": "Google", "enabled": False,
              "models": [], "defaultModel": ""},
         ],
@@ -222,7 +284,7 @@ PREAMBLE = (
     "You are editing a web app live from within its running dev environment. Your edits land on the "
     "repo at the working directory and the app's own dev server hot-reloads, so changes appear in the "
     "browser within seconds.\n\n"
-    "FIRST, read the repo's CLAUDE.md (and README) for THIS project's conventions — where styling "
+    "FIRST, read the repo's CLAUDE.md / AGENTS.md (and README) for THIS project's conventions — where styling "
     "lives, where components/screens live, the framework in use. Follow them.\n\n"
     "- Make the SMALLEST focused change that satisfies the request, in the spirit of the existing code.\n"
     "- Reuse existing tokens/components/patterns; don't add dependencies unless asked.\n"
@@ -397,12 +459,14 @@ EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 
 def detail_of(name, i=None):
     i = i or {}
-    if name == "Bash":
+    if name in ("Bash", "run_terminal_command"):
         return i.get("command", "")
-    if name in ("Read", "Edit", "Write", "MultiEdit", "NotebookEdit"):
-        return i.get("file_path") or i.get("notebook_path") or ""
-    if name in ("Grep", "Glob"):
+    if name in ("Read", "read_file", "Edit", "Write", "MultiEdit", "NotebookEdit") or name in GROK_EDIT_TOOLS:
+        return i.get("file_path") or i.get("target_file") or i.get("notebook_path") or ""
+    if name in ("Grep", "Glob", "grep"):
         return i.get("pattern", "")
+    if name == "list_dir":
+        return i.get("target_directory") or i.get("path") or ""
     return json.dumps(i)[:600]
 
 
@@ -748,6 +812,233 @@ def read_codex_history(repo, sid):
     return {"id": sid, "events": events}
 
 
+# --- Grok (xAI) chat history (read-only) -----------------------------------------------------
+# Grok writes sessions under ~/.grok/sessions/<quote(cwd,safe='')>/<uuid>/ with summary.json +
+# chat_history.jsonl. On-disk shape ≠ live streaming-messages-json; separate mapper. abs_repo is
+# always realpath(repo) so Node and Python shims share the same session storage key.
+def grok_sessions_root():
+    return os.path.join(grok_home(), "sessions")
+
+
+def abs_repo_of(repo):
+    try:
+        return os.path.realpath(repo)
+    except OSError:
+        return os.path.abspath(repo)
+
+
+def grok_primary_dir(abs_repo):
+    return os.path.join(grok_sessions_root(), quote(abs_repo, safe=""))
+
+
+def grok_user_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content
+                         if isinstance(b, dict) and b.get("type") == "text" and b.get("text")).strip()
+    return ""
+
+
+def grok_first_prompt(text):
+    # Unwrap <user_query> first — headless --prompt-file content is often stored inside it, so
+    # PREAMBLE strip must run after.
+    t = str(text or "")
+    m = re.search(r"<user_query>\s*([\s\S]*?)\s*</user_query>", t, re.I)
+    if m:
+        t = m.group(1)
+    t = strip_preamble(t)
+    t = re.sub(r"<system-reminder>[\s\S]*?</system-reminder>", "", t, flags=re.I).strip()
+    t = re.sub(r"<user_info>[\s\S]*?</user_info>", "", t, flags=re.I).strip()
+    return (t.split("\n[")[0].strip() or t)
+
+
+def reasoning_summary_text(summary):
+    if isinstance(summary, str):
+        return summary
+    if isinstance(summary, list):
+        parts = []
+        for s in summary:
+            if isinstance(s, str):
+                parts.append(s)
+            elif isinstance(s, dict):
+                parts.append(s.get("text") or s.get("summary_text") or "")
+        return "\n".join(p for p in parts if p)
+    if isinstance(summary, dict):
+        return summary.get("text") or summary.get("summary_text") or ""
+    return ""
+
+
+def grok_session_dirs(abs_repo):
+    found = {}  # id → (dir, summary)
+
+    def try_dir(d):
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            return
+        for name in entries:
+            if not valid_session_id(name):
+                continue
+            sdir = os.path.join(d, name)
+            if not os.path.isdir(sdir):
+                continue
+            try:
+                with open(os.path.join(sdir, "summary.json"), encoding="utf-8") as fh:
+                    summary = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            sid = (summary.get("info") or {}).get("id") or name
+            if valid_session_id(sid):
+                found[sid] = (sdir, summary)
+
+    primary = grok_primary_dir(abs_repo)
+    try_dir(primary)
+    try:
+        parents = os.listdir(grok_sessions_root())
+    except OSError:
+        return list(found.values())
+    for pname in parents:
+        parent = os.path.join(grok_sessions_root(), pname)
+        if not os.path.isdir(parent) or parent == primary:
+            continue
+        try:
+            entries = os.listdir(parent)
+        except OSError:
+            continue
+        for name in entries:
+            if not valid_session_id(name) or name in found:
+                continue
+            sdir = os.path.join(parent, name)
+            if not os.path.isdir(sdir):
+                continue
+            try:
+                with open(os.path.join(sdir, "summary.json"), encoding="utf-8") as fh:
+                    summary = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            cwd = (summary.get("info") or {}).get("cwd")
+            if not cwd:
+                continue
+            try:
+                rc = os.path.realpath(cwd)
+            except OSError:
+                rc = os.path.abspath(cwd)
+            if rc != abs_repo:
+                continue
+            sid = (summary.get("info") or {}).get("id") or name
+            if valid_session_id(sid):
+                found[sid] = (sdir, summary)
+    return list(found.values())
+
+
+def list_grok_history(repo):
+    abs_repo = abs_repo_of(repo)
+    sessions = []
+    for sdir, summary in grok_session_dirs(abs_repo):
+        sid = (summary.get("info") or {}).get("id") or os.path.basename(sdir)
+        first_prompt = ""
+        try:
+            with open(os.path.join(sdir, "chat_history.jsonl"), encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("type") != "user":
+                        continue
+                    t = grok_first_prompt(grok_user_text(rec.get("content")))
+                    if t and not t.startswith("<"):
+                        first_prompt = t
+                        break
+                    if t and not first_prompt:
+                        first_prompt = t
+        except OSError:
+            pass
+        title = summary.get("generated_title") or summary.get("session_summary") or (first_prompt or "(untitled)")[:80]
+        sessions.append({
+            "id": sid,
+            "title": str(title)[:80],
+            "firstPrompt": (first_prompt or str(title))[:140],
+            "startedAt": summary.get("created_at") or "",
+            "endedAt": summary.get("updated_at") or summary.get("last_active_at") or summary.get("created_at") or "",
+            "branch": summary.get("head_branch") or "",
+            "messageCount": summary.get("num_chat_messages") or summary.get("num_messages") or 0,
+        })
+    sessions.sort(key=lambda s: s.get("endedAt") or "", reverse=True)
+    return sessions
+
+
+def read_grok_history(repo, sid):
+    if not valid_session_id(sid):
+        return None
+    abs_repo = abs_repo_of(repo)
+    hit = None
+    for sdir, summary in grok_session_dirs(abs_repo):
+        if ((summary.get("info") or {}).get("id") or os.path.basename(sdir)) == sid:
+            hit = (sdir, summary)
+            break
+    if not hit:
+        return None
+    sdir = hit[0]
+    try:
+        with open(os.path.join(sdir, "chat_history.jsonl"), encoding="utf-8") as fh:
+            lines = [ln for ln in fh.read().split("\n") if ln]
+    except OSError:
+        return None
+    events = []
+    last_text = None
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        t = rec.get("type")
+        if t == "system":
+            continue
+        if t == "user":
+            txt = strip_preamble(grok_user_text(rec.get("content")))
+            if not txt or txt.lstrip().startswith("<system-reminder>") or txt.lstrip().startswith("<user_info>"):
+                continue
+            cleaned = grok_first_prompt(txt)
+            if cleaned:
+                events.append({"type": "user", "text": cleaned})
+        elif t == "reasoning":
+            rtxt = reasoning_summary_text(rec.get("summary"))
+            if rtxt:
+                events.append({"type": "thinking_delta", "text": rtxt})
+        elif t == "assistant":
+            if isinstance(rec.get("content"), str) and rec["content"]:
+                last_text = rec["content"]
+                events.append({"type": "delta", "text": rec["content"]})
+            for tc in rec.get("tool_calls") or []:
+                raw = tc.get("arguments") or "{}"
+                try:
+                    args = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                except ValueError:
+                    args = {}
+                name = tc.get("name") or "tool"
+                if name in GROK_EDIT_TOOLS:
+                    events.append({"type": "file_edit", "tool": name,
+                                   "path": rel_path(abs_repo, args.get("file_path") or ""), "id": tc.get("id")})
+                else:
+                    events.append({"type": "tool", "tool": name, "detail": detail_of(name, args), "id": tc.get("id")})
+        elif t == "tool_result":
+            text, trunc = result_text(rec.get("content"))
+            events.append({"type": "tool_result", "tool": None, "id": rec.get("tool_call_id"),
+                           "text": text, "isError": bool(rec.get("is_error")), "truncated": trunc})
+        elif t == "backend_tool_call":
+            events.append({"type": "tool", "tool": rec.get("name") or "backend_tool",
+                           "detail": rec.get("detail") if isinstance(rec.get("detail"), str) else "",
+                           "id": rec.get("id")})
+    events.append({"type": "result", "isError": False, "numTurns": None, "durationMs": None,
+                   "totalCostUsd": None, "usage": None, "result": last_text})
+    return {"id": sid, "events": events}
+
+
 # Generate (or edit) an image with Gemini "nano banana" via the Generative Language REST API.
 # Generic — knows nothing about the target repo. The key goes in a header (never the URL, so it
 # can't leak into request logs); `image` (optional, {mimeType,data}) makes it image-to-image.
@@ -1034,16 +1325,199 @@ def stream_codex(repo, prompt, body, emit, aborted):
     return state["had_error"]
 
 
-# Provider dispatch for the agent step. Anthropic (default/absent) → the claude CLI; OpenAI → codex;
-# Google → a clean not-yet-supported error. Shared by run_design and run_image.
+# Drive one headless `grok` run (the xAI provider). Live format is streaming-messages-json +
+# --include-partial-messages (Claude-like; frozen against grok 1.0.3 — see
+# shim/fixtures/grok-streaming-messages-edit.jsonl). Large prompts go through --prompt-file.
+# PREAMBLE is prepended into that file. Auth is host-only: grok login / XAI_API_KEY env.
+def stream_grok(repo, prompt, body, emit, aborted):
+    model, effort = requested_model(body), requested_effort(body)
+    try:
+        abs_repo = os.path.realpath(repo)
+    except OSError as e:
+        emit("error", {"message": f"could not resolve repo path: {e}"})
+        return True
+    prompt_file = os.path.join(
+        tempfile.gettempdir(),
+        f"slidewrite-grok-prompt-{int(time.time() * 1000)}-{secrets.token_hex(4)}.txt")
+    try:
+        with open(prompt_file, "w", encoding="utf-8") as fh:
+            fh.write(PREAMBLE + "\n\n" + prompt)
+    except OSError as e:
+        emit("error", {"message": f"could not write grok prompt file: {e}"})
+        return True
+    cmd = [
+        GROK_BIN,
+        "--prompt-file", prompt_file,
+        "--cwd", abs_repo,
+        "--output-format", "streaming-messages-json",
+        "--include-partial-messages",
+        "--always-approve",
+        "--permission-mode", "bypassPermissions",
+        "--sandbox", "off",
+        "--no-auto-update",
+        "--max-turns", "40",
+    ]
+    if model:
+        cmd += ["-m", model]
+    if effort:
+        cmd += ["--effort", effort]
+    if valid_session_id(body.get("resume")):
+        cmd += ["-r", body["resume"]]
+    env = dict(os.environ)
+    if GROK_HOME:
+        env["GROK_HOME"] = GROK_HOME
+
+    def cleanup():
+        try:
+            os.unlink(prompt_file)
+        except OSError:
+            pass
+
+    try:
+        proc = subprocess.Popen(cmd, cwd=abs_repo, env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                encoding="utf-8")
+    except OSError as e:
+        cleanup()
+        emit("error", {"message": f"could not start `{GROK_BIN}`: {e}"})
+        return True
+
+    tool = {}
+    state = {"had_error": False, "streamed_text": False, "started": False, "saw_result": False}
+    per_msg = {}
+    thinking_tokens = 0
+    last_usage_at = 0
+    err_tail = deque(maxlen=40)
+
+    def emit_usage(force=False):
+        nonlocal last_usage_at, thinking_tokens
+        now = time.time() * 1000
+        if not force and now - last_usage_at < 250:
+            return
+        last_usage_at = now
+        inp = out = cr = cc = 0
+        for u in per_msg.values():
+            inp += u.get("input_tokens") or 0
+            out += u.get("output_tokens") or 0
+            cr += u.get("cache_read_input_tokens") or 0
+            cc += u.get("cache_creation_input_tokens") or 0
+        emit("usage", {"inputTokens": inp, "outputTokens": out, "cacheReadTokens": cr,
+                       "cacheCreationTokens": cc, "thinkingTokens": thinking_tokens})
+
+    def handle(m):
+        nonlocal thinking_tokens
+        t = m.get("type")
+        if t == "system" and m.get("subtype") == "init":
+            state["started"] = True
+            emit("start", {"sessionId": m.get("session_id"), "model": m.get("model") or model or ""})
+        elif t == "stream_event" and (m.get("event") or {}).get("type") == "content_block_delta":
+            d = (m.get("event") or {}).get("delta") or {}
+            if d.get("type") == "text_delta" and d.get("text"):
+                state["streamed_text"] = True
+                emit("delta", {"text": d["text"]})
+            elif d.get("type") == "thinking_delta" and d.get("thinking"):
+                emit("thinking_delta", {"text": d["thinking"]})
+        elif t == "stream_event" and (m.get("event") or {}).get("type") == "message_start":
+            msg = (m.get("event") or {}).get("message") or {}
+            if msg.get("id") and msg.get("usage"):
+                per_msg[msg["id"]] = msg["usage"]
+                emit_usage(True)
+        elif t == "system" and m.get("subtype") == "thinking_tokens":
+            thinking_tokens += m.get("estimated_tokens_delta") or 0
+            emit_usage()
+        elif t == "assistant":
+            msg = m.get("message") or {}
+            if msg.get("id") and msg.get("usage"):
+                per_msg[msg["id"]] = msg["usage"]
+                thinking_tokens = 0
+                emit_usage(True)
+            for b in msg.get("content") or []:
+                if not isinstance(b, dict) or b.get("type") != "tool_use":
+                    continue
+                tool[b.get("id")] = b.get("name")
+                if b.get("name") in GROK_EDIT_TOOLS:
+                    emit("file_edit", {"tool": b["name"],
+                                       "path": rel_path(abs_repo, (b.get("input") or {}).get("file_path", "")),
+                                       "id": b.get("id")})
+                else:
+                    emit("tool", {"tool": b.get("name"), "detail": detail_of(b.get("name"), b.get("input")),
+                                  "id": b.get("id")})
+        elif t == "user":
+            content = (m.get("message") or {}).get("content")
+            for b in content if isinstance(content, list) else []:
+                if not isinstance(b, dict) or b.get("type") != "tool_result":
+                    continue
+                text, trunc = result_text(b.get("content"))
+                emit("tool_result", {"tool": tool.get(b.get("tool_use_id")), "id": b.get("tool_use_id"),
+                                     "text": text, "isError": bool(b.get("is_error")), "truncated": trunc})
+        elif t == "result":
+            state["started"] = True
+            state["saw_result"] = True
+            state["had_error"] = bool(m.get("is_error"))
+            if m.get("usage"):
+                if not per_msg:
+                    per_msg["_result"] = m["usage"]
+                emit_usage(True)
+            emit("result", {"isError": state["had_error"], "numTurns": m.get("num_turns"),
+                            "durationMs": m.get("duration_ms"), "totalCostUsd": m.get("total_cost_usd"),
+                            "usage": m.get("usage"),
+                            "result": None if state["streamed_text"] else m.get("result")})
+
+    def drain():
+        for line in proc.stderr:
+            err_tail.append(line)
+            if DEBUG:
+                print("grok stderr:", line, end="", file=sys.stderr)
+
+    threading.Thread(target=drain, daemon=True).start()
+    try:
+        for line in proc.stdout:
+            if aborted():
+                proc.kill()
+                return state["had_error"]
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if DEBUG:
+                print("grok", ev.get("type"), ev.get("subtype") or "", file=sys.stderr)
+            handle(ev)
+        proc.wait()
+        if aborted():
+            return state["had_error"]
+        if not state["started"]:
+            state["had_error"] = True
+            emit("error", {"message": ("".join(err_tail)[-500:].strip() or "grok did not start")
+                           + " — run `grok login` or set XAI_API_KEY"})
+        elif not state["saw_result"]:
+            state["had_error"] = True
+            emit("error", {"message": "".join(err_tail)[-500:].strip() or "grok exited without a result"})
+            emit("result", {"isError": True, "result": None})
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        cleanup()
+    return state["had_error"]
+
+
+# Provider dispatch for the agent step. Explicit allow-list — unknown providers hard-error (no
+# silent Claude fallthrough). Shared by run_design and run_image.
 def run_agent(repo, prompt, body, emit, aborted):
     provider = body.get("provider") or "anthropic"
+    if provider == "anthropic":
+        return stream_query(repo, prompt, body, emit, aborted)
     if provider == "openai":
         return stream_codex(repo, prompt, body, emit, aborted)
+    if provider == "grok":
+        return stream_grok(repo, prompt, body, emit, aborted)
     if provider == "google":
         emit("error", {"message": "Google provider is not yet supported"})
         return True
-    return stream_query(repo, prompt, body, emit, aborted)
+    emit("error", {"message": f'Unknown provider "{provider}" — upgrade the shim or pick anthropic/openai/grok in options'})
+    return True
 
 
 # Commit only what THIS run changed (diff of porcelain before/after); no push.
@@ -1188,16 +1662,25 @@ class Handler(BaseHTTPRequestHandler):
                 **model_meta,  # legacy top-level models/defaultModel = discovered Anthropic list
                 "geminiModel": GEMINI_MODEL, "geminiEnv": bool(GEMINI_KEY),  # geminiEnv: server-side key fallback
             })
-        # History is provider-scoped: the openai provider reads codex's rollout tree, everything else
-        # (anthropic/absent) reads claude's ~/.claude/projects transcripts. The extension sends the
-        # per-origin provider as a `?provider=` query param so the 🕘 view shows the right backend.
+        # History is provider-scoped: openai → codex rollouts, grok → ~/.grok/sessions, else claude
+        # ~/.claude/projects. The extension sends the per-origin provider as `?provider=`.
         hist_provider = (parse_qs(urlsplit(self.path).query).get("provider") or ["anthropic"])[0]
         if path == "/history":
-            sessions = list_codex_history(repo) if hist_provider == "openai" else list_history(repo)
+            if hist_provider == "openai":
+                sessions = list_codex_history(repo)
+            elif hist_provider == "grok":
+                sessions = list_grok_history(repo)
+            else:
+                sessions = list_history(repo)
             return self._json(200, {"sessions": sessions})
         if path.startswith("/history/"):
             sid = unquote(path[len("/history/"):])
-            data = read_codex_history(repo, sid) if hist_provider == "openai" else read_history(repo, sid)
+            if hist_provider == "openai":
+                data = read_codex_history(repo, sid)
+            elif hist_provider == "grok":
+                data = read_grok_history(repo, sid)
+            else:
+                data = read_history(repo, sid)
             return self._json(200, data) if data else self._json(404, {"error": "not found"})
         self._json(404, {"error": "not found"})
 
