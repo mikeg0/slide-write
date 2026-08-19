@@ -68,6 +68,12 @@ function codexClientVersion() {                                  // the /models 
   return _codexVer;
 }
 
+// Every discovery helper below returns `{ models, error?, fix? }` and never throws. `error` is a
+// human-readable reason the list came back empty — the panel shows it verbatim instead of a generic
+// "no models" hint (README §"Dynamic model lists") — and `fix` is the single shell command that
+// repairs it. Absent keys mean "nothing to report"; an empty list with no `error` is a real answer
+// (e.g. an account with no entitlements), not a failure.
+//
 // Ask the authenticated Claude Code subprocess for the models available to this repo/account. An
 // empty async input stream lets the SDK complete its initialization handshake without a model turn.
 async function anthropicModels(repo) {
@@ -78,7 +84,7 @@ async function anthropicModels(repo) {
     // Bound the handshake (parity with the Python shim's 20s subprocess timeout) so a stuck
     // subprocess can't hang /meta; the finally close() reaps it either way.
     const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("model discovery timed out")), 20_000).unref());
-    return (await Promise.race([q.supportedModels(), timeout]))
+    const models = (await Promise.race([q.supportedModels(), timeout]))
       .filter((m) => typeof m.value === "string" && m.value)
       .map((m) => {
         const levels = (m.supportedEffortLevels || []).filter((id) => typeof id === "string" && id);
@@ -93,67 +99,91 @@ async function anthropicModels(repo) {
           defaultEffort: levels.length ? "default" : "",
         };
       });
+    return { models };
   } catch (e) {
-    if (DEBUG) console.error("anthropicModels:", e?.message || e);
-    return [];
+    const msg = e?.message || String(e);
+    if (DEBUG) console.error("anthropicModels:", msg);
+    return { models: [], error: `claude model discovery failed: ${msg}`, fix: "claude auth login" };
   } finally { q?.close(); }
 }
 
 // Fetch the OpenAI model list the way codex does: the ChatGPT-account-scoped /models endpoint, using
 // the oauth access_token from CODEX_HOME/auth.json. (api.openai.com/v1/models 403s with this token —
 // this is the only working source.) Returns model/effort metadata for the *listable*,
-// api-supported models. Called when the panel opens; any failure → [] (never throws).
+// api-supported models. Called when the panel opens; any failure → an empty list plus the `error`
+// (and, when a re-login is the cure, the `fix`) the panel shows in place of the model dropdown.
 async function openAiModels() {
-  let models = [];
+  const authPath = join(codexHome(), "auth.json");
+  let auth;
   try {
-    const auth = JSON.parse(await readFile(join(codexHome(), "auth.json"), "utf8"));
-    const token = auth?.tokens?.access_token, account = auth?.tokens?.account_id;
-    if (token) {
-      const ver = await codexClientVersion();
-      const res = await fetch(`https://chatgpt.com/backend-api/codex/models?client_version=${encodeURIComponent(ver)}`,
-        { signal: AbortSignal.timeout(15_000),   // parity with the Python shim's urlopen timeout
-          headers: { authorization: `Bearer ${token}`, "chatgpt-account-id": account || "",
-                     originator: "codex_cli_rs", "user-agent": "codex_cli_rs" } });
-      if (res.ok) {
-        const data = await res.json();
-        models = (data.models || [])
-          .filter((m) => m.slug && m.visibility === "list" && m.supported_in_api !== false)
-          .map((m) => ({
-            id: m.slug,
-            label: m.display_name || m.slug,
-            efforts: (m.supported_reasoning_levels || [])
-              .filter((level) => typeof level.effort === "string" && level.effort)
-              .map((level) => ({
-                id: level.effort,
-                label: effortLabel(level.effort),
-                description: level.description || "",
-              })),
-            defaultEffort: m.default_reasoning_level || "",
-          }));
-      } else if (DEBUG) console.error("openAiModels: HTTP", res.status);
+    auth = JSON.parse(await readFile(authPath, "utf8"));
+  } catch (e) {
+    if (DEBUG) console.error("openAiModels:", e?.message || e);
+    return { models: [], fix: "codex login",
+      error: e?.code === "ENOENT" ? `codex is not signed in — no ${authPath}`
+                                  : `can't read ${authPath}: ${e?.message || e}` };
+  }
+  const token = auth?.tokens?.access_token, account = auth?.tokens?.account_id;
+  if (!token) return { models: [], error: `no ChatGPT access token in ${authPath}`, fix: "codex login" };
+  try {
+    const ver = await codexClientVersion();
+    const res = await fetch(`https://chatgpt.com/backend-api/codex/models?client_version=${encodeURIComponent(ver)}`,
+      { signal: AbortSignal.timeout(15_000),   // parity with the Python shim's urlopen timeout
+        headers: { authorization: `Bearer ${token}`, "chatgpt-account-id": account || "",
+                   originator: "codex_cli_rs", "user-agent": "codex_cli_rs" } });
+    if (!res.ok) {
+      if (DEBUG) console.error("openAiModels: HTTP", res.status);
+      // 401 here is terminal, not transient: codex silently rotates this token in normal use, so a
+      // 401 reaching the shim means the refresh token is spent/revoked too — only a re-login fixes
+      // it, and `codex exec` is just as broken. Say so rather than showing an empty dropdown.
+      return res.status === 401
+        ? { models: [], fix: "codex logout && codex login",
+            error: "codex sign-in expired or revoked (HTTP 401 from the ChatGPT models endpoint)" }
+        : { models: [], error: `ChatGPT models endpoint returned HTTP ${res.status}` };
     }
-  } catch (e) { if (DEBUG) console.error("openAiModels:", e?.message || e); }
-  return models;
+    const data = await res.json();
+    const models = (data.models || [])
+      .filter((m) => m.slug && m.visibility === "list" && m.supported_in_api !== false)
+      .map((m) => ({
+        id: m.slug,
+        label: m.display_name || m.slug,
+        efforts: (m.supported_reasoning_levels || [])
+          .filter((level) => typeof level.effort === "string" && level.effort)
+          .map((level) => ({
+            id: level.effort,
+            label: effortLabel(level.effort),
+            description: level.description || "",
+          })),
+        defaultEffort: m.default_reasoning_level || "",
+      }));
+    return { models };
+  } catch (e) {
+    if (DEBUG) console.error("openAiModels:", e?.message || e);
+    return { models: [], error: `couldn't reach the ChatGPT models endpoint: ${e?.message || e}` };
+  }
 }
 
 // Grok model list: prefer a short `grok models` refresh (populates cache/login path), then read
-// `$GROK_HOME/models_cache.json`. Any failure → [] (never throws) — empty means not logged in / CLI missing.
+// `$GROK_HOME/models_cache.json`. Any failure → an empty list plus an `error` naming the cause
+// (missing CLI vs. no cache = not logged in), never a throw.
 async function grokModels() {
   const env = { ...process.env };
   if (GROK_HOME) env.GROK_HOME = GROK_HOME;
+  let spawnErr;   // kept so a missing `grok` binary reports itself instead of looking like a logout
   try {
     await new Promise((resolveDone) => {
       const child = spawn(GROK_BIN, ["models"], { env, stdio: ["ignore", "pipe", "pipe"] });
       const t = setTimeout(() => { try { child.kill("SIGTERM"); } catch {} resolveDone(); }, 15_000);
       t.unref();
       child.on("close", () => { clearTimeout(t); resolveDone(); });
-      child.on("error", () => { clearTimeout(t); resolveDone(); });
+      child.on("error", (e) => { spawnErr = e; clearTimeout(t); resolveDone(); });
     });
-  } catch (e) { if (DEBUG) console.error("grokModels spawn:", e?.message || e); }
+  } catch (e) { spawnErr = e; if (DEBUG) console.error("grokModels spawn:", e?.message || e); }
+  const cachePath = join(grokHome(), "models_cache.json");
   try {
-    const raw = JSON.parse(await readFile(join(grokHome(), "models_cache.json"), "utf8"));
+    const raw = JSON.parse(await readFile(cachePath, "utf8"));
     const entries = raw?.models && typeof raw.models === "object" ? Object.values(raw.models) : [];
-    return entries.map((entry) => {
+    const models = entries.map((entry) => {
       const info = entry?.info || entry || {};
       const id = info.id || info.model;
       if (typeof id !== "string" || !id) return null;
@@ -174,23 +204,39 @@ async function grokModels() {
         defaultEffort: efforts.some((e) => e.id === defaultEffort) ? defaultEffort : (efforts[0]?.id || ""),
       };
     }).filter(Boolean);
-  } catch (e) { if (DEBUG) console.error("grokModels cache:", e?.message || e); return []; }
+    return models.length ? { models }
+      : { models: [], error: `${cachePath} lists no models`, fix: "grok login" };
+  } catch (e) {
+    if (DEBUG) console.error("grokModels cache:", e?.message || e);
+    if (spawnErr?.code === "ENOENT")
+      return { models: [], error: `grok CLI not found at "${GROK_BIN}" — install it or pass --grok-bin <path>` };
+    return { models: [], fix: "grok login",
+      error: e?.code === "ENOENT" ? `grok is not signed in — no ${cachePath}`
+                                  : `can't read ${cachePath}: ${e?.message || e}` };
+  }
 }
 
 // Provider list for /meta — the client picks a provider on the options page, then the dropdown shows
 // that provider's `models`. `enabled:false` advertises a provider the UI should show but not allow.
 async function providerMeta(repo) {
   const [anthropic, openai, grok] = await Promise.all([anthropicModels(repo), openAiModels(), grokModels()]);
-  const anthropicDefault = (DEFAULT_MODEL && anthropic.some((m) => m.id === DEFAULT_MODEL) && DEFAULT_MODEL)
-    || anthropic[0]?.id || "";
+  const anthropicDefault = (DEFAULT_MODEL && anthropic.models.some((m) => m.id === DEFAULT_MODEL) && DEFAULT_MODEL)
+    || anthropic.models[0]?.id || "";
+  // `error`/`fix` are omitted when absent so the payload of a healthy provider is byte-identical to
+  // what older extensions already parse (they ignore unknown keys either way).
+  const entry = (id, label, disc, defaultModel) => ({
+    id, label, enabled: true, models: disc.models, defaultModel,
+    ...(disc.error ? { error: disc.error } : {}),
+    ...(disc.fix ? { fix: disc.fix } : {}),
+  });
   return {
-    models: anthropic,
+    models: anthropic.models,
     defaultModel: anthropicDefault,
     providers: [
-      { id: "anthropic", label: "Anthropic", enabled: true, models: anthropic, defaultModel: anthropicDefault },
-      { id: "openai",    label: "OpenAI",    enabled: true, models: openai, defaultModel: openai[0]?.id || "" },
-      { id: "grok",      label: "xAI",       enabled: true, models: grok, defaultModel: grok[0]?.id || "" },
-      { id: "google",    label: "Google",    enabled: false, models: [], defaultModel: "" },
+      entry("anthropic", "Anthropic", anthropic, anthropicDefault),
+      entry("openai", "OpenAI", openai, openai.models[0]?.id || ""),
+      entry("grok", "xAI", grok, grok.models[0]?.id || ""),
+      { id: "google", label: "Google", enabled: false, models: [], defaultModel: "" },
     ],
     defaultProvider: "anthropic",
   };

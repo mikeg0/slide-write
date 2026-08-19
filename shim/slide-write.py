@@ -7,6 +7,7 @@
 # native installer (curl -fsSL https://claude.ai/install.sh | bash) ships a self-contained binary.
 # Stdlib only; Python 3.10+. Keep this file in lockstep with slide-write.mjs (it is the reference).
 import base64
+import errno
 import json
 import os
 import re
@@ -112,6 +113,12 @@ def codex_client_version():  # the /models endpoint requires client_version
     return _codex_ver
 
 
+# Every discovery helper below returns `{"models": [...], "error"?: str, "fix"?: str}` and never
+# raises. `error` is a human-readable reason the list came back empty — the panel shows it verbatim
+# instead of a generic "no models" hint (README §"Dynamic model lists") — and `fix` is the single
+# shell command that repairs it. Absent keys mean "nothing to report"; an empty list with no `error`
+# is a real answer (e.g. an account with no entitlements), not a failure. Mirrors slide-write.mjs.
+#
 # Ask the authenticated Claude CLI for the models available to this repo/account. The initialize
 # control request completes before any user prompt, so discovery consumes no model turn.
 def anthropic_models(repo):
@@ -151,65 +158,96 @@ def anthropic_models(repo):
                                "description": model.get("description") or "",
                                "efforts": efforts,
                                "defaultEffort": "default" if levels else ""})
-            return models
+            return {"models": models}
         if DEBUG and proc.returncode:
             print("anthropic_models: claude exited", proc.returncode, proc.stderr[-1000:], file=sys.stderr)
+        detail = (f"claude exited {proc.returncode}" if proc.returncode
+                  else "claude returned no model list")
     except (OSError, ValueError, subprocess.SubprocessError) as e:
         if DEBUG:
             print("anthropic_models:", e, file=sys.stderr)
-    return []
+        detail = str(e) or e.__class__.__name__
+    return {"models": [], "error": f"claude model discovery failed: {detail}",
+            "fix": "claude auth login"}
 
 
 # Fetch the OpenAI model list the way codex does: the ChatGPT-account-scoped /models endpoint, using
 # the oauth access_token from CODEX_HOME/auth.json. (api.openai.com/v1/models 403s with this token —
 # this is the only working source.) Returns model/effort metadata for the *listable*,
-# api-supported models. Called when the panel opens; any failure → [] (never raises).
+# api-supported models. Called when the panel opens; any failure → an empty list plus the `error`
+# (and, when a re-login is the cure, the `fix`) the panel shows in place of the model dropdown.
 def openai_models():
-    models = []
+    auth_path = os.path.join(codex_home(), "auth.json")
     try:
-        with open(os.path.join(codex_home(), "auth.json"), encoding="utf-8") as fh:
+        with open(auth_path, encoding="utf-8") as fh:
             auth = json.load(fh)
-        tokens = auth.get("tokens") or {}
-        token, account = tokens.get("access_token"), tokens.get("account_id")
-        if token:
-            ver = codex_client_version()
-            req = urllib.request.Request(
-                f"https://chatgpt.com/backend-api/codex/models?client_version={quote(ver)}",
-                headers={"Authorization": f"Bearer {token}", "chatgpt-account-id": account or "",
-                         "originator": "codex_cli_rs", "User-Agent": "codex_cli_rs"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            models = [{
-                "id": m["slug"],
-                "label": m.get("display_name") or m["slug"],
-                "efforts": [{
-                    "id": level["effort"],
-                    "label": effort_label(level["effort"]),
-                    "description": level.get("description") or "",
-                } for level in (m.get("supported_reasoning_levels") or [])
-                  if isinstance(level.get("effort"), str) and level["effort"]],
-                "defaultEffort": m.get("default_reasoning_level") or "",
-            } for m in (data.get("models") or [])
-              if m.get("slug") and m.get("visibility") == "list" and m.get("supported_in_api") is not False]
+    except (OSError, ValueError) as e:
+        if DEBUG:
+            print("openai_models:", e, file=sys.stderr)
+        missing = isinstance(e, OSError) and e.errno == errno.ENOENT
+        return {"models": [], "fix": "codex login",
+                "error": (f"codex is not signed in — no {auth_path}" if missing
+                          else f"can't read {auth_path}: {e}")}
+    tokens = auth.get("tokens") or {}
+    token, account = tokens.get("access_token"), tokens.get("account_id")
+    if not token:
+        return {"models": [], "error": f"no ChatGPT access token in {auth_path}",
+                "fix": "codex login"}
+    try:
+        ver = codex_client_version()
+        req = urllib.request.Request(
+            f"https://chatgpt.com/backend-api/codex/models?client_version={quote(ver)}",
+            headers={"Authorization": f"Bearer {token}", "chatgpt-account-id": account or "",
+                     "originator": "codex_cli_rs", "User-Agent": "codex_cli_rs"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if DEBUG:
+            print("openai_models: HTTP", e.code, file=sys.stderr)
+        # 401 here is terminal, not transient: codex silently rotates this token in normal use, so a
+        # 401 reaching the shim means the refresh token is spent/revoked too — only a re-login fixes
+        # it, and `codex exec` is just as broken. Say so rather than showing an empty dropdown.
+        if e.code == 401:
+            return {"models": [], "fix": "codex logout && codex login",
+                    "error": "codex sign-in expired or revoked "
+                             "(HTTP 401 from the ChatGPT models endpoint)"}
+        return {"models": [], "error": f"ChatGPT models endpoint returned HTTP {e.code}"}
     except (OSError, ValueError, urllib.error.URLError) as e:
         if DEBUG:
             print("openai_models:", e, file=sys.stderr)
-    return models
+        return {"models": [], "error": f"couldn't reach the ChatGPT models endpoint: {e}"}
+    models = [{
+        "id": m["slug"],
+        "label": m.get("display_name") or m["slug"],
+        "efforts": [{
+            "id": level["effort"],
+            "label": effort_label(level["effort"]),
+            "description": level.get("description") or "",
+        } for level in (m.get("supported_reasoning_levels") or [])
+          if isinstance(level.get("effort"), str) and level["effort"]],
+        "defaultEffort": m.get("default_reasoning_level") or "",
+    } for m in (data.get("models") or [])
+      if m.get("slug") and m.get("visibility") == "list" and m.get("supported_in_api") is not False]
+    return {"models": models}
 
 
 # Grok model list: prefer a short `grok models` refresh (populates cache/login path), then read
-# `$GROK_HOME/models_cache.json`. Any failure → [] (never raises) — empty means not logged in / CLI missing.
+# `$GROK_HOME/models_cache.json`. Any failure → an empty list plus an `error` naming the cause
+# (missing CLI vs. no cache = not logged in), never a raise.
 def grok_models():
     env = dict(os.environ)
     if GROK_HOME:
         env["GROK_HOME"] = GROK_HOME
+    missing_cli = False   # kept so a missing `grok` binary reports itself, not a phantom logout
     try:
         subprocess.run([GROK_BIN, "models"], env=env, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError) as e:
+        missing_cli = isinstance(e, OSError) and e.errno == errno.ENOENT
         if DEBUG:
             print("grok_models spawn:", e, file=sys.stderr)
+    cache_path = os.path.join(grok_home(), "models_cache.json")
     try:
-        with open(os.path.join(grok_home(), "models_cache.json"), encoding="utf-8") as fh:
+        with open(cache_path, encoding="utf-8") as fh:
             raw = json.load(fh)
         entries = list((raw.get("models") or {}).values()) if isinstance(raw.get("models"), dict) else []
         models = []
@@ -238,30 +276,48 @@ def grok_models():
                 "efforts": efforts,
                 "defaultEffort": default_effort,
             })
-        return models
+        if models:
+            return {"models": models}
+        return {"models": [], "error": f"{cache_path} lists no models", "fix": "grok login"}
     except (OSError, ValueError) as e:
         if DEBUG:
             print("grok_models cache:", e, file=sys.stderr)
-        return []
+        if missing_cli:
+            return {"models": [], "error": f'grok CLI not found at "{GROK_BIN}" — '
+                                           "install it or pass --grok-bin <path>"}
+        missing = isinstance(e, OSError) and e.errno == errno.ENOENT
+        return {"models": [], "fix": "grok login",
+                "error": (f"grok is not signed in — no {cache_path}" if missing
+                          else f"can't read {cache_path}: {e}")}
 
 
 # Provider list for /meta — the client picks a provider on the options page, then the dropdown shows
 # that provider's `models`. `enabled: False` advertises a provider the UI should show but not allow.
 def provider_meta(repo):
     anthropic, openai, grok = anthropic_models(repo), openai_models(), grok_models()
+    anthropic_models_list = anthropic["models"]
     anthropic_default = (DEFAULT_MODEL if DEFAULT_MODEL
-                          and any(m["id"] == DEFAULT_MODEL for m in anthropic)
-                          else (anthropic[0]["id"] if anthropic else ""))
+                          and any(m["id"] == DEFAULT_MODEL for m in anthropic_models_list)
+                          else (anthropic_models_list[0]["id"] if anthropic_models_list else ""))
+
+    # `error`/`fix` are omitted when absent so a healthy provider's payload is identical to what
+    # older extensions already parse (they ignore unknown keys either way).
+    def entry(pid, label, disc, default_model):
+        out = {"id": pid, "label": label, "enabled": True,
+               "models": disc["models"], "defaultModel": default_model}
+        for key in ("error", "fix"):
+            if disc.get(key):
+                out[key] = disc[key]
+        return out
+
     return {
-        "models": anthropic,
+        "models": anthropic_models_list,
         "defaultModel": anthropic_default,
         "providers": [
-            {"id": "anthropic", "label": "Anthropic", "enabled": True,
-             "models": anthropic, "defaultModel": anthropic_default},
-            {"id": "openai", "label": "OpenAI", "enabled": True,
-             "models": openai, "defaultModel": (openai[0]["id"] if openai else "")},
-            {"id": "grok", "label": "xAI", "enabled": True,
-             "models": grok, "defaultModel": (grok[0]["id"] if grok else "")},
+            entry("anthropic", "Anthropic", anthropic, anthropic_default),
+            entry("openai", "OpenAI", openai,
+                  openai["models"][0]["id"] if openai["models"] else ""),
+            entry("grok", "xAI", grok, grok["models"][0]["id"] if grok["models"] else ""),
             {"id": "google", "label": "Google", "enabled": False,
              "models": [], "defaultModel": ""},
         ],

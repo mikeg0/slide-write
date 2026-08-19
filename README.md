@@ -413,9 +413,26 @@ Grok discovery prefers a short `grok models` refresh, then reads `$GROK_HOME/mod
 (`reasoning_efforts` → the same model shape). Empty list means not logged in / CLI missing — the
 extension surfaces a status hint; Send is not hard-blocked (parity with OpenAI).
 
+**Why a list is empty.** A provider entry whose discovery failed also carries `error` — the
+human-readable cause — and, where a re-login is the cure, `fix`: the one shell command that repairs
+it (`codex logout && codex login`, `grok login`, `claude auth login`). Both keys are omitted when
+there is nothing to report, so a healthy entry stays byte-identical for older clients, and an empty
+list with no `error` remains a legitimate answer (an account with no entitlements). The cases the
+shims distinguish: **OpenAI** — no `CODEX_HOME/auth.json` (never signed in) vs. no access token in it
+vs. **HTTP 401** from the models endpoint vs. another HTTP status vs. an unreachable endpoint;
+**Grok** — a missing `grok` binary (`--grok-bin`) vs. a missing/unreadable `models_cache.json` (not
+logged in) vs. a cache listing no models; **Anthropic** — a failed/timed-out discovery handshake. The
+401 case is worth spelling out because it is terminal, not transient: codex rotates that access token
+silently in normal use, so a 401 reaching the shim means the refresh token is spent or revoked as
+well (plain `codex exec` is equally broken) and only a full re-login fixes it. The side panel puts
+`error` in its status line and raises the diagnostics banner — "No OpenAI models available" — with
+`fix` shown as the command to run on the code machine, instead of leaving a silently empty dropdown
+as the only symptom.
+
 There is no shim cache of discovery results beyond what each CLI maintains: the panel fetches `/meta`
 once as it opens (and when that open panel changes origin/connection), while its liveness timer
-polls only `/health`. A provider discovery failure yields an empty list rather than stale model names.
+polls only `/health`. A provider discovery failure yields an empty list — plus the `error`/`fix` above
+— rather than stale model names.
 
 ---
 
@@ -472,7 +489,7 @@ actually used is echoed in the `start` event.
 **Provider selection (additive).** `/design` and `/generate-image` also accept an optional top-level
 `provider` — `"anthropic"` (default/absent), `"openai"`, `"grok"`, or `"google"`. `/meta` advertises
 the choices as
-`providers: [{ id, label, enabled, models: [{id,label,efforts?,defaultEffort?}], defaultModel }]`
+`providers: [{ id, label, enabled, models: [{id,label,efforts?,defaultEffort?}], defaultModel, error?, fix? }]`
 plus `defaultProvider`,
 and the top-level `models`/`defaultModel` expose the discovered Anthropic list for backward compatibility. The
 extension's options page picks the provider per-origin; the side-panel model dropdown then shows that

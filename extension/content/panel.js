@@ -144,6 +144,17 @@ function modelsFor(meta, provider) {
   return { models: [], defaultModel: "" };
 }
 
+// The shim reports WHY a provider's model list is empty: `/meta.providers[].error` (human-readable
+// cause, e.g. an expired codex sign-in) plus an optional `fix` (the shell command that repairs it).
+// Both are advisory extras — older shims omit them, and then the panel falls back to its generic
+// per-provider hints. Only meaningful while the list is empty; a populated dropdown wins.
+function providerIssue(meta, provider, models) {
+  if (!meta || !Array.isArray(meta.providers) || (models && models.length)) return null;
+  const p = meta.providers.find((x) => x.id === provider);
+  if (!p || typeof p.error !== "string" || !p.error) return null;
+  return { error: p.error, fix: typeof p.fix === "string" ? p.fix : "", label: p.label || provider };
+}
+
 // When /meta has a `providers` array, only allow Send for providers listed and enabled there.
 // Blocks new-extension + old-shim footgun where `provider:"grok"` would silently run Claude and
 // modelsFor would fall back to Anthropic models. Ancient shims without providers[] cannot be
@@ -334,7 +345,13 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   // Render the model button label + menu items to reflect `models` / `selectedModel`.
   function renderModels() {
     const cur = models.find((m) => m.id === selectedModel);
-    modelLabel.textContent = cur ? cur.label : (selectedModel || "Model");
+    // An empty list says so on the button itself — "Model" with nothing behind it read as a UI
+    // that hadn't loaded yet. The reason lives in the status line + banner (renderConn); Chrome
+    // won't tooltip a disabled button, so `title` here is only for the enabled case.
+    const issue = providerIssue(cfg.meta, cfg.provider, models);
+    modelLabel.textContent = cur ? cur.label
+      : (selectedModel || (cfg.configured && !models.length ? "No models" : "Model"));
+    modelBtn.title = issue ? `${issue.error}${issue.fix ? ` — run: ${issue.fix}` : ""}` : "Choose model";
     modelBtn.disabled = !cfg.configured || models.length < 2;
     modelMenu.textContent = "";
     for (const m of models) {
@@ -492,10 +509,19 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       diagCodePy,
     ]),
   ]);
+  // Single-command remedy for a provider-level failure (e.g. `codex logout && codex login`), shown
+  // in place of the two shim-launch commands. Reuses the same code-block styling.
+  const diagFixCode = el("code", { class: "dmsg-diag-code" });
+  const diagFix = el("div", { class: "dmsg-diag-clis", hidden: "" }, [
+    el("div", { class: "dmsg-diag-cli" }, [
+      el("div", { class: "dmsg-diag-cli-label", text: "Run on the code machine" }),
+      diagFixCode,
+    ]),
+  ]);
   const diagRetry = el("button", { class: "dmsg-diag-btn", text: "↻ Retry", onclick: () => reprobe(true) });
   const diagSettings = el("button", { class: "dmsg-diag-btn dmsg-diag-btn-ghost", text: "⚙️ Options", onclick: () => onOpenOptions && onOpenOptions() });
   const diag = el("div", { class: "dmsg-diag", hidden: "" }, [
-    diagTitle, diagText, diagCodes,
+    diagTitle, diagText, diagCodes, diagFix,
     el("div", { class: "dmsg-diag-actions" }, [diagRetry, diagSettings]),
   ]);
 
@@ -528,6 +554,10 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       if (cfg.meta && !providerAllowed(cfg.meta, cfg.provider))
         return `shim does not support provider “${cfg.provider}” — upgrade slide-write`;
       if (cfg.meta && providerAllowed(cfg.meta, cfg.provider) && models.length === 0) {
+        // The shim's own diagnosis beats the guesses below when it offers one (the banner in
+        // renderConn carries the same text plus the fix command).
+        const issue = providerIssue(cfg.meta, cfg.provider, models);
+        if (issue) return `no ${issue.label} models: ${issue.error}`;   // colon, not a dash — the errors carry their own dashes
         if (cfg.provider === "grok") return "no Grok models — run grok login or check GROK_HOME";
         if (cfg.provider === "openai") return "no OpenAI models — check codex login / CODEX_HOME";
         return `no models for provider “${cfg.provider}”`;
@@ -543,9 +573,25 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   function renderConn() {
     if (!busy) setStatus(idleStatus());
     const st = cfg.conn && cfg.conn.state;
-    const show = cfg.configured && st && st !== "live";
+    // A reachable shim that can't list the selected provider's models is a failure too — it just
+    // isn't a *connection* failure, so it used to leave an empty dropdown and no explanation.
+    const issue = (!st || st === "live") && providerAllowed(cfg.meta, cfg.provider)
+      ? providerIssue(cfg.meta, cfg.provider, models) : null;
+    const show = cfg.configured && ((st && st !== "live") || !!issue);
     diag.hidden = !show;
     if (!show) return;
+    if (issue) {
+      diagTitle.textContent = `No ${issue.label} models available`;
+      diagText.textContent = `${issue.error}. Until it's fixed, ${issue.label} runs have no model to `
+        + "select — switch this origin's provider in Options, or repair the CLI login on the code machine"
+        + (issue.fix ? ":" : ".");
+      diagCodes.hidden = true;
+      diagFixCode.textContent = issue.fix;
+      diagFix.hidden = !issue.fix;
+      diagSettings.hidden = false;
+      return;
+    }
+    diagFix.hidden = true;
     if (st === "unauthorized") {
       diagTitle.textContent = "Agent rejected the token";
       diagText.textContent = `The agent at ${shimHost()} is running but returned 401 Unauthorized. Open Options and set the token to match the shim's --token value.`;
