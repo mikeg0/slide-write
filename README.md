@@ -565,7 +565,14 @@ shows the conversations from the provider currently selected on the options page
   repo), so the shim reads each rollout's `session_meta` line and keeps only those whose `cwd` is
   this repo. The replayed events come from the rollout's `event_msg`/`response_item` records — a
   different on-disk shape than `codex exec --json`'s live stream, but mapped onto the same §6 shapes
-  `streamCodex` emits (`tool`/`file_edit`, no `tool_result`, `result` = the last agent message). The
+  `streamCodex` emits (`tool`/`file_edit`, no `tool_result`, `result` = the last agent message).
+  **Two rollout shapes**: codex ≥ 0.148 replaced the legacy per-event records (`event_msg`
+  `user_message` / `agent_message` / `patch_apply_end`, `response_item` `function_call`) with one
+  `event_msg`/`item_completed` per item (`item.type` `UserMessage` / `AgentMessage` / `Reasoning` /
+  `FileChange` — a path-keyed `changes` object — / `CommandExecution`), and `task_complete` carries
+  the authoritative `last_agent_message`. No single rollout mixes the two, so both mappers stay: a
+  shim that reads only the legacy records shows every recent session as `(untitled)` with `0 msg`
+  and replays an empty transcript. The
   PREAMBLE the shim prepends to every codex prompt is stripped from titles and the replayed `user`
   event so they show the actual request (parity with claude, whose PREAMBLE rides in `systemPrompt`).
 - **`grok`** — Grok writes sessions under

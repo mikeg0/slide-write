@@ -724,6 +724,22 @@ def codex_request(text):
     return t.split("\n[")[0].strip() or t
 
 
+# codex >= 0.148 rewrote the rollout: the legacy event_msg records (user_message / agent_message /
+# patch_apply_end) and response_item/function_call became one event_msg/item_completed per item,
+# carrying the shapes these two helpers read. Older rollouts still use the legacy records and no
+# file mixes the two formats, so both mappers below handle both. Mirrors itemText/itemCommand in .mjs.
+def item_text(it):
+    return "".join((c or {}).get("text") or "" for c in (it.get("content") or [])).strip()
+
+
+def item_command(it):
+    parsed = " ; ".join(c.get("cmd") for c in (it.get("parsed_cmd") or []) if isinstance(c, dict) and c.get("cmd"))
+    if parsed:
+        return parsed
+    cmd = it.get("command")
+    return " ".join(cmd) if isinstance(cmd, list) else (cmd or "")
+
+
 # Read the first `n` bytes of a file as utf8. codex's session_meta line carries the whole system
 # prompt (~19KB), but `cwd` sits in its first few hundred bytes — enough to pre-filter by repo
 # without fully loading the (often multi-hundred-KB) rollouts that belong to other repos.
@@ -787,6 +803,15 @@ def list_codex_history(repo):
                 message_count += 1
             elif rec.get("type") == "event_msg" and p.get("type") == "agent_message":
                 message_count += 1
+            elif rec.get("type") == "event_msg" and p.get("type") == "item_completed":  # codex >= 0.148
+                it = p.get("item") or {}
+                if it.get("type") == "UserMessage":
+                    t = codex_request(item_text(it))
+                    if t and not first_prompt:
+                        first_prompt = t
+                    message_count += 1
+                elif it.get("type") == "AgentMessage":
+                    message_count += 1
         sessions.append({
             "id": sid, "title": (first_prompt or "(untitled)")[:80],
             "firstPrompt": first_prompt[:140], "startedAt": started, "endedAt": ended_at,
@@ -863,6 +888,33 @@ def read_codex_history(repo, sid):
             events.append({"type": "tool",
                            "tool": "codex_exec" if p.get("name") == "exec_command" else (p.get("name") or "tool"),
                            "detail": detail, "id": p.get("call_id")})
+        elif t == "event_msg" and pt == "task_complete":
+            if p.get("last_agent_message"):
+                last_agent = p["last_agent_message"]  # authoritative final answer
+        elif t == "event_msg" and pt == "item_completed":  # codex >= 0.148
+            it = p.get("item") or {}
+            kind = it.get("type")
+            if kind == "UserMessage":
+                txt = strip_preamble(item_text(it))
+                if txt:
+                    events.append({"type": "user", "text": txt})
+            elif kind == "AgentMessage":
+                txt = item_text(it)
+                if txt:
+                    last_agent = txt
+                    events.append({"type": "delta", "text": txt})
+            elif kind == "Reasoning":
+                for entry in it.get("summary_text") or []:
+                    txt = entry if isinstance(entry, str) else (entry or {}).get("text")
+                    if txt:
+                        events.append({"type": "thinking_delta", "text": txt})
+            elif kind == "FileChange":
+                for path in (it.get("changes") or {}):
+                    events.append({"type": "file_edit", "tool": "codex",
+                                   "path": rel_path(repo, path), "id": it.get("id")})
+            elif kind == "CommandExecution":
+                events.append({"type": "tool", "tool": "codex_exec",
+                               "detail": item_command(it), "id": it.get("id")})
     events.append({"type": "result", "isError": had_error, "numTurns": None, "durationMs": None,
                    "totalCostUsd": None, "usage": None, "result": last_agent})
     return {"id": sid, "events": events}

@@ -569,6 +569,14 @@ async function codexRollouts() {
 // before the first `\n[…]` context marker buildPrompt appends (screen/element/screenshot lines).
 const codexRequest = (text) => { const t = stripPreamble(text); return t.split("\n[")[0].trim() || t; };
 
+// codex >= 0.148 rewrote the rollout: the legacy `event_msg` records (user_message / agent_message /
+// patch_apply_end) and `response_item`/`function_call` became one `event_msg`/`item_completed` per
+// item, carrying the shapes these two helpers read. Older rollouts still use the legacy records and
+// no file mixes the two formats, so both mappers below handle both.
+const itemText = (it) => (it.content || []).map((c) => c?.text || "").join("").trim();
+const itemCommand = (it) => (it.parsed_cmd || []).map((c) => c?.cmd).filter(Boolean).join(" ; ")
+  || (Array.isArray(it.command) ? it.command.join(" ") : it.command || "");
+
 const CWD_RE = /"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"/;
 
 // List this repo's codex sessions, newest first (parallel to listHistory for the claude path).
@@ -593,6 +601,14 @@ async function listCodexHistory(repo) {
         if (t) firstPrompt ||= t;
         messageCount++;
       } else if (rec.type === "event_msg" && p.type === "agent_message") messageCount++;
+      else if (rec.type === "event_msg" && p.type === "item_completed") {   // codex >= 0.148
+        const it = p.item || {};
+        if (it.type === "UserMessage") {
+          const t = codexRequest(itemText(it));
+          if (t) firstPrompt ||= t;
+          messageCount++;
+        } else if (it.type === "AgentMessage") messageCount++;
+      }
     }
     sessions.push({ id, title: (firstPrompt || "(untitled)").slice(0, 80),
       firstPrompt: firstPrompt.slice(0, 140), startedAt: started, endedAt, branch: "", messageCount });
@@ -640,6 +656,27 @@ async function readCodexHistory(repo, id) {
       const detail = args.cmd || args.path || (p.arguments && p.arguments !== "{}" ? p.arguments.slice(0, 200) : "");
       events.push({ type: "tool", tool: p.name === "exec_command" ? "codex_exec" : p.name || "tool",
         detail, id: p.call_id });
+    } else if (rec.type === "event_msg" && p.type === "task_complete") {
+      if (p.last_agent_message) lastAgent = p.last_agent_message;   // authoritative final answer
+    } else if (rec.type === "event_msg" && p.type === "item_completed") {   // codex >= 0.148
+      const it = p.item || {};
+      if (it.type === "UserMessage") {
+        const t = stripPreamble(itemText(it));
+        if (t) events.push({ type: "user", text: t });
+      } else if (it.type === "AgentMessage") {
+        const t = itemText(it);
+        if (t) { lastAgent = t; events.push({ type: "delta", text: t }); }
+      } else if (it.type === "Reasoning") {
+        for (const s of it.summary_text || []) {
+          const t = typeof s === "string" ? s : s?.text;
+          if (t) events.push({ type: "thinking_delta", text: t });
+        }
+      } else if (it.type === "FileChange") {
+        for (const path of Object.keys(it.changes || {}))
+          events.push({ type: "file_edit", tool: "codex", path: relPath(repo, path), id: it.id });
+      } else if (it.type === "CommandExecution") {
+        events.push({ type: "tool", tool: "codex_exec", detail: itemCommand(it), id: it.id });
+      }
     }
   }
   events.push({ type: "result", isError: hadError, numTurns: null, durationMs: null,
