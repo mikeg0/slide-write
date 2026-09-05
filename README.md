@@ -354,6 +354,23 @@ against `codex` CLI 0.144.1; `codex exec --json` is the headless equivalent of
 `claude -p --output-format stream-json`. Resume threads a prior codex session via
 `codex exec … resume <thread_id> -` (the `-` reads the continuation prompt from stdin).
 
+**GPT-6 Astra (`gpt-6-astra`)** is supported through this OpenAI provider in both shims.
+[OpenAI lists Astra for Codex CLI and API access](https://learn.chatgpt.com/docs/models#gpt-6-astra);
+availability depends on the signed-in account, client, and rollout. Slide Write discovers it from
+the account's model endpoint and exposes the returned reasoning options in the side panel.
+Choose **OpenAI (Codex)** in the origin's extension options, then **GPT-6-Astra** in the model
+dropdown. Close and reopen an already-open side panel to refresh its model list. If Astra is
+absent, check the shim host's `codex --version` and `/model` picker with the same login.
+
+A direct `POST /design` request can select it with:
+
+```json
+{"provider":"openai","model":"gpt-6-astra","effort":"low","prompt":"Make the primary button green"}
+```
+
+Validated with Codex CLI 0.153.4: both shims listed Astra through authenticated `/meta` and
+completed a live Astra `/design` smoke test (`start → delta → usage → result → done`).
+
 #### Grok / xAI (`provider: "grok"`) — Grok Build CLI
 
 When a request carries `provider: "grok"`, the agent step runs the host **`grok`** CLI headless:
